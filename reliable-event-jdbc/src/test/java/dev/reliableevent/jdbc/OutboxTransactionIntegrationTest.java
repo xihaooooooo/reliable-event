@@ -35,6 +35,10 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 })
 class OutboxTransactionIntegrationTest {
 
+    private static final String EVENT_TYPE = "coupon-task-execute";
+    private static final int PENDING_STATUS = 0;
+    private static final int DEFAULT_MAX_ATTEMPTS = 8;
+
     @Container
     static final MySQLContainer<?> MYSQL = new MySQLContainer<>("mysql:5.7.44")
             .withDatabaseName("reliable_event_test")
@@ -61,7 +65,7 @@ class OutboxTransactionIntegrationTest {
 
         assertThatThrownBy(() -> transaction.executeWithoutResult(status -> {
             insertBusinessRecord(101L);
-            insertOutboxEvent("coupon-task-execute", "101");
+            insertOutboxEvent(101L);
             throw new IntentionalRollbackException();
         })).isInstanceOf(IntentionalRollbackException.class);
 
@@ -75,7 +79,7 @@ class OutboxTransactionIntegrationTest {
 
         transaction.executeWithoutResult(status -> {
             insertBusinessRecord(102L);
-            insertOutboxEvent("coupon-task-execute", "102");
+            insertOutboxEvent(102L);
         });
 
         assertThat(rowCount("test_business_record")).isOne();
@@ -90,7 +94,7 @@ class OutboxTransactionIntegrationTest {
         );
     }
 
-    private void insertOutboxEvent(String eventType, String eventKey) {
+    private void insertOutboxEvent(long taskId) {
         Instant now = Instant.now();
         jdbcTemplate.update("""
                 INSERT INTO reliable_event_outbox (
@@ -104,12 +108,12 @@ class OutboxTransactionIntegrationTest {
                     updated_at
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                eventType,
-                eventKey,
-                "{\"taskId\":" + eventKey + "}",
-                0,
+                EVENT_TYPE,
+                Long.toString(taskId),
+                "{\"taskId\":" + taskId + "}",
+                PENDING_STATUS,
                 Timestamp.from(now),
-                8,
+                DEFAULT_MAX_ATTEMPTS,
                 Timestamp.from(now),
                 Timestamp.from(now)
         );

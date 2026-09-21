@@ -1,0 +1,5 @@
+CREATE TABLE IF NOT EXISTS test_business_record (
+    id   BIGINT NOT NULL,
+    name VARCHAR(128) NOT NULL,
+    PRIMARY KEY (id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;

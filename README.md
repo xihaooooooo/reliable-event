@@ -4,7 +4,7 @@ ReliableEvent 是一个面向 Spring Boot 3 与 RocketMQ 的可靠消息 Starter
 
 它通过 Transactional Outbox 模式，让业务数据与待发布事件在同一个 MySQL 本地事务中提交，再由后台发布器完成消息发送、失败重试、租约恢复和死信处理。
 
-当前仓库已完成 M0：建立 Maven 工程、固定 MySQL 5.7 测试环境、提供最小建表脚本，并用集成测试验证业务数据与 Outbox 事件会一起提交或一起回滚。下一步是 M1 最小发布闭环。
+当前仓库已完成 M1 最小发布闭环：业务方可以在活动事务中登记事件，模块会持久化 JSON Payload、避免重复登记，并由单实例发布器扫描到期事件，通过 Fake 发送适配完成发送和 `PUBLISHED` 状态更新。
 
 ## 已确定的方向
 

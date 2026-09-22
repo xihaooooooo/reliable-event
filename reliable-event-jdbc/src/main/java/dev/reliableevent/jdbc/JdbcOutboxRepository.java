@@ -9,6 +9,7 @@ import java.sql.Statement;
 import java.sql.Timestamp;
 import java.time.Instant;
 import java.util.List;
+import java.util.Optional;
 
 final class JdbcOutboxRepository {
 
@@ -74,70 +75,167 @@ final class JdbcOutboxRepository {
         return new EventId(existingId);
     }
 
-    List<Long> findDueEventIds(Instant now, int limit) {
+    List<EventCandidate> findDueEventCandidates(Instant now, int limit) {
         return jdbcTemplate.query(
                 """
-                SELECT id
+                SELECT id, version
                 FROM reliable_event_outbox
-                WHERE status = ? AND next_attempt_at <= ?
+                WHERE status IN (?, ?) AND next_attempt_at <= ?
+                  AND attempt_count < max_attempts
                 ORDER BY next_attempt_at, id
                 LIMIT ?
                 """,
-                (resultSet, rowNumber) -> resultSet.getLong("id"),
+                (resultSet, rowNumber) -> new EventCandidate(
+                        new EventId(resultSet.getLong("id")),
+                        resultSet.getLong("version")
+                ),
                 EventStatus.PENDING.code(),
+                EventStatus.RETRY_WAIT.code(),
                 Timestamp.from(now),
                 limit
         );
     }
 
-    boolean markPublishing(long eventId, Instant now) {
+    Optional<ClaimedEvent> claim(EventCandidate candidate, Instant now) {
         int updated = jdbcTemplate.update(
                 """
                 UPDATE reliable_event_outbox
-                SET status = ?, updated_at = ?
-                WHERE id = ? AND status = ?
+                SET status = ?,
+                    attempt_count = attempt_count + 1,
+                    version = version + 1,
+                    updated_at = ?
+                WHERE id = ?
+                  AND status IN (?, ?)
+                  AND next_attempt_at <= ?
+                  AND attempt_count < max_attempts
+                  AND version = ?
                 """,
                 EventStatus.PUBLISHING.code(),
                 Timestamp.from(now),
-                eventId,
-                EventStatus.PENDING.code()
+                candidate.id().value(),
+                EventStatus.PENDING.code(),
+                EventStatus.RETRY_WAIT.code(),
+                Timestamp.from(now),
+                candidate.version()
         );
-        return updated == 1;
+        if (updated != 1) {
+            return Optional.empty();
+        }
+        return Optional.of(findClaimedEvent(candidate.id().value()));
     }
 
-    StoredEvent findById(long eventId) {
+    private ClaimedEvent findClaimedEvent(long eventId) {
         return jdbcTemplate.queryForObject(
                 """
-                SELECT id, event_type, event_key, payload, headers
+                SELECT id,
+                       event_type,
+                       event_key,
+                       payload,
+                       headers,
+                       version,
+                       attempt_count,
+                       max_attempts
                 FROM reliable_event_outbox
                 WHERE id = ?
                 """,
-                (resultSet, rowNumber) -> new StoredEvent(
-                        new EventId(resultSet.getLong("id")),
-                        resultSet.getString("event_type"),
-                        resultSet.getString("event_key"),
-                        resultSet.getString("payload"),
-                        resultSet.getString("headers")
+                (resultSet, rowNumber) -> new ClaimedEvent(
+                        new StoredEvent(
+                                new EventId(resultSet.getLong("id")),
+                                resultSet.getString("event_type"),
+                                resultSet.getString("event_key"),
+                                resultSet.getString("payload"),
+                                resultSet.getString("headers")
+                        ),
+                        resultSet.getLong("version"),
+                        resultSet.getInt("attempt_count"),
+                        resultSet.getInt("max_attempts")
                 ),
                 eventId
         );
     }
 
-    void markPublished(long eventId, Instant publishedAt) {
+    void markPublished(ClaimedEvent claimedEvent, Instant publishedAt) {
         int updated = jdbcTemplate.update(
                 """
                 UPDATE reliable_event_outbox
-                SET status = ?, published_at = ?, updated_at = ?
-                WHERE id = ? AND status = ?
+                SET status = ?,
+                    published_at = ?,
+                    updated_at = ?,
+                    version = version + 1
+                WHERE id = ?
+                  AND status = ?
+                  AND version = ?
                 """,
                 EventStatus.PUBLISHED.code(),
                 Timestamp.from(publishedAt),
                 Timestamp.from(publishedAt),
-                eventId,
-                EventStatus.PUBLISHING.code()
+                claimedEvent.event().id().value(),
+                EventStatus.PUBLISHING.code(),
+                claimedEvent.claimVersion()
         );
         if (updated != 1) {
-            throw new IllegalStateException("Event was not in PUBLISHING state: " + eventId);
+            throw new IllegalStateException(
+                    "Event claim is no longer current: " + claimedEvent.event().id().value()
+            );
+        }
+    }
+
+    void markRetryWait(
+            ClaimedEvent claimedEvent,
+            Instant failedAt,
+            Instant nextAttemptAt,
+            String lastError
+    ) {
+        int updated = jdbcTemplate.update(
+                """
+                UPDATE reliable_event_outbox
+                SET status = ?,
+                    next_attempt_at = ?,
+                    last_error = ?,
+                    updated_at = ?,
+                    version = version + 1
+                WHERE id = ?
+                  AND status = ?
+                  AND version = ?
+                """,
+                EventStatus.RETRY_WAIT.code(),
+                Timestamp.from(nextAttemptAt),
+                lastError,
+                Timestamp.from(failedAt),
+                claimedEvent.event().id().value(),
+                EventStatus.PUBLISHING.code(),
+                claimedEvent.claimVersion()
+        );
+        if (updated != 1) {
+            throw new IllegalStateException(
+                    "Event claim is no longer current: " + claimedEvent.event().id().value()
+            );
+        }
+    }
+
+    void markDead(ClaimedEvent claimedEvent, Instant failedAt, String lastError) {
+        int updated = jdbcTemplate.update(
+                """
+                UPDATE reliable_event_outbox
+                SET status = ?,
+                    last_error = ?,
+                    updated_at = ?,
+                    version = version + 1
+                WHERE id = ?
+                  AND status = ?
+                  AND version = ?
+                """,
+                EventStatus.DEAD.code(),
+                lastError,
+                Timestamp.from(failedAt),
+                claimedEvent.event().id().value(),
+                EventStatus.PUBLISHING.code(),
+                claimedEvent.claimVersion()
+        );
+        if (updated != 1) {
+            throw new IllegalStateException(
+                    "Event claim is no longer current: " + claimedEvent.event().id().value()
+            );
         }
     }
 }

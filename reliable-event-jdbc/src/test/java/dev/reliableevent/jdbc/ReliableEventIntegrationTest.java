@@ -5,6 +5,20 @@ import dev.reliableevent.EventId;
 import dev.reliableevent.MissingActiveTransactionException;
 import dev.reliableevent.ReliableEvent;
 import dev.reliableevent.ReliableEventPublisher;
+import dev.reliableevent.jdbc.internal.cycle.JdbcEventPublicationCycle;
+import dev.reliableevent.jdbc.internal.cycle.PublicationCycleResult;
+import dev.reliableevent.jdbc.internal.model.ClaimedEvent;
+import dev.reliableevent.jdbc.internal.model.EventCandidate;
+import dev.reliableevent.jdbc.internal.model.EventStatus;
+import dev.reliableevent.jdbc.internal.model.ExpiredLeaseCandidate;
+import dev.reliableevent.jdbc.internal.model.StoredEvent;
+import dev.reliableevent.jdbc.internal.persistence.JdbcOutboxRepository;
+import dev.reliableevent.jdbc.internal.publication.EventSendException;
+import dev.reliableevent.jdbc.internal.publication.EventSender;
+import dev.reliableevent.jdbc.internal.publication.JdbcEventPublicationWorker;
+import dev.reliableevent.jdbc.internal.publication.SendReceipt;
+import dev.reliableevent.jdbc.internal.recovery.JdbcExpiredLeaseRecovery;
+import dev.reliableevent.jdbc.internal.retry.ExponentialBackoff;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -36,6 +50,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.CyclicBarrier;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
@@ -53,6 +68,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 @Sql({
         "classpath:schema/reliable-event-outbox.sql",
         "classpath:schema/test-business-record.sql",
+        "classpath:schema/test-message-delivery.sql",
         "classpath:schema/clear-test-data.sql"
 })
 class ReliableEventIntegrationTest {
@@ -350,7 +366,7 @@ class ReliableEventIntegrationTest {
             repository.markDead(
                     claimedEvent,
                     NOW,
-                    "dev.reliableevent.jdbc.EventSendException: missing destination"
+                    EventSendException.class.getName() + ": missing destination"
             );
             return null;
         }))
@@ -601,7 +617,7 @@ class ReliableEventIntegrationTest {
         assertThat(attemptCountOf(eventId)).isOne();
         assertThat(versionOf(eventId)).isEqualTo(2L);
         assertThat(lastErrorOf(eventId))
-                .isEqualTo("dev.reliableevent.jdbc.EventSendException: missing destination");
+                .isEqualTo(EventSendException.class.getName() + ": missing destination");
         assertThat(publishedAtOf(eventId)).isNull();
         assertThat(leaseOwnerOf(eventId)).isNull();
         assertThat(leaseUntilOf(eventId)).isNull();
@@ -893,6 +909,291 @@ class ReliableEventIntegrationTest {
     }
 
     @Test
+    void publicationCycleRecoversExpiredLeasesBeforePublishingDueEvents() {
+        ReliableEventPublisher twoAttemptPublisher = publisherWithMaxAttempts(2);
+        EventId expiredEvent = inTransaction(
+                () -> twoAttemptPublisher.publish(event(315L, NOW.minusSeconds(1)))
+        );
+        EventCandidate expiredCandidate = repository.findDueEventCandidates(NOW, 50).get(0);
+        inTransaction(() -> claim(expiredCandidate, WORKER_ID).orElseThrow());
+        expireLease(expiredEvent, 1);
+        EventId dueEvent = inTransaction(
+                () -> publisher.publish(event(316L, NOW.minusSeconds(1)))
+        );
+        FakeEventSender sender = new FakeEventSender();
+        JdbcEventPublicationCycle cycle = new JdbcEventPublicationCycle(
+                recovery(50, deterministicBackoff()),
+                worker(sender, SECOND_WORKER_ID)
+        );
+
+        Instant databaseTimeBeforeCycle = databaseNow();
+        PublicationCycleResult result = cycle.runOnce();
+        Instant databaseTimeAfterCycle = databaseNow();
+
+        assertThat(result).isEqualTo(new PublicationCycleResult(1, 1));
+        assertThat(statusOf(expiredEvent)).isEqualTo(EventStatus.RETRY_WAIT.code());
+        assertThat(attemptCountOf(expiredEvent)).isOne();
+        assertThat(versionOf(expiredEvent)).isEqualTo(2L);
+        assertThat(nextAttemptAtOf(expiredEvent)).isBetween(
+                databaseTimeBeforeCycle.plusSeconds(1),
+                databaseTimeAfterCycle.plusSeconds(1)
+        );
+        assertThat(statusOf(dueEvent)).isEqualTo(EventStatus.PUBLISHED.code());
+        assertThat(sender.sentEvents)
+                .extracting(StoredEvent::id)
+                .containsExactly(dueEvent);
+    }
+
+    @Test
+    void twoRecoverersCompetingForTheSameRetryableSnapshotRecoverOnlyOnce()
+            throws Exception {
+        ReliableEventPublisher twoAttemptPublisher = publisherWithMaxAttempts(2);
+        EventId eventId = inTransaction(
+                () -> twoAttemptPublisher.publish(event(317L, NOW.minusSeconds(1)))
+        );
+        EventCandidate candidate = repository.findDueEventCandidates(NOW, 50).get(0);
+        inTransaction(() -> claim(candidate, WORKER_ID).orElseThrow());
+        expireLease(eventId, 1);
+        List<ExpiredLeaseCandidate> snapshot =
+                List.copyOf(repository.findExpiredLeaseCandidates(50));
+        assertThat(snapshot).hasSize(1);
+
+        CyclicBarrier transactionStart = new CyclicBarrier(2);
+        JdbcExpiredLeaseRecovery firstRecovery = recovery(
+                50,
+                backoffWaitingAt(transactionStart)
+        );
+        JdbcExpiredLeaseRecovery secondRecovery = recovery(
+                50,
+                backoffWaitingAt(transactionStart)
+        );
+        ExecutorService executor = Executors.newFixedThreadPool(2);
+
+        int firstRecovered;
+        int secondRecovered;
+        try {
+            Future<Integer> firstResult = executor.submit(
+                    () -> firstRecovery.recoverCandidates(snapshot)
+            );
+            Future<Integer> secondResult = executor.submit(
+                    () -> secondRecovery.recoverCandidates(snapshot)
+            );
+
+            firstRecovered = firstResult.get(10, TimeUnit.SECONDS);
+            secondRecovered = secondResult.get(10, TimeUnit.SECONDS);
+        } finally {
+            executor.shutdownNow();
+            assertThat(executor.awaitTermination(5, TimeUnit.SECONDS))
+                    .as("recovery executor terminated")
+                    .isTrue();
+        }
+
+        assertThat(List.of(firstRecovered, secondRecovered))
+                .containsExactlyInAnyOrder(0, 1);
+        assertThat(statusOf(eventId)).isEqualTo(EventStatus.RETRY_WAIT.code());
+        assertThat(attemptCountOf(eventId)).isOne();
+        assertThat(versionOf(eventId)).isEqualTo(2L);
+        assertThat(leaseOwnerOf(eventId)).isNull();
+        assertThat(leaseUntilOf(eventId)).isNull();
+        assertThat(lastErrorOf(eventId))
+                .isEqualTo(JdbcExpiredLeaseRecovery.LEASE_EXPIRED_ERROR);
+    }
+
+    @Test
+    void twoRecoverersCompetingForTheSameExhaustedSnapshotDeadLetterOnlyOnce()
+            throws Exception {
+        ReliableEventPublisher oneAttemptPublisher = publisherWithMaxAttempts(1);
+        EventId eventId = inTransaction(
+                () -> oneAttemptPublisher.publish(event(318L, NOW.minusSeconds(1)))
+        );
+        EventCandidate candidate = repository.findDueEventCandidates(NOW, 50).get(0);
+        inTransaction(() -> claim(candidate, WORKER_ID).orElseThrow());
+        expireLease(eventId, 1);
+        List<ExpiredLeaseCandidate> snapshot =
+                List.copyOf(repository.findExpiredLeaseCandidates(50));
+        assertThat(snapshot).hasSize(1);
+        CountDownLatch ready = new CountDownLatch(2);
+        CountDownLatch start = new CountDownLatch(1);
+        AtomicInteger randomCalls = new AtomicInteger();
+        ExponentialBackoff backoff = new ExponentialBackoff(
+                Duration.ofSeconds(1),
+                Duration.ofMinutes(5),
+                0.2,
+                () -> {
+                    randomCalls.incrementAndGet();
+                    return 0.0;
+                }
+        );
+        ExecutorService executor = Executors.newFixedThreadPool(2);
+
+        int firstRecovered;
+        int secondRecovered;
+        try {
+            Future<Integer> firstResult = executor.submit(() -> recoverAfterSignal(
+                    recovery(50, backoff), snapshot, ready, start
+            ));
+            Future<Integer> secondResult = executor.submit(() -> recoverAfterSignal(
+                    recovery(50, backoff), snapshot, ready, start
+            ));
+
+            assertThat(ready.await(5, TimeUnit.SECONDS))
+                    .as("both recoverers became ready")
+                    .isTrue();
+            start.countDown();
+            firstRecovered = firstResult.get(10, TimeUnit.SECONDS);
+            secondRecovered = secondResult.get(10, TimeUnit.SECONDS);
+        } finally {
+            start.countDown();
+            executor.shutdownNow();
+            assertThat(executor.awaitTermination(5, TimeUnit.SECONDS))
+                    .as("recovery executor terminated")
+                    .isTrue();
+        }
+
+        assertThat(List.of(firstRecovered, secondRecovered))
+                .containsExactlyInAnyOrder(0, 1);
+        assertThat(randomCalls).hasValue(0);
+        assertThat(statusOf(eventId)).isEqualTo(EventStatus.DEAD.code());
+        assertThat(attemptCountOf(eventId)).isOne();
+        assertThat(versionOf(eventId)).isEqualTo(2L);
+        assertThat(leaseOwnerOf(eventId)).isNull();
+        assertThat(leaseUntilOf(eventId)).isNull();
+    }
+
+    @Test
+    void recoveredLeaseRejectsTheOldWorkersSuccessfulCompletion() throws Exception {
+        ReliableEventPublisher twoAttemptPublisher = publisherWithMaxAttempts(2);
+        EventId eventId = inTransaction(
+                () -> twoAttemptPublisher.publish(event(319L, NOW.minusSeconds(1)))
+        );
+        BlockingEventSender oldSender = new BlockingEventSender();
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        Future<Integer> oldResult = null;
+
+        try {
+            oldResult = executor.submit(
+                    () -> worker(oldSender, WORKER_ID).publishDueEvents()
+            );
+            assertThat(oldSender.awaitSend(5, TimeUnit.SECONDS))
+                    .as("old worker entered the sender")
+                    .isTrue();
+            expireLease(eventId, 1);
+
+            assertThat(recovery(50, deterministicBackoff()).recoverExpiredLeases())
+                    .isOne();
+            Instant recoveredNextAttemptAt = nextAttemptAtOf(eventId);
+            String recoveredError = lastErrorOf(eventId);
+
+            oldSender.release();
+            Future<Integer> completedOldResult = oldResult;
+            assertThatThrownBy(() -> completedOldResult.get(10, TimeUnit.SECONDS))
+                    .hasCauseInstanceOf(IllegalStateException.class)
+                    .hasRootCauseMessage(
+                            "Event claim is no longer current: eventId="
+                                    + eventId.value()
+                                    + ", leaseOwner="
+                                    + WORKER_ID
+                    );
+
+            assertThat(statusOf(eventId)).isEqualTo(EventStatus.RETRY_WAIT.code());
+            assertThat(attemptCountOf(eventId)).isOne();
+            assertThat(versionOf(eventId)).isEqualTo(2L);
+            assertThat(nextAttemptAtOf(eventId)).isEqualTo(recoveredNextAttemptAt);
+            assertThat(lastErrorOf(eventId)).isEqualTo(recoveredError);
+            assertThat(publishedAtOf(eventId)).isNull();
+        } finally {
+            oldSender.release();
+            if (oldResult != null && !oldResult.isDone()) {
+                oldResult.cancel(true);
+            }
+            executor.shutdownNow();
+            assertThat(executor.awaitTermination(5, TimeUnit.SECONDS))
+                    .as("old worker executor terminated")
+                    .isTrue();
+        }
+    }
+
+    @Test
+    void newWorkerCompletesAfterRecoveryWithoutBeingOverwrittenByOldWorker()
+            throws Exception {
+        ReliableEventPublisher twoAttemptPublisher = publisherWithMaxAttempts(2);
+        EventId eventId = inTransaction(
+                () -> twoAttemptPublisher.publish(event(320L, NOW.minusSeconds(1)))
+        );
+        BlockingEventSender oldSender = new BlockingEventSender();
+        BlockingEventSender newSender = new BlockingEventSender();
+        ExecutorService executor = Executors.newFixedThreadPool(2);
+        Future<Integer> oldResult = null;
+        Future<Integer> newResult = null;
+
+        try {
+            oldResult = executor.submit(
+                    () -> worker(oldSender, WORKER_ID).publishDueEvents()
+            );
+            assertThat(oldSender.awaitSend(5, TimeUnit.SECONDS))
+                    .as("old worker entered the sender")
+                    .isTrue();
+            expireLease(eventId, 1);
+            assertThat(recovery(50, deterministicBackoff()).recoverExpiredLeases())
+                    .isOne();
+
+            Instant nextAttemptAt = nextAttemptAtOf(eventId);
+            JdbcEventPublicationWorker newWorker = worker(
+                    newSender,
+                    Clock.fixed(nextAttemptAt, ZoneOffset.UTC),
+                    deterministicBackoff(),
+                    SECOND_WORKER_ID
+            );
+            newResult = executor.submit(newWorker::publishDueEvents);
+            assertThat(newSender.awaitSend(5, TimeUnit.SECONDS))
+                    .as("new worker entered the sender")
+                    .isTrue();
+
+            Instant newLeaseUntil = leaseUntilOf(eventId);
+            assertThat(statusOf(eventId)).isEqualTo(EventStatus.PUBLISHING.code());
+            assertThat(attemptCountOf(eventId)).isEqualTo(2);
+            assertThat(versionOf(eventId)).isEqualTo(3L);
+            assertThat(leaseOwnerOf(eventId)).isEqualTo(SECOND_WORKER_ID);
+
+            oldSender.release();
+            Future<Integer> completedOldResult = oldResult;
+            assertThatThrownBy(() -> completedOldResult.get(10, TimeUnit.SECONDS))
+                    .hasCauseInstanceOf(IllegalStateException.class);
+
+            assertThat(statusOf(eventId)).isEqualTo(EventStatus.PUBLISHING.code());
+            assertThat(attemptCountOf(eventId)).isEqualTo(2);
+            assertThat(versionOf(eventId)).isEqualTo(3L);
+            assertThat(leaseOwnerOf(eventId)).isEqualTo(SECOND_WORKER_ID);
+            assertThat(leaseUntilOf(eventId)).isEqualTo(newLeaseUntil);
+
+            newSender.release();
+            assertThat(newResult.get(10, TimeUnit.SECONDS)).isOne();
+
+            assertThat(statusOf(eventId)).isEqualTo(EventStatus.PUBLISHED.code());
+            assertThat(attemptCountOf(eventId)).isEqualTo(2);
+            assertThat(versionOf(eventId)).isEqualTo(4L);
+            assertThat(leaseOwnerOf(eventId)).isNull();
+            assertThat(leaseUntilOf(eventId)).isNull();
+            assertThat(publishedAtOf(eventId)).isEqualTo(nextAttemptAt);
+            assertThat(oldSender.sendCount()).isOne();
+            assertThat(newSender.sendCount()).isOne();
+        } finally {
+            oldSender.release();
+            newSender.release();
+            if (oldResult != null && !oldResult.isDone()) {
+                oldResult.cancel(true);
+            }
+            if (newResult != null && !newResult.isDone()) {
+                newResult.cancel(true);
+            }
+            executor.shutdownNow();
+            assertThat(executor.awaitTermination(5, TimeUnit.SECONDS))
+                    .as("takeover executor terminated")
+                    .isTrue();
+        }
+    }
+
+    @Test
     void deadEventDoesNotStopLaterCandidatesInTheSameBatch() {
         EventId deadEvent = inTransaction(
                 () -> publisher.publish(event(209L, NOW.minusSeconds(1)))
@@ -936,13 +1237,22 @@ class ReliableEventIntegrationTest {
             Clock clock,
             ExponentialBackoff backoff
     ) {
+        return worker(sender, clock, backoff, WORKER_ID);
+    }
+
+    private JdbcEventPublicationWorker worker(
+            EventSender sender,
+            Clock clock,
+            ExponentialBackoff backoff,
+            String workerId
+    ) {
         return new JdbcEventPublicationWorker(
                 jdbcTemplate,
                 transactionManager,
                 sender,
                 clock,
                 50,
-                WORKER_ID,
+                workerId,
                 LEASE_DURATION,
                 backoff
         );
@@ -1024,6 +1334,38 @@ class ReliableEventIntegrationTest {
             throw new IllegalStateException("Timed out waiting for concurrent start signal");
         }
         return worker.publishCandidates(List.of(candidate));
+    }
+
+    private int recoverAfterSignal(
+            JdbcExpiredLeaseRecovery recovery,
+            List<ExpiredLeaseCandidate> candidates,
+            CountDownLatch ready,
+            CountDownLatch start
+    ) throws InterruptedException {
+        ready.countDown();
+        if (!start.await(5, TimeUnit.SECONDS)) {
+            throw new IllegalStateException("Timed out waiting for concurrent recovery signal");
+        }
+        return recovery.recoverCandidates(candidates);
+    }
+
+    private ExponentialBackoff backoffWaitingAt(CyclicBarrier barrier) {
+        return new ExponentialBackoff(
+                Duration.ofSeconds(1),
+                Duration.ofMinutes(5),
+                0.2,
+                () -> {
+                    try {
+                        barrier.await(5, TimeUnit.SECONDS);
+                        return 0.0;
+                    } catch (Exception exception) {
+                        throw new IllegalStateException(
+                                "Timed out waiting for concurrent recovery transaction",
+                                exception
+                        );
+                    }
+                }
+        );
     }
 
     private ReliableEvent<CouponTaskPayload> event(long taskId, Instant availableAt) {
@@ -1192,6 +1534,40 @@ class ReliableEventIntegrationTest {
 
         List<StoredEvent> sentEvents() {
             return List.copyOf(sentEvents);
+        }
+    }
+
+    private static final class BlockingEventSender implements EventSender {
+
+        private final CountDownLatch sendStarted = new CountDownLatch(1);
+        private final CountDownLatch releaseSend = new CountDownLatch(1);
+        private final AtomicInteger sendCount = new AtomicInteger();
+
+        @Override
+        public SendReceipt send(StoredEvent event) {
+            sendCount.incrementAndGet();
+            sendStarted.countDown();
+            try {
+                if (!releaseSend.await(10, TimeUnit.SECONDS)) {
+                    throw new IllegalStateException("Timed out waiting to release sender");
+                }
+            } catch (InterruptedException exception) {
+                Thread.currentThread().interrupt();
+                throw new IllegalStateException("Interrupted while waiting to release sender", exception);
+            }
+            return new SendReceipt("blocking-fake-" + event.id().value());
+        }
+
+        boolean awaitSend(long timeout, TimeUnit unit) throws InterruptedException {
+            return sendStarted.await(timeout, unit);
+        }
+
+        void release() {
+            releaseSend.countDown();
+        }
+
+        int sendCount() {
+            return sendCount.get();
         }
     }
 

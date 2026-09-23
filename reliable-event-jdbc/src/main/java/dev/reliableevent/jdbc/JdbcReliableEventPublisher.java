@@ -7,6 +7,7 @@ import dev.reliableevent.MissingActiveTransactionException;
 import dev.reliableevent.ReliableEvent;
 import dev.reliableevent.ReliableEventPublisher;
 import dev.reliableevent.ReliableEventSerializationException;
+import dev.reliableevent.jdbc.internal.persistence.JdbcOutboxRepository;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 

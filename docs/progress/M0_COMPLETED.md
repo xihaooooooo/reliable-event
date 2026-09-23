@@ -3,9 +3,9 @@
 ## 这一阶段做了什么
 
 - 建立了 Maven 父工程，并先创建一个 `reliable-event-jdbc` 模块。
-- 固定使用 Java 17、Spring Boot 3 和 MySQL 5.7。
+- 固定使用 Java 17、Spring Boot 3 和 MySQL 8.0。
 - 创建了 `reliable_event_outbox` 表，保存等待发布的事件。
-- 使用 Testcontainers，让测试自动启动真实的 MySQL 5.7。
+- 使用 Testcontainers，让测试自动启动真实的 MySQL 8.0。
 - 编写了事务提交和事务回滚两个集成测试。
 
 ## 现在证明了什么

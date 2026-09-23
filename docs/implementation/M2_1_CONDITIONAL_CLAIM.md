@@ -91,7 +91,7 @@ WHERE id = ?
 - `attempt_count` 只在抢占成功时增加；
 - 本阶段只允许从 `PENDING` 抢占，`RETRY_WAIT` 在 M2.3 引入。
 
-MySQL 5.7 没有 `UPDATE ... RETURNING`。抢占成功后，在同一个短事务中按 ID 读取事件内容，并构造：
+MySQL 8.0 没有 `UPDATE ... RETURNING`。抢占成功后，在同一个短事务中按 ID 读取事件内容，并构造：
 
 ```text
 ClaimedEvent(storedEvent, claimVersion)
@@ -158,7 +158,7 @@ Worker 仍然可以按批次顺序处理，不在 M2.1 引入并行线程池。
 
 ## 测试清单
 
-继续使用 MySQL 5.7 Testcontainers，至少增加以下验证：
+继续使用 MySQL 8.0 Testcontainers，至少增加以下验证：
 
 1. 到期事件候选包含数据库中的当前版本；
 2. 使用正确的候选版本能够抢占，状态变为 `PUBLISHING`；

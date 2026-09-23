@@ -5,11 +5,14 @@ import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.support.TransactionTemplate;
 
 import java.time.Clock;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
 import java.util.Objects;
 
 final class JdbcEventPublicationWorker {
+
+    private static final int MAX_WORKER_ID_LENGTH = 128;
 
     private final JdbcOutboxRepository repository;
     private final EventSender sender;
@@ -17,13 +20,17 @@ final class JdbcEventPublicationWorker {
     private final Clock clock;
     private final int batchSize;
     private final ExponentialBackoff backoff;
+    private final String workerId;
+    private final Duration leaseDuration;
 
     JdbcEventPublicationWorker(
             JdbcTemplate jdbcTemplate,
             PlatformTransactionManager transactionManager,
             EventSender sender,
             Clock clock,
-            int batchSize
+            int batchSize,
+            String workerId,
+            Duration leaseDuration
     ) {
         this(
                 jdbcTemplate,
@@ -31,6 +38,8 @@ final class JdbcEventPublicationWorker {
                 sender,
                 clock,
                 batchSize,
+                workerId,
+                leaseDuration,
                 ExponentialBackoff.defaults()
         );
     }
@@ -41,16 +50,31 @@ final class JdbcEventPublicationWorker {
             EventSender sender,
             Clock clock,
             int batchSize,
+            String workerId,
+            Duration leaseDuration,
             ExponentialBackoff backoff
     ) {
         if (batchSize <= 0) {
             throw new IllegalArgumentException("batchSize must be positive");
         }
+        if (workerId == null || workerId.isBlank()) {
+            throw new IllegalArgumentException("workerId must not be blank");
+        }
+        if (workerId.codePointCount(0, workerId.length()) > MAX_WORKER_ID_LENGTH) {
+            throw new IllegalArgumentException("workerId must not exceed 128 characters");
+        }
+        Objects.requireNonNull(leaseDuration, "leaseDuration must not be null");
+        if (leaseDuration.toMillis() <= 0) {
+            throw new IllegalArgumentException("leaseDuration must be at least one millisecond");
+        }
+        Math.multiplyExact(leaseDuration.toMillis(), 1_000L);
         this.repository = new JdbcOutboxRepository(Objects.requireNonNull(jdbcTemplate));
         this.transaction = new TransactionTemplate(Objects.requireNonNull(transactionManager));
         this.sender = Objects.requireNonNull(sender);
         this.clock = Objects.requireNonNull(clock);
         this.batchSize = batchSize;
+        this.workerId = workerId;
+        this.leaseDuration = leaseDuration;
         this.backoff = Objects.requireNonNull(backoff);
     }
 
@@ -65,7 +89,12 @@ final class JdbcEventPublicationWorker {
         int publishedCount = 0;
         for (EventCandidate candidate : candidates) {
             ClaimedEvent claimedEvent = transaction.execute(
-                    status -> repository.claim(candidate, now).orElse(null)
+                    status -> repository.claim(
+                            candidate,
+                            now,
+                            workerId,
+                            leaseDuration
+                    ).orElse(null)
             );
             if (claimedEvent == null) {
                 continue;

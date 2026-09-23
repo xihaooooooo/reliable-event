@@ -23,7 +23,7 @@ PENDING → PUBLISHING → RETRY_WAIT
 
 ## 验证结果
 
-使用 Java 17 和 MySQL 5.7.44 Testcontainers 执行 `mvn clean verify`，共 19 个测试全部通过：
+使用 Java 17 和 MySQL 8.0.36 Testcontainers 执行 `mvn clean verify`，共 19 个测试全部通过：
 
 - 7 个单元测试覆盖指数增长、最大基础延迟、确定性抖动、非法配置、错误摘要和 Unicode 安全截断；
 - 12 个集成测试覆盖原有事务、幂等、条件抢占和双 Worker 竞争，以及新增的失败等待、提前扫描不重试、到期重试成功、旧版本失败更新拒绝和同批次继续处理。

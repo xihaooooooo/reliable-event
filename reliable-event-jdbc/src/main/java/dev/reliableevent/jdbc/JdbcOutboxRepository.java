@@ -7,8 +7,10 @@ import org.springframework.jdbc.support.KeyHolder;
 
 import java.sql.Statement;
 import java.sql.Timestamp;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
+import java.util.Objects;
 import java.util.Optional;
 
 final class JdbcOutboxRepository {
@@ -96,12 +98,53 @@ final class JdbcOutboxRepository {
         );
     }
 
-    Optional<ClaimedEvent> claim(EventCandidate candidate, Instant now) {
+    List<ExpiredLeaseCandidate> findExpiredLeaseCandidates(int limit) {
+        if (limit <= 0) {
+            throw new IllegalArgumentException("limit must be positive");
+        }
+        return jdbcTemplate.query(
+                """
+                SELECT id,
+                       version,
+                       lease_owner,
+                       lease_until,
+                       attempt_count,
+                       max_attempts
+                FROM reliable_event_outbox
+                WHERE status = ?
+                  AND lease_owner IS NOT NULL
+                  AND TRIM(lease_owner) <> ''
+                  AND lease_until <= UTC_TIMESTAMP(3)
+                ORDER BY lease_until, id
+                LIMIT ?
+                """,
+                (resultSet, rowNumber) -> new ExpiredLeaseCandidate(
+                        new EventId(resultSet.getLong("id")),
+                        resultSet.getLong("version"),
+                        resultSet.getString("lease_owner"),
+                        resultSet.getTimestamp("lease_until").toInstant(),
+                        resultSet.getInt("attempt_count"),
+                        resultSet.getInt("max_attempts")
+                ),
+                EventStatus.PUBLISHING.code(),
+                limit
+        );
+    }
+
+    Optional<ClaimedEvent> claim(
+            EventCandidate candidate,
+            Instant now,
+            String leaseOwner,
+            Duration leaseDuration
+    ) {
+        long leaseDurationMicros = Math.multiplyExact(leaseDuration.toMillis(), 1_000L);
         int updated = jdbcTemplate.update(
                 """
                 UPDATE reliable_event_outbox
                 SET status = ?,
                     attempt_count = attempt_count + 1,
+                    lease_owner = ?,
+                    lease_until = TIMESTAMPADD(MICROSECOND, ?, UTC_TIMESTAMP(3)),
                     version = version + 1,
                     updated_at = ?
                 WHERE id = ?
@@ -111,6 +154,8 @@ final class JdbcOutboxRepository {
                   AND version = ?
                 """,
                 EventStatus.PUBLISHING.code(),
+                leaseOwner,
+                leaseDurationMicros,
                 Timestamp.from(now),
                 candidate.id().value(),
                 EventStatus.PENDING.code(),
@@ -134,7 +179,9 @@ final class JdbcOutboxRepository {
                        headers,
                        version,
                        attempt_count,
-                       max_attempts
+                       max_attempts,
+                       lease_owner,
+                       lease_until
                 FROM reliable_event_outbox
                 WHERE id = ?
                 """,
@@ -148,7 +195,9 @@ final class JdbcOutboxRepository {
                         ),
                         resultSet.getLong("version"),
                         resultSet.getInt("attempt_count"),
-                        resultSet.getInt("max_attempts")
+                        resultSet.getInt("max_attempts"),
+                        resultSet.getString("lease_owner"),
+                        resultSet.getTimestamp("lease_until").toInstant()
                 ),
                 eventId
         );
@@ -160,23 +209,26 @@ final class JdbcOutboxRepository {
                 UPDATE reliable_event_outbox
                 SET status = ?,
                     published_at = ?,
+                    lease_owner = NULL,
+                    lease_until = NULL,
                     updated_at = ?,
                     version = version + 1
                 WHERE id = ?
                   AND status = ?
                   AND version = ?
+                  AND lease_owner = ?
+                  AND lease_until > UTC_TIMESTAMP(3)
                 """,
                 EventStatus.PUBLISHED.code(),
                 Timestamp.from(publishedAt),
                 Timestamp.from(publishedAt),
                 claimedEvent.event().id().value(),
                 EventStatus.PUBLISHING.code(),
-                claimedEvent.claimVersion()
+                claimedEvent.claimVersion(),
+                claimedEvent.leaseOwner()
         );
         if (updated != 1) {
-            throw new IllegalStateException(
-                    "Event claim is no longer current: " + claimedEvent.event().id().value()
-            );
+            throw staleClaim(claimedEvent);
         }
     }
 
@@ -192,11 +244,15 @@ final class JdbcOutboxRepository {
                 SET status = ?,
                     next_attempt_at = ?,
                     last_error = ?,
+                    lease_owner = NULL,
+                    lease_until = NULL,
                     updated_at = ?,
                     version = version + 1
                 WHERE id = ?
                   AND status = ?
                   AND version = ?
+                  AND lease_owner = ?
+                  AND lease_until > UTC_TIMESTAMP(3)
                 """,
                 EventStatus.RETRY_WAIT.code(),
                 Timestamp.from(nextAttemptAt),
@@ -204,12 +260,11 @@ final class JdbcOutboxRepository {
                 Timestamp.from(failedAt),
                 claimedEvent.event().id().value(),
                 EventStatus.PUBLISHING.code(),
-                claimedEvent.claimVersion()
+                claimedEvent.claimVersion(),
+                claimedEvent.leaseOwner()
         );
         if (updated != 1) {
-            throw new IllegalStateException(
-                    "Event claim is no longer current: " + claimedEvent.event().id().value()
-            );
+            throw staleClaim(claimedEvent);
         }
     }
 
@@ -219,23 +274,110 @@ final class JdbcOutboxRepository {
                 UPDATE reliable_event_outbox
                 SET status = ?,
                     last_error = ?,
+                    lease_owner = NULL,
+                    lease_until = NULL,
                     updated_at = ?,
                     version = version + 1
                 WHERE id = ?
                   AND status = ?
                   AND version = ?
+                  AND lease_owner = ?
+                  AND lease_until > UTC_TIMESTAMP(3)
                 """,
                 EventStatus.DEAD.code(),
                 lastError,
                 Timestamp.from(failedAt),
                 claimedEvent.event().id().value(),
                 EventStatus.PUBLISHING.code(),
-                claimedEvent.claimVersion()
+                claimedEvent.claimVersion(),
+                claimedEvent.leaseOwner()
         );
         if (updated != 1) {
-            throw new IllegalStateException(
-                    "Event claim is no longer current: " + claimedEvent.event().id().value()
-            );
+            throw staleClaim(claimedEvent);
         }
+    }
+
+    boolean recoverExpiredLeaseToRetryWait(
+            ExpiredLeaseCandidate candidate,
+            Duration delay,
+            String lastError
+    ) {
+        long delayMicros = positiveDurationMicros(delay, "delay");
+        int updated = jdbcTemplate.update(
+                """
+                UPDATE reliable_event_outbox
+                SET status = ?,
+                    next_attempt_at = TIMESTAMPADD(MICROSECOND, ?, UTC_TIMESTAMP(3)),
+                    last_error = ?,
+                    lease_owner = NULL,
+                    lease_until = NULL,
+                    updated_at = UTC_TIMESTAMP(3),
+                    version = version + 1
+                WHERE id = ?
+                  AND status = ?
+                  AND version = ?
+                  AND lease_owner = ?
+                  AND lease_until = ?
+                  AND lease_until <= UTC_TIMESTAMP(3)
+                """,
+                EventStatus.RETRY_WAIT.code(),
+                delayMicros,
+                Objects.requireNonNull(lastError, "lastError must not be null"),
+                candidate.id().value(),
+                EventStatus.PUBLISHING.code(),
+                candidate.version(),
+                candidate.leaseOwner(),
+                Timestamp.from(candidate.leaseUntil())
+        );
+        return updated == 1;
+    }
+
+    boolean recoverExpiredLeaseToDead(
+            ExpiredLeaseCandidate candidate,
+            String lastError
+    ) {
+        int updated = jdbcTemplate.update(
+                """
+                UPDATE reliable_event_outbox
+                SET status = ?,
+                    last_error = ?,
+                    lease_owner = NULL,
+                    lease_until = NULL,
+                    updated_at = UTC_TIMESTAMP(3),
+                    version = version + 1
+                WHERE id = ?
+                  AND status = ?
+                  AND version = ?
+                  AND lease_owner = ?
+                  AND lease_until = ?
+                  AND lease_until <= UTC_TIMESTAMP(3)
+                """,
+                EventStatus.DEAD.code(),
+                Objects.requireNonNull(lastError, "lastError must not be null"),
+                candidate.id().value(),
+                EventStatus.PUBLISHING.code(),
+                candidate.version(),
+                candidate.leaseOwner(),
+                Timestamp.from(candidate.leaseUntil())
+        );
+        return updated == 1;
+    }
+
+    private IllegalStateException staleClaim(ClaimedEvent claimedEvent) {
+        return new IllegalStateException(
+                "Event claim is no longer current: eventId="
+                        + claimedEvent.event().id().value()
+                        + ", leaseOwner="
+                        + claimedEvent.leaseOwner()
+        );
+    }
+
+    private long positiveDurationMicros(Duration duration, String name) {
+        Objects.requireNonNull(duration, name + " must not be null");
+        long millis = duration.toMillis();
+        if (millis <= 0) {
+            throw new IllegalArgumentException(name + " must be at least one millisecond");
+        }
+        return Math.multiplyExact(millis, 1_000L);
     }
 }

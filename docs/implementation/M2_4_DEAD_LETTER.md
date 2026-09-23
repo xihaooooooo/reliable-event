@@ -333,7 +333,7 @@ catch RuntimeException from sender
 - 条件更新影响零行并明确失败；
 - 当前数据库状态不被覆盖。
 
-测试继续使用固定 `Clock`、确定性退避和 MySQL 5.7 Testcontainers，不依赖真实等待。
+测试继续使用固定 `Clock`、确定性退避和 MySQL 8.0 Testcontainers，不依赖真实等待。
 
 ## 完成标准
 
@@ -348,7 +348,7 @@ catch RuntimeException from sender
 - 死信更新校验抢占版本并保存错误摘要；
 - 一个事件进入死信不会阻断同批次其他候选；
 - M0 至 M2.3 的已有测试继续通过；
-- `mvn clean verify` 在 Java 17 和 MySQL 5.7 下通过。
+- `mvn clean verify` 在 Java 17 和 MySQL 8.0 下通过。
 
 ## 本阶段明确不做
 
@@ -380,7 +380,7 @@ M2.4 能处理 Sender 明确返回的成功或异常，但仍不能覆盖进程�
 
 完成 M2.4 后，可以表述已经实现：
 
-- MySQL 5.7 版本号条件抢占；
+- MySQL 8.0 版本号条件抢占；
 - 双 Worker 并发竞争保护；
 - 带随机抖动的指数退避；
 - 最大尝试次数；

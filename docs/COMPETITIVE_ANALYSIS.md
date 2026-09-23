@@ -17,7 +17,7 @@ ReliableEvent 所解决的“业务数据与待发送消息无法共享原子提
 
 因此，ReliableEvent 的合理定位是：
 
-> 面向 Spring Boot 3、MySQL 5.7 和 RocketMQ 的轻量 Transactional Outbox Starter；以明确的状态机、MySQL 5.7 多实例条件抢占、租约恢复和可复现故障测试证明至少一次投递行为。
+> 面向 Spring Boot 3、MySQL 8.0 和 RocketMQ 的轻量 Transactional Outbox Starter；以明确的状态机、MySQL 8.0 多实例条件抢占、租约恢复和可复现故障测试证明至少一次投递行为。
 
 这是一条有实际区分度的窄路线，但不是“没有同类产品”的原创类别。真正的项目价值来自约束下的设计选择、完成度和证据，而不是模式名称。
 
@@ -52,11 +52,11 @@ ReliableEvent 所解决的“业务数据与待发送消息无法共享原子提
 - JSON Payload 与字符串 Header 持久化；
 - 使用 `event_type + event_key` 防止重复登记；
 - 按 `next_attempt_at` 过滤尚未到期的首次事件和重试事件；
-- 使用候选版本与条件更新完成 MySQL 5.7 多 Worker 抢占；
+- 使用候选版本与条件更新完成 MySQL 8.0 多 Worker 抢占；
 - 将抢占、外部发送和结果更新拆为短事务，Fake Sender 调用发生在数据库事务外；
 - 实现 `PENDING → PUBLISHING → PUBLISHED / RETRY_WAIT / DEAD` 状态流转；
 - 实现带抖动的指数退避、最大总尝试次数和显式不可重试错误；
-- 使用真实 MySQL 5.7 Testcontainers 验证双 Worker 竞争，同一候选版本只有一个 Worker 调用 Sender；
+- 使用真实 MySQL 8.0 Testcontainers 验证双 Worker 竞争，同一候选版本只有一个 Worker 调用 Sender；
 - M2 完成时共有 10 个单元测试和 17 个 MySQL 集成测试。
 
 上述“唯一执行权”只覆盖当前抢占竞争，不等于消息只会发送一次，也不覆盖抢占成功后进程退出的恢复窗口。
@@ -86,7 +86,7 @@ ReliableEvent 所解决的“业务数据与待发送消息无法共享原子提
 6. **编程模型**：事件信封、Spring 应用事件、方法调用、命令/事件平台；
 7. **基础设施边界**：需要哪些数据库、Broker、Connector 或独立服务；
 8. **可观测性与可测试性**：状态是否可查，是否提供指标、测试夹具或运维 API；
-9. **与当前技术栈的贴合度**：Spring Boot 3、MySQL 5.7、RocketMQ。
+9. **与当前技术栈的贴合度**：Spring Boot 3、MySQL 8.0、RocketMQ。
 
 ## 5. 总览
 
@@ -123,8 +123,8 @@ ReliableEvent 所解决的“业务数据与待发送消息无法共享原子提
 #### 差异
 
 - 它的核心抽象是“序列化并重放方法调用”，ReliableEvent 的核心抽象是稳定的事件信封和 RocketMQ 发布；
-- 它面向多框架、多数据库和任意副作用，ReliableEvent `0.1.0` 有意收窄到 Spring Boot 3、MySQL 5.7、RocketMQ；
-- 它在 MySQL 5.7 上建议规避并发 `flush()`，ReliableEvent 已选择 `id + status + next_attempt_at + version` 条件更新，并用双 Worker 测试证明同一候选版本的唯一执行权；
+- 它面向多框架、多数据库和任意副作用，ReliableEvent `0.1.0` 有意收窄到 Spring Boot 3、MySQL 8.0、RocketMQ；
+- 它在 MySQL 5.7 上建议规避并发 `flush()`；ReliableEvent 的当前基线是 MySQL 8.0，但仍选择 `id + status + next_attempt_at + version` 条件更新，并用双 Worker 测试证明同一候选版本的唯一执行权；
 - 它支持命名 Topic 的 FIFO 处理、嵌套 Outbox、方法参数序列化扩展等能力，而 ReliableEvent 第一版明确不保证顺序，也不做通用后台任务系统。[顺序能力说明](https://github.com/gruelbox/transaction-outbox#topics-and-fifo-ordering)
 
 #### 可借鉴
@@ -139,7 +139,7 @@ ReliableEvent 所解决的“业务数据与待发送消息无法共享原子提
 
 - 不应把 `ReliableEventPublisher.publish(event)` 改成动态代理方法调用 API；这会模糊“消息发布”边界并扩大序列化攻击面；
 - 不应为了功能对齐而在 `0.1.0` 增加 FIFO Topic、嵌套任务或任意远程调用；
-- 不应照搬基于 `SKIP LOCKED` 的并发策略，因为本项目明确要求 MySQL 5.7；
+- 不应只因 MySQL 8.0 提供 `SKIP LOCKED` 就立即替换已经验证的条件更新协议；切换前必须比较吞吐、锁等待、事务边界和故障语义；
 - 不应复制其表结构、配置命名或源码实现。即使许可证允许复用，任何代码级复用也必须单独审查许可证、保留声明并记录来源。
 
 ### 6.2 Spring Modulith Event Publication Registry
@@ -297,7 +297,7 @@ RocketMQ 事务消息先向 Broker 写入对消费者不可见的 Half Message�
 
 | 来源 | 可借鉴到 ReliableEvent | 建议阶段 | 不应照搬 |
 | --- | --- | --- | --- |
-| `transaction-outbox` | blocked/dead 告警、受控 unblock、队列饱和信号、序列化安全、测试替身 | M4/M5；人工重放评估放到 0.2.0 | 方法调用代理、通用任务执行、MySQL 5.7 上的 `SKIP LOCKED` 路线 |
+| `transaction-outbox` | blocked/dead 告警、受控 unblock、队列饱和信号、序列化安全、测试替身 | M4/M5；人工重放评估放到 0.2.0 | 方法调用代理、通用任务执行；未经基准对比直接切换到 `SKIP LOCKED` |
 | Spring Modulith | 陈旧处理、失败与处理中分离、限流重提交、已完成记录清理 API | M3/M4/M5 | 绑定模块事件模型、按监听器展开、照搬状态命名 |
 | Eventuate Tram | Producer/Relay 边界、健康与延迟指标、生产与消费测试样例 | M4/M5 | CDC 服务、Saga/CQRS、命令平台、多 Broker 扩张 |
 | Debezium | 稳定事件信封、事件 ID 去重、Schema 演进、路由与 Payload 分离 | M4/M5 | CDC/Binlog、Insert-only 表、Kafka 顺序模型 |
@@ -311,7 +311,7 @@ RocketMQ 事务消息先向 Broker 写入对消费者不可见的 Half Message�
 
 截至 M2，ReliableEvent 更准确的描述是：
 
-> 一个已经完成事务内事件登记、MySQL 5.7 条件抢占、双 Worker 竞争验证、退避重试和死信终态的 Transactional Outbox 核心原型；目标是演进为 Spring Boot 3 + MySQL 5.7 + RocketMQ Starter。
+> 一个已经完成事务内事件登记、MySQL 8.0 条件抢占、双 Worker 竞争验证、退避重试和死信终态的 Transactional Outbox 核心原型；目标是演进为 Spring Boot 3 + MySQL 8.0 + RocketMQ Starter。
 
 它目前还不是：
 
@@ -323,8 +323,8 @@ RocketMQ 事务消息先向 Broker 写入对消费者不可见的 Half Message�
 
 ### 8.2 可以形成差异的地方
 
-- **约束明确**：只面向 Spring Boot 3、MySQL 5.7、RocketMQ，不假装首版支持所有组合；
-- **MySQL 5.7 并发路径明确**：不依赖 `SKIP LOCKED`，使用候选版本和条件更新竞争执行权；
+- **约束明确**：只面向 Spring Boot 3、MySQL 8.0、RocketMQ，不假装首版支持所有组合；
+- **MySQL 8.0 并发路径明确**：当前使用候选版本和条件更新竞争执行权，不因数据库升级自动改变并发协议；
 - **状态可解释**：首次待发、处理中、重试等待、成功、死信均有持久化状态；
 - **测试优先于宣传**：事务、并发、退避和死信已有真实 MySQL 测试，后续继续用故障注入证明崩溃窗口；
 - **公共 API 收窄**：业务方只登记事件，不接触租约、重试、线程池或 RocketMQ 客户端细节。
@@ -363,7 +363,7 @@ RocketMQ 事务消息先向 Broker 写入对消费者不可见的 Half Message�
 ### 9.4 暂缓到 `0.2.0` 再评估
 
 - 受控人工重放与审计；
-- MySQL 8 `SKIP LOCKED` 策略；
+- 经过基准对比的 `SKIP LOCKED` 替代策略；
 - 顺序分组；
 - Schema Registry 或 Avro；
 - 第二种数据库或消息中间件；
@@ -373,7 +373,7 @@ RocketMQ 事务消息先向 Broker 写入对消费者不可见的 Half Message�
 
 ## 10. 最终判断
 
-ReliableEvent 已经借鉴了 Transactional Outbox 这一行业模式，也自然使用了状态机、重试、死信和幂等键等成熟思想；从当前代码与文档看，它走的是针对 MySQL 5.7 约束自行设计和验证的实现路线，而不是对某个项目公共 API 或源码的直接复刻。
+ReliableEvent 已经借鉴了 Transactional Outbox 这一行业模式，也自然使用了状态机、重试、死信和幂等键等成熟思想；从当前代码与文档看，它走的是在 MySQL 8.0 上自行设计和验证版本条件更新协议的实现路线，而不是对某个项目公共 API 或源码的直接复刻。
 
 接下来最值得借鉴的不是更多功能，而是成熟项目对以下问题的处理纪律：
 

@@ -346,7 +346,7 @@ catch RuntimeException from sender
 - 未到 `next_attempt_at` 的事件不能再次发送；
 - 一个事件发送失败不会阻断同批次其他候选；
 - M0、M1、M2.1、M2.2 的测试继续通过；
-- `mvn clean verify` 在 Java 17 和 MySQL 5.7 下通过。
+- `mvn clean verify` 在 Java 17 和 MySQL 8.0 下通过。
 
 ## 本阶段明确不做
 

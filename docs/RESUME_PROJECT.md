@@ -8,11 +8,11 @@
 
 ### ReliableEvent——基于 Transactional Outbox 的 RocketMQ 可靠消息 Starter（个人项目，开发中）
 
-`2026.09—至今`　设计技术栈：Java 17、Spring Boot 3、MySQL 5.7、RocketMQ、Micrometer、Testcontainers
+`2026.09—至今`　设计技术栈：Java 17、Spring Boot 3、MySQL 8.0、RocketMQ、Micrometer、Testcontainers
 
 - 针对业务数据库与 RocketMQ 双写时可能出现的数据已提交但消息丢失、消息已发送但事务回滚等一致性问题，完成基于 Transactional Outbox 的可靠消息方案设计，将业务数据与待发布事件纳入同一本地事务。
 - 设计 `PENDING → PUBLISHING → PUBLISHED / RETRY_WAIT / DEAD` 事件状态机，明确系统采用至少一次投递语义，并将事件唯一键和消费者幂等作为重复消息处理机制。
-- 面向 MySQL 5.7 设计基于版本号条件更新的多实例事件抢占方案，以及任务租约、指数退避、死信和宕机恢复机制；同步制定事务回滚、并发竞争和发布进程异常退出等故障测试矩阵。
+- 面向 MySQL 8.0 设计基于版本号条件更新的多实例事件抢占方案，以及任务租约、指数退避、死信和宕机恢复机制；同步制定事务回滚、并发竞争和发布进程异常退出等故障测试矩阵。
 - 规划以 Spring Boot Starter 形式提供单一事件发布接口，并在优惠券任务创建链路中验证业务记录与 Outbox 事件的原子提交；当前正在实现最小发布闭环。
 
 ### 当前版本不能写的内容
@@ -33,11 +33,11 @@
 
 ### ReliableEvent——基于 Transactional Outbox 的 RocketMQ 可靠消息 Starter（个人开源项目）
 
-`2026.09—至今`　Java 17、Spring Boot 3、MySQL 5.7、Jackson、Testcontainers
+`2026.09—至今`　Java 17、Spring Boot 3、MySQL 8.0、Jackson、Testcontainers
 
 - 针对业务数据库与消息系统双写不一致问题，设计并实现 Transactional Outbox 最小闭环，使业务数据与待发布事件通过同一本地事务原子提交，并在事务回滚测试中验证事件不会被错误保留。
 - 设计统一的 `ReliableEventPublisher` 接口，将事件序列化、Outbox持久化、状态流转和后台发布隐藏在模块内部，降低业务方接入复杂度。
-- 基于 MySQL 5.7 版本号条件更新实现事件抢占，通过双 Worker 并发集成测试验证相同候选版本只有一个执行者能够发送事件。
+- 基于 MySQL 8.0 版本号条件更新实现事件抢占，通过双 Worker 并发集成测试验证相同候选版本只有一个执行者能够发送事件。
 - 实现带随机抖动的指数退避、最大尝试次数和 `DEAD` 终态，并通过 Testcontainers 覆盖未到期不重试、重试耗尽和不可重试错误场景。
 
 ## 版本 C：完成 M3 后替换
@@ -46,10 +46,10 @@
 
 ### ReliableEvent——基于 Transactional Outbox 的 RocketMQ 可靠消息 Starter（个人开源项目）
 
-`2026.09—至今`　Java 17、Spring Boot 3、MySQL 5.7、Jackson、Micrometer、Testcontainers
+`2026.09—至今`　Java 17、Spring Boot 3、MySQL 8.0、Jackson、Micrometer、Testcontainers
 
 - 基于 Transactional Outbox 实现业务数据与待发布事件的本地事务原子提交，解决数据库提交成功但消息未发送、消息先于事务提交等一致性窗口。
-- 针对 MySQL 5.7 设计版本号条件更新抢占机制，通过受影响行数判定租约归属，完成双实例并发竞争测试，避免同一时刻多个发布实例处理同一事件。
+- 针对 MySQL 8.0 设计版本号条件更新抢占机制，通过受影响行数判定租约归属，完成双实例并发竞争测试，避免同一时刻多个发布实例处理同一事件。
 - 实现带随机抖动的指数退避、最大尝试次数、死信和任务租约；通过主动终止发布进程验证租约过期事件可被其他实例恢复执行。
 - 明确采用至少一次投递语义，针对“Broker已接收但状态未更新”的重复消息窗口设计稳定事件键与消费者幂等约束，不对外承诺 Exactly Once。
 
@@ -59,10 +59,10 @@
 
 ### ReliableEvent——基于 Transactional Outbox 的 RocketMQ 可靠消息 Spring Boot Starter
 
-`2026.09—至今`　Java 17、Spring Boot 3、MySQL 5.7、RocketMQ、Micrometer、Testcontainers
+`2026.09—至今`　Java 17、Spring Boot 3、MySQL 8.0、RocketMQ、Micrometer、Testcontainers
 
 - 设计并实现基于 Transactional Outbox 的 RocketMQ 可靠消息 Starter，使业务数据与待发布事件在同一本地事务中提交，避免数据库与消息系统双写产生的事件丢失和事务回滚不一致。
-- 基于 MySQL 5.7 版本号条件更新和任务租约实现多实例安全抢占，支持指数退避重试、死信和宕机恢复，并通过 Testcontainers 并发测试及故障注入验证关键失败场景。
+- 基于 MySQL 8.0 版本号条件更新和任务租约实现多实例安全抢占，支持指数退避重试、死信和宕机恢复，并通过 Testcontainers 并发测试及故障注入验证关键失败场景。
 - 通过有界线程池和按本地执行容量动态控制抢占批次，避免事件获得租约后长期滞留在线程池；使用 Micrometer暴露积压、发布延迟、失败和租约过期等指标。
 - 在优惠券任务创建链路完成私有接入，使 `coupon_task` 与 Outbox事件原子提交，由后台发布器可靠发送现有 RocketMQ事件；保留RocketMQ作为跨服务传输系统，不重复实现消息代理能力。
 - 使用项目实际基准测试结果替换此条：记录事件规模、实例数、吞吐量、P95/P99延迟和数据库资源消耗，并提供可复现脚本。没有真实结果前删除本条。
@@ -87,7 +87,7 @@ ReliableEvent（开发中）
 
 如果面试官问“项目现在做到什么程度”，当前应直接回答：
 
-> 项目目前已经完成 M2 可靠性阶段：业务事务可以登记 Outbox 事件，后台发布器通过 MySQL 5.7 版本号条件更新抢占事件；双 Worker 竞争时只有一个执行者能够发送。普通失败会指数退避重试，达到最大次数或遇到不可重试错误会进入死信。现在还没有完成租约恢复和 RocketMQ 适配，下一步是验证发布进程宕机后的恢复。
+> 项目目前已经完成 M2 可靠性阶段：业务事务可以登记 Outbox 事件，后台发布器通过 MySQL 8.0 版本号条件更新抢占事件；双 Worker 竞争时只有一个执行者能够发送。普通失败会指数退避重试，达到最大次数或遇到不可重试错误会进入死信。现在还没有完成完整宕机恢复和 RocketMQ 适配，下一步是验证发布进程退出后的并发接管。
 
 如果继续追问“为什么没有做完就写简历”，可以回答：
 

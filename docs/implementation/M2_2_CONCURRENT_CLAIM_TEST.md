@@ -2,7 +2,7 @@
 
 > 状态：已完成
 >
-> 目标：使用真实 MySQL 5.7，让两个独立 Worker 同时竞争同一份候选快照，证明只有一个 Worker 能获得执行权并调用发送器。
+> 目标：使用真实 MySQL 8.0，让两个独立 Worker 同时竞争同一份候选快照，证明只有一个 Worker 能获得执行权并调用发送器。
 
 ## 为什么单独做这一阶段
 
@@ -36,7 +36,7 @@ PUBLISHED
 
 ## 并发测试必须满足的条件
 
-### 1. 使用真实 MySQL 5.7
+### 1. 使用真实 MySQL 8.0
 
 继续使用现有 Testcontainers 环境，不使用 H2、Mock Repository 或只验证 Java 锁的单元测试。要验证的是 MySQL 条件更新在两个独立事务竞争同一行时的实际行为。
 
@@ -148,14 +148,14 @@ publishCandidates(candidates)
 
 ## 完成标准
 
-- 存在一个基于 MySQL 5.7 Testcontainers 的双 Worker 并发集成测试；
+- 存在一个基于 MySQL 8.0 Testcontainers 的双 Worker 并发集成测试；
 - 两个 Worker 使用同一份候选版本并从统一起点开始竞争；
 - 数据库条件更新是决定唯一执行权的机制；
 - 测试证明只有一个 Worker 调用发送器；
 - 抢占次数、最终版本和状态均符合 M2.1 语义；
 - 没有新增测试专用的公开 API 或生产环境开关；
 - M0、M1、M2.1 的已有测试继续通过；
-- `mvn clean verify` 在 Java 17 和 MySQL 5.7 下通过。
+- `mvn clean verify` 在 Java 17 和 MySQL 8.0 下通过。
 
 ## 本阶段明确不做
 

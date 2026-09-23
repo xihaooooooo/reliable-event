@@ -17,7 +17,7 @@
 
 ## 验证结果
 
-使用 MySQL 5.7.44 Testcontainers 执行 `mvn verify`，8 个集成测试全部通过。在原有 M1 场景之外，新增覆盖：
+使用 MySQL 8.0.36 Testcontainers 执行 `mvn verify`，8 个集成测试全部通过。在原有 M1 场景之外，新增覆盖：
 
 - 候选快照携带当前版本；
 - 同一候选版本只能抢占一次；

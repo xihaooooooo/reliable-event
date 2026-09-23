@@ -1,22 +1,28 @@
 package dev.reliableevent.jdbc;
 
+import dev.reliableevent.EventId;
+
 import java.time.Instant;
 import java.util.Objects;
 
-record ClaimedEvent(
-        StoredEvent event,
-        long claimVersion,
-        int attemptCount,
-        int maxAttempts,
+record ExpiredLeaseCandidate(
+        EventId id,
+        long version,
         String leaseOwner,
-        Instant leaseUntil
+        Instant leaseUntil,
+        int attemptCount,
+        int maxAttempts
 ) {
 
-    ClaimedEvent {
-        Objects.requireNonNull(event, "event must not be null");
-        if (claimVersion <= 0) {
-            throw new IllegalArgumentException("claimVersion must be positive");
+    ExpiredLeaseCandidate {
+        Objects.requireNonNull(id, "id must not be null");
+        if (version <= 0) {
+            throw new IllegalArgumentException("version must be positive");
         }
+        if (leaseOwner == null || leaseOwner.isBlank()) {
+            throw new IllegalArgumentException("leaseOwner must not be blank");
+        }
+        Objects.requireNonNull(leaseUntil, "leaseUntil must not be null");
         if (attemptCount <= 0) {
             throw new IllegalArgumentException("attemptCount must be positive");
         }
@@ -26,10 +32,6 @@ record ClaimedEvent(
         if (attemptCount > maxAttempts) {
             throw new IllegalArgumentException("attemptCount must not exceed maxAttempts");
         }
-        if (leaseOwner == null || leaseOwner.isBlank()) {
-            throw new IllegalArgumentException("leaseOwner must not be blank");
-        }
-        Objects.requireNonNull(leaseUntil, "leaseUntil must not be null");
     }
 
     boolean canRetry() {

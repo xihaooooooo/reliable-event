@@ -25,7 +25,7 @@ PENDING → PUBLISHING → PUBLISHED
 
 ## 验证结果
 
-使用 Java 17 和 MySQL 5.7.44 Testcontainers 执行 `mvn clean verify`，共 27 个测试全部通过：
+使用 Java 17 和 MySQL 8.0.36 Testcontainers 执行 `mvn clean verify`，共 27 个测试全部通过：
 
 - 10 个单元测试覆盖指数退避、错误摘要、Unicode 截断和发送错误分类；
 - 17 个集成测试覆盖事务原子性、幂等登记、条件抢占、双 Worker 竞争、延迟重试、重试耗尽、不可重试错误、死信终态和版本保护。
@@ -41,7 +41,7 @@ PENDING → PUBLISHING → PUBLISHED
 
 ## M2 已经证明的能力
 
-- MySQL 5.7 版本号条件抢占；
+- MySQL 8.0 版本号条件抢占；
 - 双 Worker 并发竞争时的唯一执行权；
 - 发送失败后的指数退避和随机抖动；
 - 未到重试时间不发送；

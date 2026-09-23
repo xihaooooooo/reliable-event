@@ -26,7 +26,7 @@ FakeEventSender 发送
 
 ## 验证结果
 
-使用 Java 17 和 MySQL 5.7.44 执行 `mvn verify`，5 个集成测试全部通过，覆盖：
+使用 Java 17 和 MySQL 8.0.36 执行 `mvn verify`，5 个集成测试全部通过，覆盖：
 
 - 事务提交和回滚；
 - 无活动事务时拒绝发布；

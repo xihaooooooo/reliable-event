@@ -23,6 +23,8 @@
         <module>reliable-event-core</module>
         <module>reliable-event-jdbc</module>
         <module>reliable-event-rocketmq</module>
+        <module>reliable-event-spring-boot-autoconfigure</module>
+        <module>reliable-event-spring-boot-starter</module>
     </modules>
 
     <properties>

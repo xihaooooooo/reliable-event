@@ -27,6 +27,14 @@ public final class JdbcReliableEventPublisher implements ReliableEventPublisher 
         this(jdbcTemplate, objectMapper, Clock.systemUTC(), DEFAULT_MAX_ATTEMPTS);
     }
 
+    public JdbcReliableEventPublisher(
+            JdbcTemplate jdbcTemplate,
+            ObjectMapper objectMapper,
+            int maxAttempts
+    ) {
+        this(jdbcTemplate, objectMapper, Clock.systemUTC(), maxAttempts);
+    }
+
     JdbcReliableEventPublisher(
             JdbcTemplate jdbcTemplate,
             ObjectMapper objectMapper,

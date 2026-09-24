@@ -1,5 +1,7 @@
 package dev.reliableevent.jdbc.internal.model;
 
+import dev.reliableevent.internal.model.StoredEvent;
+
 import java.time.Instant;
 import java.util.Objects;
 

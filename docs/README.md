@@ -21,6 +21,7 @@
 - [M3.2：过期租约恢复](implementation/M3_2_EXPIRED_LEASE_RECOVERY.md)：定义过期候选、限量扫描、条件恢复、恢复退避和耗尽后死信语义。
 - [M3.3：并发接管与恢复编排](implementation/M3_3_CONCURRENT_TAKEOVER_ORCHESTRATION.md)：冻结单轮恢复—发布顺序，并定义同一过期候选的多恢复者竞争和新旧 Worker 三方竞态测试。
 - [M3.4：发布进程退出故障注入](implementation/M3_4_PROCESS_EXIT_FAULT_INJECTION.md)：定义独立 JVM 的两个强制退出窗口、持久化发送探针和至少一次重复投递验收。
+- [M4.1：RocketMQ 发送适配与目标映射](implementation/M4_1_ROCKETMQ_SENDER_AND_DESTINATION_MAPPING.md)：冻结 RocketMQ 5.x 客户端基线、消息映射、错误分类和真实 Broker 验收方案。
 
 ## 进度记录
 
@@ -35,6 +36,7 @@
 - [M3.2 阶段完成记录](progress/M3_2_COMPLETED.md)：记录过期候选、限量恢复、恢复退避、耗尽后死信和新增验证结果。
 - [M3.3 阶段完成记录](progress/M3_3_COMPLETED.md)：记录单轮恢复—发布编排、同候选多恢复者竞争和新旧 Worker 三方竞态验证结果。
 - [M3.4 阶段完成记录](progress/M3_4_COMPLETED.md)：记录独立 JVM 强制退出、持久化发送证据和至少一次重复投递故障验证结果。
+- [M4.1 阶段完成记录](progress/M4_1_COMPLETED.md)：记录模块拆分、RocketMQ 消息映射、错误分类和真实 Broker 故障验收结果。
 
 ## 对外表述
 

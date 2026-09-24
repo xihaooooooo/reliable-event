@@ -1,5 +1,7 @@
 package dev.reliableevent.jdbc.internal.publication;
 
+import dev.reliableevent.internal.publication.EventSendException;
+import dev.reliableevent.internal.publication.EventSendFailureType;
 import org.junit.jupiter.api.Test;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -15,6 +17,9 @@ class EventSendFailureClassifierTest {
         assertThat(EventSendFailureClassifier.classify(
                 EventSendException.nonRetryable("missing destination")
         )).isEqualTo(EventSendFailureType.NON_RETRYABLE);
+        assertThat(EventSendFailureClassifier.classify(
+                EventSendException.resultUnknown("response lost")
+        )).isEqualTo(EventSendFailureType.RESULT_UNKNOWN);
     }
 
     @Test

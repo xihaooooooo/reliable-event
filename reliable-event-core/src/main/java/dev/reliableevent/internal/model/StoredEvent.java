@@ -1,4 +1,4 @@
-package dev.reliableevent.jdbc.internal.model;
+package dev.reliableevent.internal.model;
 
 import dev.reliableevent.EventId;
 

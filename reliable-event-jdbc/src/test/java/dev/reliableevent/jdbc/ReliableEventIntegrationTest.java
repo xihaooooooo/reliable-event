@@ -11,12 +11,12 @@ import dev.reliableevent.jdbc.internal.model.ClaimedEvent;
 import dev.reliableevent.jdbc.internal.model.EventCandidate;
 import dev.reliableevent.jdbc.internal.model.EventStatus;
 import dev.reliableevent.jdbc.internal.model.ExpiredLeaseCandidate;
-import dev.reliableevent.jdbc.internal.model.StoredEvent;
+import dev.reliableevent.internal.model.StoredEvent;
 import dev.reliableevent.jdbc.internal.persistence.JdbcOutboxRepository;
-import dev.reliableevent.jdbc.internal.publication.EventSendException;
-import dev.reliableevent.jdbc.internal.publication.EventSender;
+import dev.reliableevent.internal.publication.EventSendException;
+import dev.reliableevent.internal.publication.EventSender;
 import dev.reliableevent.jdbc.internal.publication.JdbcEventPublicationWorker;
-import dev.reliableevent.jdbc.internal.publication.SendReceipt;
+import dev.reliableevent.internal.publication.SendReceipt;
 import dev.reliableevent.jdbc.internal.recovery.JdbcExpiredLeaseRecovery;
 import dev.reliableevent.jdbc.internal.retry.ExponentialBackoff;
 import org.junit.jupiter.api.BeforeEach;
@@ -590,6 +590,31 @@ class ReliableEventIntegrationTest {
         assertThat(statusOf(eventId)).isEqualTo(EventStatus.DEAD.code());
         assertThat(attemptCountOf(eventId)).isEqualTo(2);
         assertThat(versionOf(eventId)).isEqualTo(4L);
+    }
+
+    @Test
+    void unknownSendResultRetriesAndBecomesDeadAfterLastAllowedAttempt() {
+        ReliableEventPublisher twoAttemptPublisher = publisherWithMaxAttempts(2);
+        EventId eventId = inTransaction(
+                () -> twoAttemptPublisher.publish(event(218L, NOW.minusSeconds(1)))
+        );
+        ResultUnknownEventSender sender = new ResultUnknownEventSender();
+        ExponentialBackoff backoff = deterministicBackoff();
+
+        assertThat(worker(sender, CLOCK, backoff).publishDueEvents()).isZero();
+        assertThat(statusOf(eventId)).isEqualTo(EventStatus.RETRY_WAIT.code());
+        assertThat(attemptCountOf(eventId)).isOne();
+        assertThat(nextAttemptAtOf(eventId)).isEqualTo(NOW.plusSeconds(1));
+
+        Clock atRetry = Clock.fixed(NOW.plusSeconds(1), ZoneOffset.UTC);
+        assertThat(worker(sender, atRetry, backoff).publishDueEvents()).isZero();
+
+        assertThat(sender.sendCount()).isEqualTo(2);
+        assertThat(statusOf(eventId)).isEqualTo(EventStatus.DEAD.code());
+        assertThat(attemptCountOf(eventId)).isEqualTo(2);
+        assertThat(versionOf(eventId)).isEqualTo(4L);
+        assertThat(lastErrorOf(eventId))
+                .isEqualTo(EventSendException.class.getName() + ": RocketMQ response lost");
     }
 
     @Test
@@ -1620,6 +1645,21 @@ class ReliableEventIntegrationTest {
         public SendReceipt send(StoredEvent event) {
             sendCount++;
             throw new IllegalStateException("temporary failure " + sendCount);
+        }
+
+        int sendCount() {
+            return sendCount;
+        }
+    }
+
+    private static final class ResultUnknownEventSender implements EventSender {
+
+        private int sendCount;
+
+        @Override
+        public SendReceipt send(StoredEvent event) {
+            sendCount++;
+            throw EventSendException.resultUnknown("RocketMQ response lost");
         }
 
         int sendCount() {

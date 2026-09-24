@@ -1,5 +1,8 @@
 package dev.reliableevent.jdbc.internal.publication;
 
+import dev.reliableevent.internal.publication.EventSendException;
+import dev.reliableevent.internal.publication.EventSendFailureType;
+
 import java.util.Objects;
 
 final class EventSendFailureClassifier {

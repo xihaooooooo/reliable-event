@@ -1,8 +1,8 @@
 package dev.reliableevent.jdbc.fault;
 
-import dev.reliableevent.jdbc.internal.model.StoredEvent;
-import dev.reliableevent.jdbc.internal.publication.EventSender;
-import dev.reliableevent.jdbc.internal.publication.SendReceipt;
+import dev.reliableevent.internal.model.StoredEvent;
+import dev.reliableevent.internal.publication.EventSender;
+import dev.reliableevent.internal.publication.SendReceipt;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 

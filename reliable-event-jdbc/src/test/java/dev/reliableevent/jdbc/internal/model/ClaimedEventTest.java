@@ -1,6 +1,7 @@
 package dev.reliableevent.jdbc.internal.model;
 
 import dev.reliableevent.EventId;
+import dev.reliableevent.internal.model.StoredEvent;
 import org.junit.jupiter.api.Test;
 
 import java.time.Instant;

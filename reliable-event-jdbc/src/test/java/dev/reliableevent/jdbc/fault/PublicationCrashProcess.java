@@ -4,7 +4,7 @@ import dev.reliableevent.EventId;
 import dev.reliableevent.jdbc.internal.model.ClaimedEvent;
 import dev.reliableevent.jdbc.internal.model.EventCandidate;
 import dev.reliableevent.jdbc.internal.persistence.JdbcOutboxRepository;
-import dev.reliableevent.jdbc.internal.publication.SendReceipt;
+import dev.reliableevent.internal.publication.SendReceipt;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.datasource.DataSourceTransactionManager;
 import org.springframework.jdbc.datasource.DriverManagerDataSource;

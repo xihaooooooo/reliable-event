@@ -20,12 +20,15 @@
     <description>Reliable event publishing with a transactional outbox</description>
 
     <modules>
+        <module>reliable-event-core</module>
         <module>reliable-event-jdbc</module>
+        <module>reliable-event-rocketmq</module>
     </modules>
 
     <properties>
         <java.version>17</java.version>
         <mysql.version>8.0.33</mysql.version>
+        <rocketmq-client.version>5.2.1</rocketmq-client.version>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
     </properties>
 </project>

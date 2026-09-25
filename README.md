@@ -4,7 +4,7 @@ ReliableEvent 是一个面向 Spring Boot 3 与 RocketMQ 的可靠消息 Starter
 
 它通过 Transactional Outbox 模式，让业务数据与待发布事件在同一个 MySQL 本地事务中提交，再由后台发布器完成消息发送、失败重试、租约恢复和死信处理。
 
-当前仓库已完成 M0 至 M4.4：业务方可以在活动事务中登记事件，模块会持久化 JSON Payload、避免重复登记。Starter 启动后按固定延迟恢复过期租约并扫描到期事件，将候选放入有界本地执行器；候选只有在线程开始执行时才使用版本号条件抢占，在事务外通过 RocketMQ 5.x gRPC 适配同步发送，再按版本、租约 Owner 和有效期更新状态。Context 关闭时会停止新抢占、撤销排队候选，并在有界时间内等待在途发送和状态更新。
+当前仓库已完成 M0 至 M4.5：业务方可以在活动事务中登记事件，模块会持久化 JSON Payload、避免重复登记。Starter 启动后按固定延迟恢复过期租约并扫描到期事件，将候选放入有界本地执行器；候选只有在线程开始执行时才使用版本号条件抢占，在事务外通过 RocketMQ 5.x gRPC 适配同步发送，再按版本、租约 Owner 和有效期更新状态。Context 关闭时会停止新抢占、撤销排队候选，并在有界时间内等待在途发送和状态更新。存在 `MeterRegistry` 时还会记录发布、延迟、积压、死信及租约恢复指标。
 
 版本号条件抢占已经通过真实 MySQL 8.0 双 Worker 并发竞争测试。发送失败后事件会按照带随机抖动的指数退避进入 `RETRY_WAIT`；达到最大尝试次数或发生明确不可重试错误时进入 `DEAD`，不再自动扫描。租约使用数据库时间计算，错误 Owner、旧版本和过期租约都不能完成状态更新；过期的 `PUBLISHING` 事件可以限量、按快照条件恢复为 `RETRY_WAIT` 或 `DEAD`。独立 JVM 故障测试验证了至少一次语义窗口；真实 RocketMQ 5.5.0 测试进一步验证了 Topic/Tag/Key/Body/属性映射、Broker 不可用恢复，以及结果未知后重投产生不同 Message ID 的预期重复消息。
 
@@ -36,7 +36,7 @@ mvn verify
 
 ## 当前 Starter 接入方式
 
-引入 `dev.reliableevent:reliable-event-spring-boot-starter:0.1.0-SNAPSHOT`，配置应用的数据源并创建 [Outbox 表](reliable-event-jdbc/src/main/resources/schema/reliable-event-outbox.sql)，然后提供 RocketMQ 5.x Proxy 地址与事件目标：
+引入 `dev.reliableevent:reliable-event-spring-boot-starter:0.1.0-SNAPSHOT`，配置应用的数据源并创建 [Outbox 表](reliable-event-jdbc/src/main/resources/schema/reliable-event-outbox.sql)。已有 M4.4 表先执行 [M4.5 增量 SQL](reliable-event-jdbc/src/main/resources/schema/reliable-event-outbox-m4-5.sql)。然后提供 RocketMQ 5.x Proxy 地址与事件目标：
 
 ```yaml
 reliable-event:
@@ -48,6 +48,8 @@ reliable-event:
 ```
 
 在业务事务内调用 `ReliableEventPublisher.publish(event)`，Starter 默认自动持续发布。可通过 `reliable-event.poll-interval`、`worker-threads`、`worker-queue-capacity` 和 `claim-batch-size` 控制扫描与本地容量；`shutdown-timeout` 控制停机时等待在途任务的上限，默认 `20s`，应小于 Spring 的 `spring.lifecycle.timeout-per-shutdown-phase`。设置 `scheduling-enabled=false` 后保留显式调用 `JdbcEventPublicationCycle.runOnce()` 的方式。配置与容量协议见 [M4.3 实施文档](docs/implementation/M4_3_SCHEDULING_AND_BOUNDED_CONCURRENCY.md)，停机语义见 [M4.4 实施文档](docs/implementation/M4_4_GRACEFUL_SHUTDOWN.md)。
+
+提供 Micrometer `MeterRegistry` 后，Starter 注册 [M4.5 指标](docs/implementation/M4_5_OBSERVABILITY_AND_M4_ACCEPTANCE.md)；不提供 Registry 时发布功能照常运行。`reliable_event.publish.success` 表示生产端成功回执次数，不代表唯一事件数或消费者处理完成。数据库积压和死信 Gauge 在多实例上展示同一份表的快照，不应跨实例求和。
 
 ## 项目原则
 

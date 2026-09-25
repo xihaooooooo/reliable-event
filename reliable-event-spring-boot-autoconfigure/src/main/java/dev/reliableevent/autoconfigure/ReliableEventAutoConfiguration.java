@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import dev.reliableevent.ReliableEventPublisher;
 import dev.reliableevent.internal.publication.EventSender;
 import dev.reliableevent.jdbc.JdbcReliableEventPublisher;
+import dev.reliableevent.jdbc.internal.observation.PublicationObserver;
 import dev.reliableevent.jdbc.internal.recovery.JdbcExpiredLeaseRecovery;
 import dev.reliableevent.jdbc.internal.retry.ExponentialBackoff;
 import dev.reliableevent.rocketmq.EventDestinationResolver;
@@ -77,11 +78,13 @@ public class ReliableEventAutoConfiguration {
                 JdbcTemplate jdbcTemplate,
                 PlatformTransactionManager transactionManager,
                 ExponentialBackoff backoff,
-                ReliableEventProperties properties
+                ReliableEventProperties properties,
+                ObjectProvider<PublicationObserver> observers
         ) {
             properties.validateCore();
             return new JdbcExpiredLeaseRecovery(
-                    jdbcTemplate, transactionManager, properties.getRecoveryBatchSize(), backoff
+                    jdbcTemplate, transactionManager, properties.getRecoveryBatchSize(), backoff,
+                    observers.getIfAvailable(() -> PublicationObserver.NOOP)
             );
         }
     }

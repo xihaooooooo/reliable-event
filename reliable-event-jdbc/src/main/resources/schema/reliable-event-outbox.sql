@@ -6,6 +6,7 @@ CREATE TABLE IF NOT EXISTS reliable_event_outbox (
     headers           JSON NULL,
     status            TINYINT NOT NULL,
     next_attempt_at   DATETIME(3) NOT NULL,
+    first_available_at DATETIME(3) NULL,
     attempt_count     INT NOT NULL DEFAULT 0,
     max_attempts      INT NOT NULL,
     lease_owner       VARCHAR(128) NULL,

@@ -11,8 +11,15 @@ public record ExpiredLeaseCandidate(
         String leaseOwner,
         Instant leaseUntil,
         int attemptCount,
-        int maxAttempts
+        int maxAttempts,
+        String eventType,
+        String eventKey
 ) {
+
+    public ExpiredLeaseCandidate(EventId id, long version, String leaseOwner, Instant leaseUntil,
+                                 int attemptCount, int maxAttempts) {
+        this(id, version, leaseOwner, leaseUntil, attemptCount, maxAttempts, null, null);
+    }
 
     public ExpiredLeaseCandidate {
         Objects.requireNonNull(id, "id must not be null");

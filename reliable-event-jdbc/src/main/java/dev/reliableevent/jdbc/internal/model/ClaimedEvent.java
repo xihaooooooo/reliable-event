@@ -11,8 +11,14 @@ public record ClaimedEvent(
         int attemptCount,
         int maxAttempts,
         String leaseOwner,
-        Instant leaseUntil
+        Instant leaseUntil,
+        Instant firstAvailableAt
 ) {
+
+    public ClaimedEvent(StoredEvent event, long claimVersion, int attemptCount,
+                        int maxAttempts, String leaseOwner, Instant leaseUntil) {
+        this(event, claimVersion, attemptCount, maxAttempts, leaseOwner, leaseUntil, null);
+    }
 
     public ClaimedEvent {
         Objects.requireNonNull(event, "event must not be null");

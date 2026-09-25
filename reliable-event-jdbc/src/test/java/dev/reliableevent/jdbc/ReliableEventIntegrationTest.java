@@ -11,6 +11,7 @@ import dev.reliableevent.jdbc.internal.model.ClaimedEvent;
 import dev.reliableevent.jdbc.internal.model.EventCandidate;
 import dev.reliableevent.jdbc.internal.model.EventStatus;
 import dev.reliableevent.jdbc.internal.model.ExpiredLeaseCandidate;
+import dev.reliableevent.jdbc.internal.observation.PublicationObserver;
 import dev.reliableevent.internal.model.StoredEvent;
 import dev.reliableevent.jdbc.internal.persistence.JdbcOutboxRepository;
 import dev.reliableevent.internal.publication.EventSendException;
@@ -21,6 +22,10 @@ import dev.reliableevent.jdbc.internal.recovery.JdbcExpiredLeaseRecovery;
 import dev.reliableevent.jdbc.internal.retry.ExponentialBackoff;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.springframework.boot.test.system.CapturedOutput;
+import org.springframework.boot.test.system.OutputCaptureExtension;
+import org.springframework.core.io.ClassPathResource;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.SpringBootConfiguration;
 import org.springframework.boot.autoconfigure.EnableAutoConfiguration;
@@ -40,6 +45,7 @@ import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
 
 import java.sql.Timestamp;
+import java.nio.charset.StandardCharsets;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
@@ -160,6 +166,77 @@ class ReliableEventIntegrationTest {
 
         assertThat(eventIds.get(1)).isEqualTo(eventIds.get(0));
         assertThat(outboxRowCount()).isOne();
+    }
+
+    @Test
+    void firstAvailabilitySurvivesDuplicateAndRetryAndStatusCountsUseDatabaseRows() {
+        Instant firstAvailable = NOW.plusSeconds(60);
+        EventId future = inTransaction(() -> publisher.publish(event(140L, firstAvailable)));
+        EventId duplicate = inTransaction(() -> publisher.publish(event(140L, NOW.plusSeconds(120))));
+        EventId dead = inTransaction(() -> publisher.publish(event(141L, NOW)));
+        jdbcTemplate.update("UPDATE reliable_event_outbox SET next_attempt_at = ? WHERE id = ?",
+                Timestamp.from(firstAvailable.plusSeconds(30)), future.value());
+        jdbcTemplate.update("UPDATE reliable_event_outbox SET status = ? WHERE id = ?",
+                EventStatus.DEAD.code(), dead.value());
+
+        assertThat(duplicate).isEqualTo(future);
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT first_available_at FROM reliable_event_outbox WHERE id = ?",
+                Timestamp.class, future.value()).toInstant()).isEqualTo(firstAvailable);
+        assertThat(repository.countStatuses().backlog()).isOne();
+        assertThat(repository.countStatuses().dead()).isOne();
+
+        EventCandidate due = repository.findDueEventCandidates(firstAvailable.plusSeconds(31), 1).get(0);
+        ClaimedEvent claimed = inTransaction(() -> repository.claim(due,
+                firstAvailable.plusSeconds(31), WORKER_ID, LEASE_DURATION).orElseThrow());
+        assertThat(claimed.firstAvailableAt()).isEqualTo(firstAvailable);
+    }
+
+    @Test
+    @ExtendWith(OutputCaptureExtension.class)
+    void observationFailureDoesNotChangePublishedStateOrLeakMessageContent(CapturedOutput output) {
+        EventId id = inTransaction(() -> publisher.publish(new ReliableEvent<>(
+                "safe-type", "safe-key", Map.of("secret", "payload-sentinel"),
+                NOW.minusSeconds(1), Map.of("token", "header-sentinel"))));
+        PublicationObserver broken = new PublicationObserver() {
+            @Override
+            public void sendSucceeded(ClaimedEvent event, SendReceipt receipt,
+                                      long elapsedNanos, Instant at) {
+                throw new IllegalStateException("observer-sentinel");
+            }
+        };
+        JdbcEventPublicationWorker observedWorker = new JdbcEventPublicationWorker(
+                jdbcTemplate, transactionManager, event -> new SendReceipt("message-safe"),
+                CLOCK, 50, WORKER_ID, LEASE_DURATION, deterministicBackoff(), broken);
+
+        assertThat(observedWorker.publishDueEvents()).isOne();
+        assertThat(statusOf(id)).isEqualTo(EventStatus.PUBLISHED.code());
+        assertThat(output.getOut()).contains("event=reliable_event.send.succeeded",
+                "eventId=" + id.value(), "eventType=safe-type", "eventKey=safe-key",
+                "messageId=message-safe");
+        assertThat(output.getOut()).doesNotContain("payload-sentinel", "header-sentinel",
+                "observer-sentinel");
+    }
+
+    @Test
+    void migrationKeepsHistoricalAvailabilityUnknown() throws Exception {
+        jdbcTemplate.execute("CREATE TABLE reliable_event_outbox_legacy (" +
+                "id BIGINT PRIMARY KEY, next_attempt_at DATETIME(3) NOT NULL)");
+        try {
+            jdbcTemplate.update("INSERT INTO reliable_event_outbox_legacy VALUES (?, ?)",
+                    1L, Timestamp.from(NOW));
+            String migration = new String(new ClassPathResource(
+                    "schema/reliable-event-outbox-m4-5.sql").getInputStream().readAllBytes(),
+                    StandardCharsets.UTF_8).replace("reliable_event_outbox\n",
+                    "reliable_event_outbox_legacy\n");
+            jdbcTemplate.execute(migration);
+
+            assertThat(jdbcTemplate.queryForObject(
+                    "SELECT first_available_at FROM reliable_event_outbox_legacy WHERE id = 1",
+                    Timestamp.class)).isNull();
+        } finally {
+            jdbcTemplate.execute("DROP TABLE reliable_event_outbox_legacy");
+        }
     }
 
     @Test

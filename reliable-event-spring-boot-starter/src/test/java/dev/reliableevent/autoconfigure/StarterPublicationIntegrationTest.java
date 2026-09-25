@@ -6,6 +6,7 @@ import dev.reliableevent.ReliableEventPublisher;
 import dev.reliableevent.internal.publication.EventSender;
 import dev.reliableevent.internal.publication.SendReceipt;
 import dev.reliableevent.jdbc.internal.cycle.JdbcEventPublicationCycle;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import org.apache.rocketmq.client.apis.ClientConfiguration;
 import org.apache.rocketmq.client.apis.ClientServiceProvider;
 import org.apache.rocketmq.client.apis.consumer.FilterExpression;
@@ -184,6 +185,41 @@ class StarterPublicationIntegrationTest {
                         .containsEntry("reliable_event_key", eventKey);
                 consumer.ack(message);
             }
+        }
+    }
+
+    @Test
+    void realBrokerSendProducesMetricsAndAStateSnapshot() {
+        try (ConfigurableApplicationContext context = new SpringApplicationBuilder(MetricsApplication.class)
+                .properties(
+                        "spring.main.web-application-type=none",
+                        "spring.datasource.url=" + MYSQL.getJdbcUrl(),
+                        "spring.datasource.username=" + MYSQL.getUsername(),
+                        "spring.datasource.password=" + MYSQL.getPassword(),
+                        "reliable-event.scheduling-enabled=false",
+                        "reliable-event.rocketmq.endpoints=localhost:8081",
+                        "reliable-event.rocketmq.request-timeout=3s",
+                        "reliable-event.rocketmq.mappings.coupon-task-execute.destination=" + TOPIC + ":execute"
+                ).run()) {
+            new ResourceDatabasePopulator(new ClassPathResource("schema/reliable-event-outbox.sql"))
+                    .execute(context.getBean(javax.sql.DataSource.class));
+            String key = "metrics-" + System.nanoTime();
+            EventId id = new TransactionTemplate(context.getBean(PlatformTransactionManager.class))
+                    .execute(status -> context.getBean(ReliableEventPublisher.class).publish(
+                            new ReliableEvent<>("coupon-task-execute", key, Map.of("taskId", 303),
+                                    Instant.now().minusSeconds(1), Map.of())));
+            assertThat(id).isNotNull();
+            assertThat(context.getBean(JdbcEventPublicationCycle.class).runOnce().publishedCount())
+                    .isOne();
+            SimpleMeterRegistry metrics = context.getBean(SimpleMeterRegistry.class);
+            assertThat(metrics.get("reliable_event.publish.success").counter().count()).isOne();
+            assertThat(metrics.get("reliable_event.publish.duration").tag("outcome", "success")
+                    .timer().count()).isOne();
+            assertThat(metrics.get("reliable_event.publish.lag").timer().count()).isOne();
+            assertThat(metrics.get("reliable_event.backlog").gauge().value()).isGreaterThanOrEqualTo(0);
+            assertThat(context.getBean(JdbcTemplate.class).queryForObject(
+                    "SELECT status FROM reliable_event_outbox WHERE id = ?", Integer.class,
+                    id.value())).isEqualTo(2);
         }
     }
 
@@ -674,6 +710,15 @@ class StarterPublicationIntegrationTest {
     @SpringBootConfiguration
     @EnableAutoConfiguration
     static class TestApplication {
+    }
+
+    @SpringBootConfiguration
+    @EnableAutoConfiguration
+    static class MetricsApplication {
+        @Bean
+        SimpleMeterRegistry meterRegistry() {
+            return new SimpleMeterRegistry();
+        }
     }
 
     @SpringBootConfiguration

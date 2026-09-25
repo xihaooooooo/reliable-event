@@ -3,6 +3,7 @@ package dev.reliableevent.autoconfigure;
 import dev.reliableevent.internal.publication.EventSender;
 import dev.reliableevent.jdbc.internal.cycle.JdbcEventPublicationCycle;
 import dev.reliableevent.jdbc.internal.publication.JdbcEventPublicationWorker;
+import dev.reliableevent.jdbc.internal.observation.PublicationObserver;
 import dev.reliableevent.jdbc.internal.recovery.JdbcExpiredLeaseRecovery;
 import dev.reliableevent.jdbc.internal.retry.ExponentialBackoff;
 import org.springframework.boot.autoconfigure.AutoConfiguration;
@@ -11,6 +12,9 @@ import org.springframework.boot.autoconfigure.condition.ConditionalOnClass;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnSingleCandidate;
+import org.springframework.beans.factory.ObjectProvider;
+import org.springframework.context.annotation.Configuration;
+import io.micrometer.core.instrument.MeterRegistry;
 import org.springframework.context.annotation.Bean;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.transaction.PlatformTransactionManager;
@@ -19,7 +23,11 @@ import javax.sql.DataSource;
 import java.time.Clock;
 import java.util.UUID;
 
-@AutoConfiguration(after = ReliableEventAutoConfiguration.class)
+@AutoConfiguration(after = ReliableEventAutoConfiguration.class, afterName = {
+        "org.springframework.boot.actuate.autoconfigure.metrics.MetricsAutoConfiguration",
+        "org.springframework.boot.actuate.autoconfigure.metrics.CompositeMeterRegistryAutoConfiguration",
+        "org.springframework.boot.actuate.autoconfigure.metrics.export.simple.SimpleMetricsExportAutoConfiguration"
+})
 @ConditionalOnProperty(prefix = "reliable-event", name = "enabled", havingValue = "true", matchIfMissing = true)
 @ConditionalOnClass({JdbcEventPublicationWorker.class, JdbcTemplate.class, EventSender.class})
 @ConditionalOnBean({JdbcTemplate.class, EventSender.class, JdbcExpiredLeaseRecovery.class,
@@ -34,7 +42,8 @@ public class ReliableEventPublicationAutoConfiguration {
             PlatformTransactionManager transactionManager,
             EventSender sender,
             ExponentialBackoff backoff,
-            ReliableEventProperties properties
+            ReliableEventProperties properties,
+            ObjectProvider<PublicationObserver> observers
     ) {
         properties.validateCore();
         return new JdbcEventPublicationWorker(
@@ -45,7 +54,8 @@ public class ReliableEventPublicationAutoConfiguration {
                 properties.getClaimBatchSize(),
                 "reliable-event-" + UUID.randomUUID(),
                 properties.getLeaseDuration(),
-                backoff
+                backoff,
+                observers.getIfAvailable(() -> PublicationObserver.NOOP)
         );
     }
 
@@ -73,5 +83,17 @@ public class ReliableEventPublicationAutoConfiguration {
                 properties.getWorkerThreads(), properties.getWorkerQueueCapacity(),
                 properties.getPollInterval(), properties.getShutdownTimeout()
         );
+    }
+
+    @Configuration(proxyBeanMethods = false)
+    @ConditionalOnClass(MeterRegistry.class)
+    @ConditionalOnBean(MeterRegistry.class)
+    static class MetricsConfiguration {
+
+        @Bean(destroyMethod = "close")
+        @ConditionalOnMissingBean(PublicationObserver.class)
+        PublicationObserver reliableEventMetrics(MeterRegistry registry, JdbcTemplate jdbcTemplate) {
+            return new MicrometerPublicationObserver(registry, jdbcTemplate);
+        }
     }
 }

@@ -18,8 +18,12 @@ public final class JdbcEventPublicationCycle {
     }
 
     public PublicationCycleResult runOnce() {
-        int recoveredCount = recovery.recoverExpiredLeases();
-        int publishedCount = worker.publishDueEvents();
-        return new PublicationCycleResult(recoveredCount, publishedCount);
+        try {
+            int recoveredCount = recovery.recoverExpiredLeases();
+            int publishedCount = worker.publishDueEvents();
+            return new PublicationCycleResult(recoveredCount, publishedCount);
+        } finally {
+            recovery.refreshSnapshot();
+        }
     }
 }

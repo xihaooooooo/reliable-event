@@ -105,6 +105,14 @@ public final class ReliableEventScheduler implements SmartLifecycle {
         if (stopped.get()) {
             return new AsyncPublicationCycleResult(0, 0);
         }
+        try {
+            return dispatchAndRefresh();
+        } finally {
+            recovery.refreshSnapshot();
+        }
+    }
+
+    private AsyncPublicationCycleResult dispatchAndRefresh() {
         int recoveredCount = recovery.recoverExpiredLeases();
         int dispatchLimit = Math.min(claimBatchSize, slots.availablePermits());
         if (dispatchLimit == 0 || stopped.get()) {
@@ -140,7 +148,7 @@ public final class ReliableEventScheduler implements SmartLifecycle {
             } catch (RejectedExecutionException exception) {
                 task.release();
                 if (!stopped.get()) {
-                    LOG.warn("Reliable event executor rejected a candidate before claim; eventId={}", eventId);
+                    LOG.warn("event=reliable_event.scheduler.candidate_rejected eventId={}", eventId);
                 }
                 break;
             } catch (RuntimeException exception) {
@@ -159,7 +167,8 @@ public final class ReliableEventScheduler implements SmartLifecycle {
         try {
             dispatchOnce();
         } catch (RuntimeException exception) {
-            LOG.error("Reliable event scan failed; type={}", exception.getClass().getName());
+            LOG.error("event=reliable_event.scheduler.failed exceptionType={}",
+                    exception.getClass().getName());
         }
     }
 
@@ -189,7 +198,7 @@ public final class ReliableEventScheduler implements SmartLifecycle {
             try {
                 callback.run();
             } catch (RuntimeException exception) {
-                LOG.error("Reliable event stop callback failed; type={}",
+                LOG.error("event=reliable_event.shutdown.callback_failed exceptionType={}",
                         exception.getClass().getName());
             }
         });
@@ -213,7 +222,7 @@ public final class ReliableEventScheduler implements SmartLifecycle {
         try {
             shutdown.start();
         } catch (RuntimeException exception) {
-            LOG.error("Unable to start reliable event stop thread; type={}",
+            LOG.error("event=reliable_event.shutdown.thread_start_failed exceptionType={}",
                     exception.getClass().getName());
             finishStop(startedAt, completion);
         }
@@ -236,7 +245,8 @@ public final class ReliableEventScheduler implements SmartLifecycle {
             Thread.currentThread().interrupt();
             forceStop();
         } catch (RuntimeException exception) {
-            LOG.error("Reliable event stop failed; type={}", exception.getClass().getName());
+            LOG.error("event=reliable_event.shutdown.failed exceptionType={}",
+                    exception.getClass().getName());
             forceStop();
         } finally {
             completion.complete(null);
@@ -257,7 +267,7 @@ public final class ReliableEventScheduler implements SmartLifecycle {
         synchronized (lifecycleMonitor) {
             timedOut = true;
         }
-        LOG.warn("Reliable event stop timed out; admittedTasks={}, outstandingCandidates={}",
+        LOG.warn("event=reliable_event.shutdown.timed_out admittedTasks={} outstandingCandidates={}",
                 admittedTasks.get(), outstandingIds.size());
         scanner.shutdownNow();
         for (Runnable task : executor.shutdownNow()) {
@@ -308,7 +318,7 @@ public final class ReliableEventScheduler implements SmartLifecycle {
                     worker.publishClaimedEvent(claimed);
                 }
             } catch (RuntimeException exception) {
-                LOG.error("Reliable event task failed; eventId={}, type={}",
+                LOG.error("event=reliable_event.scheduler.task_failed eventId={} exceptionType={}",
                         candidate.id().value(), exception.getClass().getName());
             } finally {
                 if (admitted) {

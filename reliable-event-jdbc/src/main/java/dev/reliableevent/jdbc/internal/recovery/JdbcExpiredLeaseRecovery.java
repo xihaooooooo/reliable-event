@@ -1,8 +1,11 @@
 package dev.reliableevent.jdbc.internal.recovery;
 
 import dev.reliableevent.jdbc.internal.model.ExpiredLeaseCandidate;
+import dev.reliableevent.jdbc.internal.observation.PublicationObserver;
 import dev.reliableevent.jdbc.internal.persistence.JdbcOutboxRepository;
 import dev.reliableevent.jdbc.internal.retry.ExponentialBackoff;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.support.TransactionTemplate;
@@ -13,6 +16,7 @@ import java.util.Objects;
 
 public final class JdbcExpiredLeaseRecovery {
 
+    private static final Logger LOG = LoggerFactory.getLogger(JdbcExpiredLeaseRecovery.class);
     public static final String LEASE_EXPIRED_ERROR =
             "Publication lease expired before completion";
 
@@ -20,6 +24,7 @@ public final class JdbcExpiredLeaseRecovery {
     private final TransactionTemplate transaction;
     private final ExponentialBackoff backoff;
     private final int recoveryBatchSize;
+    private final PublicationObserver observer;
 
     public JdbcExpiredLeaseRecovery(
             JdbcTemplate jdbcTemplate,
@@ -40,6 +45,17 @@ public final class JdbcExpiredLeaseRecovery {
             int recoveryBatchSize,
             ExponentialBackoff backoff
     ) {
+        this(jdbcTemplate, transactionManager, recoveryBatchSize, backoff,
+                PublicationObserver.NOOP);
+    }
+
+    public JdbcExpiredLeaseRecovery(
+            JdbcTemplate jdbcTemplate,
+            PlatformTransactionManager transactionManager,
+            int recoveryBatchSize,
+            ExponentialBackoff backoff,
+            PublicationObserver observer
+    ) {
         if (recoveryBatchSize <= 0) {
             throw new IllegalArgumentException("recoveryBatchSize must be positive");
         }
@@ -47,6 +63,7 @@ public final class JdbcExpiredLeaseRecovery {
         this.transaction = new TransactionTemplate(Objects.requireNonNull(transactionManager));
         this.recoveryBatchSize = recoveryBatchSize;
         this.backoff = Objects.requireNonNull(backoff);
+        this.observer = Objects.requireNonNull(observer);
     }
 
     public int recoverExpiredLeases() {
@@ -69,22 +86,50 @@ public final class JdbcExpiredLeaseRecovery {
     }
 
     private boolean recover(ExpiredLeaseCandidate candidate) {
+        boolean dead = !candidate.canRetry();
+        boolean recovered;
         if (!candidate.canRetry()) {
-            return Boolean.TRUE.equals(transaction.execute(status ->
+            recovered = Boolean.TRUE.equals(transaction.execute(status ->
                     repository.recoverExpiredLeaseToDead(
                             candidate,
                             LEASE_EXPIRED_ERROR
                     )
             ));
+        } else {
+            Duration delay = backoff.nextDelay(candidate.attemptCount());
+            recovered = Boolean.TRUE.equals(transaction.execute(status ->
+                    repository.recoverExpiredLeaseToRetryWait(
+                            candidate, delay, LEASE_EXPIRED_ERROR
+                    )
+            ));
         }
+        if (recovered) {
+            LOG.atInfo().addKeyValue("event", "reliable_event.lease.recovered")
+                    .addKeyValue("eventId", candidate.id().value())
+                    .addKeyValue("eventType", candidate.eventType())
+                    .addKeyValue("eventKey", candidate.eventKey())
+                    .addKeyValue("attemptCount", candidate.attemptCount())
+                    .addKeyValue("leaseOwner", candidate.leaseOwner())
+                    .addKeyValue("targetStatus", dead ? "DEAD" : "RETRY_WAIT")
+                    .log("event=reliable_event.lease.recovered eventId={} eventType={} eventKey={} attemptCount={} leaseOwner={} targetStatus={}",
+                    candidate.id().value(), candidate.eventType(), candidate.eventKey(),
+                    candidate.attemptCount(), candidate.leaseOwner(), dead ? "DEAD" : "RETRY_WAIT");
+            try {
+                observer.leaseRecovered(candidate, dead);
+            } catch (RuntimeException failure) {
+                LOG.warn("event=reliable_event.observation.failed exceptionType={}",
+                        failure.getClass().getName());
+            }
+        }
+        return recovered;
+    }
 
-        Duration delay = backoff.nextDelay(candidate.attemptCount());
-        return Boolean.TRUE.equals(transaction.execute(status ->
-                repository.recoverExpiredLeaseToRetryWait(
-                        candidate,
-                        delay,
-                        LEASE_EXPIRED_ERROR
-                )
-        ));
+    public void refreshSnapshot() {
+        try {
+            observer.refreshSnapshot();
+        } catch (RuntimeException failure) {
+            LOG.warn("event=reliable_event.observation.failed exceptionType={}",
+                    failure.getClass().getName());
+        }
     }
 }

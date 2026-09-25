@@ -6,6 +6,8 @@ import dev.reliableevent.internal.publication.EventSender;
 import dev.reliableevent.jdbc.internal.cycle.JdbcEventPublicationCycle;
 import dev.reliableevent.jdbc.internal.publication.JdbcEventPublicationWorker;
 import dev.reliableevent.jdbc.internal.recovery.JdbcExpiredLeaseRecovery;
+import dev.reliableevent.jdbc.internal.observation.PublicationObserver;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import dev.reliableevent.rocketmq.EventDestinationResolver;
 import dev.reliableevent.rocketmq.RocketMqDestination;
 import org.apache.rocketmq.client.apis.ClientServiceProvider;
@@ -42,6 +44,19 @@ class ReliableEventAutoConfigurationTest {
                     ReliableEventPublicationAutoConfiguration.class
             ))
             .withPropertyValues("reliable-event.scheduling-enabled=false");
+
+    @Test
+    void meterRegistryEnablesOptionalPublicationMetrics() {
+        jdbcRunner()
+                .withBean(EventSender.class, () -> mock(EventSender.class))
+                .withBean(SimpleMeterRegistry.class, SimpleMeterRegistry::new)
+                .run(context -> {
+                    assertThat(context).hasNotFailed();
+                    assertThat(context).hasSingleBean(PublicationObserver.class);
+                    assertThat(context.getBean(PublicationObserver.class))
+                            .isInstanceOf(MicrometerPublicationObserver.class);
+                });
+    }
 
     @Test
     void disabledCreatesNoDefaultBeans() {

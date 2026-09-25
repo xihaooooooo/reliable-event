@@ -5,6 +5,7 @@ import dev.reliableevent.jdbc.internal.model.ClaimedEvent;
 import dev.reliableevent.jdbc.internal.model.EventCandidate;
 import dev.reliableevent.jdbc.internal.model.EventStatus;
 import dev.reliableevent.jdbc.internal.model.ExpiredLeaseCandidate;
+import dev.reliableevent.jdbc.internal.model.OutboxCounts;
 import dev.reliableevent.internal.model.StoredEvent;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.support.GeneratedKeyHolder;
@@ -28,10 +29,11 @@ public final class JdbcOutboxRepository {
                 headers,
                 status,
                 next_attempt_at,
+                first_available_at,
                 max_attempts,
                 created_at,
                 updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON DUPLICATE KEY UPDATE id = LAST_INSERT_ID(id)
             """;
 
@@ -59,9 +61,10 @@ public final class JdbcOutboxRepository {
             statement.setString(4, headersJson);
             statement.setInt(5, EventStatus.PENDING.code());
             statement.setTimestamp(6, Timestamp.from(availableAt));
-            statement.setInt(7, maxAttempts);
-            statement.setTimestamp(8, Timestamp.from(createdAt));
+            statement.setTimestamp(7, Timestamp.from(availableAt));
+            statement.setInt(8, maxAttempts);
             statement.setTimestamp(9, Timestamp.from(createdAt));
+            statement.setTimestamp(10, Timestamp.from(createdAt));
             return statement;
         }, keyHolder);
 
@@ -106,6 +109,30 @@ public final class JdbcOutboxRepository {
         );
     }
 
+    public OutboxCounts countStatuses() {
+        return jdbcTemplate.query(
+                """
+                SELECT status, COUNT(*) AS total
+                FROM reliable_event_outbox
+                WHERE status IN (?, ?, ?)
+                GROUP BY status
+                """,
+                resultSet -> {
+                    long backlog = 0;
+                    long dead = 0;
+                    while (resultSet.next()) {
+                        if (resultSet.getInt("status") == EventStatus.DEAD.code()) {
+                            dead += resultSet.getLong("total");
+                        } else {
+                            backlog += resultSet.getLong("total");
+                        }
+                    }
+                    return new OutboxCounts(backlog, dead);
+                },
+                EventStatus.PENDING.code(), EventStatus.RETRY_WAIT.code(), EventStatus.DEAD.code()
+        );
+    }
+
     public List<ExpiredLeaseCandidate> findExpiredLeaseCandidates(int limit) {
         if (limit <= 0) {
             throw new IllegalArgumentException("limit must be positive");
@@ -114,6 +141,8 @@ public final class JdbcOutboxRepository {
                 """
                 SELECT id,
                        version,
+                       event_type,
+                       event_key,
                        lease_owner,
                        lease_until,
                        attempt_count,
@@ -132,7 +161,9 @@ public final class JdbcOutboxRepository {
                         resultSet.getString("lease_owner"),
                         resultSet.getTimestamp("lease_until").toInstant(),
                         resultSet.getInt("attempt_count"),
-                        resultSet.getInt("max_attempts")
+                        resultSet.getInt("max_attempts"),
+                        resultSet.getString("event_type"),
+                        resultSet.getString("event_key")
                 ),
                 EventStatus.PUBLISHING.code(),
                 limit
@@ -189,7 +220,8 @@ public final class JdbcOutboxRepository {
                        attempt_count,
                        max_attempts,
                        lease_owner,
-                       lease_until
+                       lease_until,
+                       first_available_at
                 FROM reliable_event_outbox
                 WHERE id = ?
                 """,
@@ -205,7 +237,9 @@ public final class JdbcOutboxRepository {
                         resultSet.getInt("attempt_count"),
                         resultSet.getInt("max_attempts"),
                         resultSet.getString("lease_owner"),
-                        resultSet.getTimestamp("lease_until").toInstant()
+                        resultSet.getTimestamp("lease_until").toInstant(),
+                        resultSet.getTimestamp("first_available_at") == null
+                                ? null : resultSet.getTimestamp("first_available_at").toInstant()
                 ),
                 eventId
         );

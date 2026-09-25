@@ -25,6 +25,7 @@
         <module>reliable-event-rocketmq</module>
         <module>reliable-event-spring-boot-autoconfigure</module>
         <module>reliable-event-spring-boot-starter</module>
+        <module>reliable-event-example</module>
     </modules>
 
     <properties>

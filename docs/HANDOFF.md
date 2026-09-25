@@ -2,7 +2,7 @@
 
 ## 当前进度
 
-M0、M1、完整 M2、M3 和 M4.1 至 M4.5 已完成。项目已经具备经过真实 MySQL、独立 JVM 故障注入和真实 RocketMQ 5.5.0 验证的条件抢占、失败重试、死信闭环、租约恢复、并发接管与普通消息发送能力。Spring Boot Starter 现已自动装配、持续调度、执行有界优雅停机，并在提供 `MeterRegistry` 时记录运行指标：
+M0、M1、完整 M2、M3、M4.1 至 M4.5 和 M5.1 已完成。项目已经具备经过真实 MySQL、独立 JVM 故障注入和真实 RocketMQ 5.5.0 验证的条件抢占、失败重试、死信闭环、租约恢复、并发接管与普通消息发送能力。Spring Boot Starter 现已自动装配、持续调度、执行有界优雅停机，并在提供 `MeterRegistry` 时记录运行指标。M5.1 新增公开的[原创订单示例](../reliable-event-example/README.md)，展示业务事务、自动发布与消费者按业务键去重：
 
 ```text
 事务内 publish → PENDING → 查询候选版本 → 条件抢占为 PUBLISHING
@@ -40,7 +40,7 @@ Context 关闭 → 停止新抢占 → 撤销未抢占队列 → 限时等待在
   成功回执被视为未知 → 重试 → 两条不同 Message ID 的预期重复消息
 ```
 
-已经实现事务校验、JSON 序列化、重复事件键幂等登记、未来事件过滤、版本号条件抢占、短事务状态更新、带随机抖动的指数退避、最大尝试次数、三类发送结果、`DEAD` 终态、数据库时间租约、过期租约恢复、RocketMQ 5.x 普通消息同步发送、固定延迟调度、有界并发、有界停机、Micrometer 指标和结构化生产日志。公共 API、JDBC 状态机、RocketMQ 适配、自动配置及 Starter 已拆为五个模块。真实服务测试已覆盖消息映射、Broker 不可用恢复、结果未知重复投递、Starter 自动发送、排队候选不占租约、自动租约恢复、双实例共用数据库抢占、关闭时的队列撤销与第二实例接管、超时后的租约恢复，以及真实 Broker 发送后的指标结果。
+已经实现事务校验、JSON 序列化、重复事件键幂等登记、未来事件过滤、版本号条件抢占、短事务状态更新、带随机抖动的指数退避、最大尝试次数、三类发送结果、`DEAD` 终态、数据库时间租约、过期租约恢复、RocketMQ 5.x 普通消息同步发送、固定延迟调度、有界并发、有界停机、Micrometer 指标和结构化生产日志。公共 API、JDBC 状态机、RocketMQ 适配、自动配置及 Starter 为五个库模块，另有一个独立的原创示例应用模块。真实服务测试已覆盖消息映射、Broker 不可用恢复、结果未知重复投递、Starter 自动发送、排队候选不占租约、自动租约恢复、双实例共用数据库抢占、关闭时的队列撤销与第二实例接管、超时后的租约恢复，以及真实 Broker 发送后的指标结果。
 
 ## 验证方式
 
@@ -50,7 +50,7 @@ Context 关闭 → 停止新抢占 → 撤销未抢占队列 → 限时等待在
 mvn verify
 ```
 
-当前共有 127 个测试，覆盖单元、Context、MySQL、独立 JVM 和真实 RocketMQ 场景，全部通过。
+当前共有 134 个测试，覆盖单元、Context、MySQL、独立 JVM、真实 RocketMQ 和原创示例端到端场景，全部通过。
 
 ## 当前边界
 
@@ -61,8 +61,8 @@ mvn verify
 - `DEAD` 暂无人工重放接口；
 - 已有 M4.4 表须先执行 [M4.5 增量 SQL](../reliable-event-jdbc/src/main/resources/schema/reliable-event-outbox-m4-5.sql)；存量行首次可用时间无法准确回填，因此不生成对应发布延迟样本；
 - 指标需要应用提供 `MeterRegistry`；积压、死信 Gauge 为数据库快照，多实例不能求和；
-- 当前只验证单 Broker 测试环境，消费者仍需按稳定事件 ID 或业务 Key 实现幂等。
+- 当前只验证单 Broker 测试环境；示例展示了按业务 Key 的消费幂等，但 Starter 本身不提供通用消费者框架。
 
 ## 下一步
 
-进入 M5，完成原创示例应用、优惠券场景私有接入、基准测试和 `0.1.0` 发布检查。M4.5 的结果见 [完成记录](progress/M4_5_COMPLETED.md)，协议见 [实施文档](implementation/M4_5_OBSERVABILITY_AND_M4_ACCEPTANCE.md)。
+按 M5 规划继续私有优惠券场景接入、可复现基准测试和 `0.1.0` 发布检查。M5.1 结果见 [完成记录](progress/M5_1_COMPLETED.md)，协议见 [实施文档](implementation/M5_1_ORIGINAL_EXAMPLE_APPLICATION.md)。

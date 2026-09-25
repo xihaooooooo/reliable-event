@@ -1,0 +1,21 @@
+server:
+  port: ${EXAMPLE_HTTP_PORT:8090}
+
+spring:
+  datasource:
+    url: ${EXAMPLE_JDBC_URL:jdbc:mysql://localhost:3307/reliable_event_example?connectionTimeZone=UTC}
+    username: ${EXAMPLE_DB_USER:example}
+    password: ${EXAMPLE_DB_PASSWORD:example}
+
+example:
+  rocketmq:
+    topic: ${EXAMPLE_ROCKETMQ_TOPIC:reliable-event-example}
+    consumer-group: ${EXAMPLE_ROCKETMQ_GROUP:reliable-event-example-consumer}
+
+reliable-event:
+  poll-interval: 200ms
+  rocketmq:
+    endpoints: ${EXAMPLE_ROCKETMQ_ENDPOINT:localhost:8081}
+    mappings:
+      order-created:
+        destination: ${example.rocketmq.topic}:created

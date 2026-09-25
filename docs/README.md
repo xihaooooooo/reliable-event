@@ -26,6 +26,7 @@
 - [M4.3：常驻调度与有界并发](implementation/M4_3_SCHEDULING_AND_BOUNDED_CONCURRENCY.md)：定义自动扫描、排队前不抢占、本地容量约束、并发执行和验收测试。
 - [M4.4：停止抢占、等待在途发送与优雅停机](implementation/M4_4_GRACEFUL_SHUTDOWN.md)：定义有界停机、排队候选撤销、在途发送等待、Producer 关闭顺序和超时语义。
 - [M4.5：Micrometer 指标、结构化日志与 M4 总验收](implementation/M4_5_OBSERVABILITY_AND_M4_ACCEPTANCE.md)：冻结指标口径、日志字段、首次可用时间迁移和真实服务验收。
+- [M5.1：原创示例应用与端到端幂等演示](implementation/M5_1_ORIGINAL_EXAMPLE_APPLICATION.md)：定义公开示例的业务事务、自动发布、消费去重、本地运行与验收证据。
 
 ## 进度记录
 
@@ -45,6 +46,7 @@
 - [M4.3 阶段完成记录](progress/M4_3_COMPLETED.md)：记录常驻调度、有界并发、队列不持有租约和真实服务验收结果。
 - [M4.4 阶段完成记录](progress/M4_4_COMPLETED.md)：记录有界停机、Producer 关闭顺序、超时恢复与全仓回归结果。
 - [M4.5 阶段完成记录](progress/M4_5_COMPLETED.md)：记录指标、结构化日志、数据库迁移与 M4 总验收结果。
+- [M5.1 阶段完成记录](progress/M5_1_COMPLETED.md)：记录原创示例、真实订单链路、重复消息去重和完整回归结果。
 
 ## 对外表述
 

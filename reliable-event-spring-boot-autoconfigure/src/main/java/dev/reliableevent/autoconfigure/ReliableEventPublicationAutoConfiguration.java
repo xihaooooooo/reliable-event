@@ -57,4 +57,21 @@ public class ReliableEventPublicationAutoConfiguration {
     ) {
         return new JdbcEventPublicationCycle(recovery, worker);
     }
+
+    @Bean
+    @ConditionalOnProperty(prefix = "reliable-event", name = "scheduling-enabled",
+            havingValue = "true", matchIfMissing = true)
+    @ConditionalOnMissingBean(ReliableEventScheduler.class)
+    ReliableEventScheduler reliableEventScheduler(
+            JdbcExpiredLeaseRecovery recovery,
+            JdbcEventPublicationWorker worker,
+            ReliableEventProperties properties
+    ) {
+        properties.validateCore();
+        return new ReliableEventScheduler(
+                recovery, worker, properties.getClaimBatchSize(),
+                properties.getWorkerThreads(), properties.getWorkerQueueCapacity(),
+                properties.getPollInterval()
+        );
+    }
 }

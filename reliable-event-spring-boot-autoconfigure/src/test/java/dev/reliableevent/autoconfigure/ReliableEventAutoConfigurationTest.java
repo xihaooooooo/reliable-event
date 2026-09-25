@@ -37,7 +37,8 @@ class ReliableEventAutoConfigurationTest {
             .withConfiguration(AutoConfigurations.of(
                     ReliableEventAutoConfiguration.class,
                     ReliableEventPublicationAutoConfiguration.class
-            ));
+            ))
+            .withPropertyValues("reliable-event.scheduling-enabled=false");
 
     @Test
     void disabledCreatesNoDefaultBeans() {
@@ -51,6 +52,7 @@ class ReliableEventAutoConfigurationTest {
                     assertThat(context).doesNotHaveBean(ReliableEventPublisher.class);
                     assertThat(context).doesNotHaveBean(Producer.class);
                     assertThat(context).doesNotHaveBean(JdbcEventPublicationCycle.class);
+                    assertThat(context).doesNotHaveBean(ReliableEventScheduler.class);
                 });
     }
 
@@ -65,6 +67,7 @@ class ReliableEventAutoConfigurationTest {
                     assertThat(context).hasSingleBean(JdbcExpiredLeaseRecovery.class);
                     assertThat(context).hasSingleBean(JdbcEventPublicationWorker.class);
                     assertThat(context).hasSingleBean(JdbcEventPublicationCycle.class);
+                    assertThat(context).doesNotHaveBean(ReliableEventScheduler.class);
                     assertThat(context).doesNotHaveBean(Producer.class);
                 });
     }
@@ -79,6 +82,29 @@ class ReliableEventAutoConfigurationTest {
                     assertThat(context).getBean(ReliableEventPublisher.class).isSameAs(custom);
                     assertThat(context).hasSingleBean(JdbcEventPublicationCycle.class);
                 });
+    }
+
+    @Test
+    void schedulingCanStartWithCustomSenderAndBacksOffForCustomRuntime() {
+        JdbcExpiredLeaseRecovery recovery = mock(JdbcExpiredLeaseRecovery.class);
+        JdbcEventPublicationWorker worker = mock(JdbcEventPublicationWorker.class);
+        when(worker.findDueEventCandidates(org.mockito.ArgumentMatchers.anyInt()))
+                .thenReturn(java.util.List.of());
+        jdbcRunner().withBean(EventSender.class, () -> mock(EventSender.class))
+                .withBean(JdbcExpiredLeaseRecovery.class, () -> recovery)
+                .withBean(JdbcEventPublicationWorker.class, () -> worker)
+                .withPropertyValues("reliable-event.scheduling-enabled=true")
+                .run(context -> {
+                    assertThat(context).hasNotFailed();
+                    assertThat(context).hasSingleBean(ReliableEventScheduler.class);
+                    assertThat(context.getBean(ReliableEventScheduler.class).isRunning()).isTrue();
+                });
+
+        ReliableEventScheduler custom = mock(ReliableEventScheduler.class);
+        jdbcRunner().withBean(EventSender.class, () -> mock(EventSender.class))
+                .withBean(ReliableEventScheduler.class, () -> custom)
+                .withPropertyValues("reliable-event.scheduling-enabled=true")
+                .run(context -> assertThat(context.getBean(ReliableEventScheduler.class)).isSameAs(custom));
     }
 
     @Test
@@ -241,7 +267,11 @@ class ReliableEventAutoConfigurationTest {
                 "reliable-event.claim-batch-size=0",
                 "reliable-event.lease-duration=0ms",
                 "reliable-event.max-retry-delay=500ms",
-                "reliable-event.poll-interval=1s"
+                "reliable-event.poll-interval=0ms",
+                "reliable-event.worker-threads=0",
+                "reliable-event.worker-queue-capacity=-1",
+                "reliable-event.worker-threads=2147483647",
+                "reliable-event.published-retention=7d"
         }) {
             jdbcRunner().withBean(EventSender.class, () -> mock(EventSender.class))
                     .withPropertyValues(property)

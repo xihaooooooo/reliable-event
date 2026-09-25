@@ -83,6 +83,9 @@ public final class JdbcOutboxRepository {
     }
 
     public List<EventCandidate> findDueEventCandidates(Instant now, int limit) {
+        if (limit <= 0) {
+            throw new IllegalArgumentException("limit must be positive");
+        }
         return jdbcTemplate.query(
                 """
                 SELECT id, version

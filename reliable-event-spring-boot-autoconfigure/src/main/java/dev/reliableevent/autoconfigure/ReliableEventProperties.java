@@ -14,6 +14,10 @@ public class ReliableEventProperties {
     private boolean enabled = true;
     private int claimBatchSize = 50;
     private int recoveryBatchSize = 50;
+    private boolean schedulingEnabled = true;
+    private Duration pollInterval = Duration.ofSeconds(1);
+    private int workerThreads = 8;
+    private int workerQueueCapacity = 200;
     private Duration leaseDuration = Duration.ofSeconds(30);
     private int maxAttempts = 8;
     private Duration initialRetryDelay = Duration.ofSeconds(1);
@@ -26,6 +30,14 @@ public class ReliableEventProperties {
     public void setClaimBatchSize(int claimBatchSize) { this.claimBatchSize = claimBatchSize; }
     public int getRecoveryBatchSize() { return recoveryBatchSize; }
     public void setRecoveryBatchSize(int recoveryBatchSize) { this.recoveryBatchSize = recoveryBatchSize; }
+    public boolean isSchedulingEnabled() { return schedulingEnabled; }
+    public void setSchedulingEnabled(boolean schedulingEnabled) { this.schedulingEnabled = schedulingEnabled; }
+    public Duration getPollInterval() { return pollInterval; }
+    public void setPollInterval(Duration pollInterval) { this.pollInterval = pollInterval; }
+    public int getWorkerThreads() { return workerThreads; }
+    public void setWorkerThreads(int workerThreads) { this.workerThreads = workerThreads; }
+    public int getWorkerQueueCapacity() { return workerQueueCapacity; }
+    public void setWorkerQueueCapacity(int workerQueueCapacity) { this.workerQueueCapacity = workerQueueCapacity; }
     public Duration getLeaseDuration() { return leaseDuration; }
     public void setLeaseDuration(Duration leaseDuration) { this.leaseDuration = leaseDuration; }
     public int getMaxAttempts() { return maxAttempts; }
@@ -40,6 +52,14 @@ public class ReliableEventProperties {
     public void validateCore() {
         positive(claimBatchSize, "claim-batch-size");
         positive(recoveryBatchSize, "recovery-batch-size");
+        positiveMillis(pollInterval, "poll-interval");
+        positive(workerThreads, "worker-threads");
+        if (workerQueueCapacity < 0) {
+            throw invalid("worker-queue-capacity", "must not be negative");
+        }
+        if ((long) workerThreads + workerQueueCapacity > Integer.MAX_VALUE) {
+            throw invalid("worker-threads/worker-queue-capacity", "combined capacity is too large");
+        }
         positive(maxAttempts, "max-attempts");
         positiveMillis(leaseDuration, "lease-duration");
         try {

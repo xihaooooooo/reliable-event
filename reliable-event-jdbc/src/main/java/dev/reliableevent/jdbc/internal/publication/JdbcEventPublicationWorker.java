@@ -15,6 +15,7 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
 import java.util.Objects;
+import java.util.Optional;
 
 public final class JdbcEventPublicationWorker {
 
@@ -85,32 +86,46 @@ public final class JdbcEventPublicationWorker {
     }
 
     public int publishDueEvents() {
-        Instant now = clock.instant();
-        return publishCandidates(repository.findDueEventCandidates(now, batchSize));
+        return publishCandidates(findDueEventCandidates(batchSize));
+    }
+
+    public List<EventCandidate> findDueEventCandidates(int limit) {
+        if (limit <= 0) {
+            throw new IllegalArgumentException("limit must be positive");
+        }
+        return repository.findDueEventCandidates(clock.instant(), limit);
     }
 
     public int publishCandidates(List<EventCandidate> candidates) {
         Objects.requireNonNull(candidates, "candidates must not be null");
-        Instant now = clock.instant();
         int publishedCount = 0;
         for (EventCandidate candidate : candidates) {
-            ClaimedEvent claimedEvent = transaction.execute(
-                    status -> repository.claim(
-                            candidate,
-                            now,
-                            workerId,
-                            leaseDuration
-                    ).orElse(null)
-            );
-            if (claimedEvent == null) {
-                continue;
-            }
-
-            if (publish(claimedEvent)) {
+            if (publishCandidate(candidate)) {
                 publishedCount++;
             }
         }
         return publishedCount;
+    }
+
+    public boolean publishCandidate(EventCandidate candidate) {
+        return claimCandidate(candidate).map(this::publishClaimedEvent).orElse(false);
+    }
+
+    public Optional<ClaimedEvent> claimCandidate(EventCandidate candidate) {
+        Objects.requireNonNull(candidate, "candidate must not be null");
+        Instant now = clock.instant();
+        return transaction.execute(
+                status -> repository.claim(
+                        candidate,
+                        now,
+                        workerId,
+                        leaseDuration
+                )
+        );
+    }
+
+    public boolean publishClaimedEvent(ClaimedEvent claimedEvent) {
+        return publish(Objects.requireNonNull(claimedEvent, "claimedEvent must not be null"));
     }
 
     private boolean publish(ClaimedEvent claimedEvent) {

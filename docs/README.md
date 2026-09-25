@@ -24,6 +24,7 @@
 - [M4.1：RocketMQ 发送适配与目标映射](implementation/M4_1_ROCKETMQ_SENDER_AND_DESTINATION_MAPPING.md)：冻结 RocketMQ 5.x 客户端基线、消息映射、错误分类和真实 Broker 验收方案。
 - [M4.2：Spring Boot 自动配置与 Starter](implementation/M4_2_SPRING_BOOT_AUTOCONFIGURE_AND_STARTER.md)：定义配置属性、条件装配、Producer 生命周期、目标映射绑定和启动期校验。
 - [M4.3：常驻调度与有界并发](implementation/M4_3_SCHEDULING_AND_BOUNDED_CONCURRENCY.md)：定义自动扫描、排队前不抢占、本地容量约束、并发执行和验收测试。
+- [M4.4：停止抢占、等待在途发送与优雅停机](implementation/M4_4_GRACEFUL_SHUTDOWN.md)：定义有界停机、排队候选撤销、在途发送等待、Producer 关闭顺序和超时语义。
 
 ## 进度记录
 
@@ -41,6 +42,7 @@
 - [M4.1 阶段完成记录](progress/M4_1_COMPLETED.md)：记录模块拆分、RocketMQ 消息映射、错误分类和真实 Broker 故障验收结果。
 - [M4.2 阶段完成记录](progress/M4_2_COMPLETED.md)：记录 Starter 自动配置、属性校验、Producer 生命周期和真实服务验收结果。
 - [M4.3 阶段完成记录](progress/M4_3_COMPLETED.md)：记录常驻调度、有界并发、队列不持有租约和真实服务验收结果。
+- [M4.4 阶段完成记录](progress/M4_4_COMPLETED.md)：记录有界停机、Producer 关闭顺序、超时恢复与全仓回归结果。
 
 ## 对外表述
 

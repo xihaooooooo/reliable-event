@@ -23,7 +23,10 @@ import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.transaction.PlatformTransactionManager;
 
 import javax.sql.DataSource;
+import java.io.IOException;
+import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.Mockito.RETURNS_SELF;
@@ -234,6 +237,7 @@ class ReliableEventAutoConfigurationTest {
     void yamlBindsEventTypeWithHyphenAndPreservesCase() {
         String yaml = """
                 reliable-event:
+                  shutdown-timeout: 9s
                   rocketmq:
                     mappings:
                       Order-Created:
@@ -258,7 +262,19 @@ class ReliableEventAutoConfigurationTest {
                     assertThat(properties.destinations()).containsKeys("Order-Created", "coupon-task-execute");
                     assertThat(properties.destinations().get("Order-Created"))
                             .isEqualTo(new RocketMqDestination("events", "created"));
+                    assertThat(properties.getShutdownTimeout()).isEqualTo(Duration.ofSeconds(9));
                 });
+    }
+
+    @Test
+    void generatedMetadataIncludesShutdownTimeout() throws IOException {
+        try (InputStream resource = getClass().getClassLoader().getResourceAsStream(
+                "META-INF/spring-configuration-metadata.json")) {
+            assertThat(resource).isNotNull();
+            assertThat(new String(resource.readAllBytes(), StandardCharsets.UTF_8))
+                    .contains("\"name\": \"reliable-event.shutdown-timeout\"")
+                    .contains("\"defaultValue\": \"20s\"");
+        }
     }
 
     @Test
@@ -271,6 +287,7 @@ class ReliableEventAutoConfigurationTest {
                 "reliable-event.worker-threads=0",
                 "reliable-event.worker-queue-capacity=-1",
                 "reliable-event.worker-threads=2147483647",
+                "reliable-event.shutdown-timeout=0ms",
                 "reliable-event.published-retention=7d"
         }) {
             jdbcRunner().withBean(EventSender.class, () -> mock(EventSender.class))

@@ -18,6 +18,7 @@ public class ReliableEventProperties {
     private Duration pollInterval = Duration.ofSeconds(1);
     private int workerThreads = 8;
     private int workerQueueCapacity = 200;
+    private Duration shutdownTimeout = Duration.ofSeconds(20);
     private Duration leaseDuration = Duration.ofSeconds(30);
     private int maxAttempts = 8;
     private Duration initialRetryDelay = Duration.ofSeconds(1);
@@ -38,6 +39,8 @@ public class ReliableEventProperties {
     public void setWorkerThreads(int workerThreads) { this.workerThreads = workerThreads; }
     public int getWorkerQueueCapacity() { return workerQueueCapacity; }
     public void setWorkerQueueCapacity(int workerQueueCapacity) { this.workerQueueCapacity = workerQueueCapacity; }
+    public Duration getShutdownTimeout() { return shutdownTimeout; }
+    public void setShutdownTimeout(Duration shutdownTimeout) { this.shutdownTimeout = shutdownTimeout; }
     public Duration getLeaseDuration() { return leaseDuration; }
     public void setLeaseDuration(Duration leaseDuration) { this.leaseDuration = leaseDuration; }
     public int getMaxAttempts() { return maxAttempts; }
@@ -59,6 +62,12 @@ public class ReliableEventProperties {
         }
         if ((long) workerThreads + workerQueueCapacity > Integer.MAX_VALUE) {
             throw invalid("worker-threads/worker-queue-capacity", "combined capacity is too large");
+        }
+        positiveMillis(shutdownTimeout, "shutdown-timeout");
+        try {
+            shutdownTimeout.toNanos();
+        } catch (ArithmeticException exception) {
+            throw invalid("shutdown-timeout", "is too large");
         }
         positive(maxAttempts, "max-attempts");
         positiveMillis(leaseDuration, "lease-duration");

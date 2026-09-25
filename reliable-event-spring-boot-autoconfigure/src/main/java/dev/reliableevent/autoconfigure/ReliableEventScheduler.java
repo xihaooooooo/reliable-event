@@ -9,11 +9,13 @@ import org.slf4j.LoggerFactory;
 import org.springframework.context.SmartLifecycle;
 
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.RejectedExecutionException;
@@ -25,7 +27,6 @@ import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 /**
  * Schedules bounded publication work. A queued candidate has not claimed a database lease.
@@ -38,12 +39,16 @@ public final class ReliableEventScheduler implements SmartLifecycle {
     private final JdbcEventPublicationWorker worker;
     private final int claimBatchSize;
     private final long pollIntervalMillis;
+    private final long shutdownTimeoutNanos;
     private final Semaphore slots;
     private final Set<Long> outstandingIds = ConcurrentHashMap.newKeySet();
     private final ScheduledExecutorService scanner;
     private final ThreadPoolExecutor executor;
     private final AtomicBoolean stopped = new AtomicBoolean();
-    private final ReentrantReadWriteLock claimGate = new ReentrantReadWriteLock(true);
+    private final AtomicInteger admittedTasks = new AtomicInteger();
+    private final Object lifecycleMonitor = new Object();
+    private CompletableFuture<Void> stopCompletion;
+    private volatile boolean timedOut;
     private volatile boolean running;
 
     public ReliableEventScheduler(
@@ -53,6 +58,19 @@ public final class ReliableEventScheduler implements SmartLifecycle {
             int workerThreads,
             int workerQueueCapacity,
             Duration pollInterval
+    ) {
+        this(recovery, worker, claimBatchSize, workerThreads, workerQueueCapacity,
+                pollInterval, Duration.ofSeconds(20));
+    }
+
+    public ReliableEventScheduler(
+            JdbcExpiredLeaseRecovery recovery,
+            JdbcEventPublicationWorker worker,
+            int claimBatchSize,
+            int workerThreads,
+            int workerQueueCapacity,
+            Duration pollInterval,
+            Duration shutdownTimeout
     ) {
         this.recovery = Objects.requireNonNull(recovery, "recovery must not be null");
         this.worker = Objects.requireNonNull(worker, "worker must not be null");
@@ -65,6 +83,11 @@ public final class ReliableEventScheduler implements SmartLifecycle {
         if (pollIntervalMillis <= 0) {
             throw new IllegalArgumentException("pollInterval must be at least one millisecond");
         }
+        Objects.requireNonNull(shutdownTimeout, "shutdownTimeout must not be null");
+        if (shutdownTimeout.toMillis() <= 0) {
+            throw new IllegalArgumentException("shutdownTimeout must be at least one millisecond");
+        }
+        this.shutdownTimeoutNanos = shutdownTimeout.toNanos();
         this.claimBatchSize = claimBatchSize;
         this.slots = new Semaphore(capacity);
         this.scanner = Executors.newSingleThreadScheduledExecutor(namedDaemonThreads("reliable-event-scan"));
@@ -106,7 +129,13 @@ public final class ReliableEventScheduler implements SmartLifecycle {
             }
             CandidateTask task = new CandidateTask(candidate);
             try {
-                executor.execute(task);
+                synchronized (lifecycleMonitor) {
+                    if (stopped.get()) {
+                        task.release();
+                        break;
+                    }
+                    executor.execute(task);
+                }
                 submittedCount++;
             } catch (RejectedExecutionException exception) {
                 task.release();
@@ -114,6 +143,9 @@ public final class ReliableEventScheduler implements SmartLifecycle {
                     LOG.warn("Reliable event executor rejected a candidate before claim; eventId={}", eventId);
                 }
                 break;
+            } catch (RuntimeException exception) {
+                task.release();
+                throw exception;
             }
         }
         return new AsyncPublicationCycleResult(recoveredCount, submittedCount);
@@ -132,38 +164,105 @@ public final class ReliableEventScheduler implements SmartLifecycle {
     }
 
     @Override
-    public synchronized void start() {
-        if (running) {
-            return;
+    public void start() {
+        synchronized (lifecycleMonitor) {
+            if (running) {
+                return;
+            }
+            if (stopped.get()) {
+                throw new IllegalStateException("Reliable event scheduler cannot restart after stop");
+            }
+            scanner.scheduleWithFixedDelay(this::runSafely, 0, pollIntervalMillis, TimeUnit.MILLISECONDS);
+            running = true;
         }
-        if (stopped.get()) {
-            throw new IllegalStateException("Reliable event scheduler cannot restart after stop");
-        }
-        scanner.scheduleWithFixedDelay(this::runSafely, 0, pollIntervalMillis, TimeUnit.MILLISECONDS);
-        running = true;
     }
 
     @Override
-    public synchronized void stop() {
-        claimGate.writeLock().lock();
-        try {
-            if (!stopped.compareAndSet(false, true)) {
-                return;
-            }
-        } finally {
-            claimGate.writeLock().unlock();
-        }
-        running = false;
-        scanner.shutdownNow();
-        for (Runnable task : executor.shutdownNow()) {
-            ((CandidateTask) task).release();
-        }
+    public void stop() {
+        beginStop().join();
     }
 
     @Override
     public void stop(Runnable callback) {
-        stop();
-        callback.run();
+        Objects.requireNonNull(callback, "callback must not be null");
+        beginStop().whenComplete((ignored, failure) -> {
+            try {
+                callback.run();
+            } catch (RuntimeException exception) {
+                LOG.error("Reliable event stop callback failed; type={}",
+                        exception.getClass().getName());
+            }
+        });
+    }
+
+    private CompletableFuture<Void> beginStop() {
+        CompletableFuture<Void> completion;
+        long startedAt;
+        synchronized (lifecycleMonitor) {
+            if (stopCompletion != null) {
+                return stopCompletion;
+            }
+            startedAt = System.nanoTime();
+            stopped.set(true);
+            running = false;
+            completion = new CompletableFuture<>();
+            stopCompletion = completion;
+        }
+        Thread shutdown = new Thread(() -> finishStop(startedAt, completion), "reliable-event-stop");
+        shutdown.setDaemon(true);
+        try {
+            shutdown.start();
+        } catch (RuntimeException exception) {
+            LOG.error("Unable to start reliable event stop thread; type={}",
+                    exception.getClass().getName());
+            finishStop(startedAt, completion);
+        }
+        return completion;
+    }
+
+    private void finishStop(long startedAt, CompletableFuture<Void> completion) {
+        try {
+            scanner.shutdownNow();
+            executor.shutdown();
+            releaseQueuedTasks();
+            boolean scannerTerminated = scanner.awaitTermination(
+                    remainingNanos(startedAt), TimeUnit.NANOSECONDS);
+            boolean workersTerminated = executor.awaitTermination(
+                    remainingNanos(startedAt), TimeUnit.NANOSECONDS);
+            if (!scannerTerminated || !workersTerminated) {
+                forceStop();
+            }
+        } catch (InterruptedException exception) {
+            Thread.currentThread().interrupt();
+            forceStop();
+        } catch (RuntimeException exception) {
+            LOG.error("Reliable event stop failed; type={}", exception.getClass().getName());
+            forceStop();
+        } finally {
+            completion.complete(null);
+        }
+    }
+
+    private long remainingNanos(long startedAt) {
+        return Math.max(0L, shutdownTimeoutNanos - (System.nanoTime() - startedAt));
+    }
+
+    private void releaseQueuedTasks() {
+        List<Runnable> queued = new ArrayList<>();
+        executor.getQueue().drainTo(queued);
+        queued.forEach(task -> ((CandidateTask) task).release());
+    }
+
+    private void forceStop() {
+        synchronized (lifecycleMonitor) {
+            timedOut = true;
+        }
+        LOG.warn("Reliable event stop timed out; admittedTasks={}, outstandingCandidates={}",
+                admittedTasks.get(), outstandingIds.size());
+        scanner.shutdownNow();
+        for (Runnable task : executor.shutdownNow()) {
+            ((CandidateTask) task).release();
+        }
     }
 
     @Override
@@ -195,24 +294,26 @@ public final class ReliableEventScheduler implements SmartLifecycle {
 
         @Override
         public void run() {
+            boolean admitted = false;
             try {
-                ClaimedEvent claimed;
-                claimGate.readLock().lock();
-                try {
+                synchronized (lifecycleMonitor) {
                     if (stopped.get()) {
                         return;
                     }
-                    claimed = worker.claimCandidate(candidate).orElse(null);
-                } finally {
-                    claimGate.readLock().unlock();
+                    admittedTasks.incrementAndGet();
+                    admitted = true;
                 }
-                if (claimed != null) {
+                ClaimedEvent claimed = worker.claimCandidate(candidate).orElse(null);
+                if (claimed != null && !timedOut) {
                     worker.publishClaimedEvent(claimed);
                 }
             } catch (RuntimeException exception) {
                 LOG.error("Reliable event task failed; eventId={}, type={}",
                         candidate.id().value(), exception.getClass().getName());
             } finally {
+                if (admitted) {
+                    admittedTasks.decrementAndGet();
+                }
                 release();
             }
         }

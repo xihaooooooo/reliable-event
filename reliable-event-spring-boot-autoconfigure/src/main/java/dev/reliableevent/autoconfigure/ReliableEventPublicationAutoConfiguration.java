@@ -71,7 +71,7 @@ public class ReliableEventPublicationAutoConfiguration {
         return new ReliableEventScheduler(
                 recovery, worker, properties.getClaimBatchSize(),
                 properties.getWorkerThreads(), properties.getWorkerQueueCapacity(),
-                properties.getPollInterval()
+                properties.getPollInterval(), properties.getShutdownTimeout()
         );
     }
 }

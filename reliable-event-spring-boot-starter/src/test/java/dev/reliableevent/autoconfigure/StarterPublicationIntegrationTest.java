@@ -339,6 +339,209 @@ class StarterPublicationIntegrationTest {
     }
 
     @Test
+    void closingContextDrainsTheActiveEventAndLeavesQueuedEventForAnotherInstance()
+            throws Exception {
+        DriverManagerDataSource dataSource = new DriverManagerDataSource(
+                MYSQL.getJdbcUrl(), MYSQL.getUsername(), MYSQL.getPassword()
+        );
+        new ResourceDatabasePopulator(
+                new ClassPathResource("schema/reliable-event-outbox.sql")
+        ).execute(dataSource);
+        CountDownLatch firstStarted = new CountDownLatch(1);
+        CountDownLatch releaseFirst = new CountDownLatch(1);
+        AtomicInteger firstInstanceSends = new AtomicInteger();
+        AtomicInteger secondInstanceSends = new AtomicInteger();
+        BlockingSenderApplication.sender = event -> {
+            firstInstanceSends.incrementAndGet();
+            firstStarted.countDown();
+            try {
+                if (!releaseFirst.await(15, TimeUnit.SECONDS)) {
+                    throw new IllegalStateException("Test sender was not released");
+                }
+            } catch (InterruptedException exception) {
+                Thread.currentThread().interrupt();
+                throw new IllegalStateException("Active send was interrupted during graceful stop", exception);
+            }
+            return new SendReceipt("first-instance");
+        };
+        String[] properties = {
+                "spring.main.web-application-type=none",
+                "spring.datasource.url=" + MYSQL.getJdbcUrl(),
+                "spring.datasource.username=" + MYSQL.getUsername(),
+                "spring.datasource.password=" + MYSQL.getPassword(),
+                "reliable-event.poll-interval=50ms",
+                "reliable-event.worker-threads=1",
+                "reliable-event.worker-queue-capacity=1",
+                "reliable-event.claim-batch-size=2",
+                "reliable-event.shutdown-timeout=5s"
+        };
+        ConfigurableApplicationContext first = new SpringApplicationBuilder(BlockingSenderApplication.class)
+                .properties(properties).run();
+        Thread closer = new Thread(first::close, "first-instance-close");
+        try {
+            JdbcTemplate jdbc = new JdbcTemplate(dataSource);
+            List<EventId> ids = new TransactionTemplate(first.getBean(PlatformTransactionManager.class))
+                    .execute(status -> List.of(
+                            first.getBean(ReliableEventPublisher.class).publish(new ReliableEvent<>(
+                                    "test", "shutdown-first-" + System.nanoTime(), Map.of("value", 1),
+                                    Instant.now().minusSeconds(1), Map.of()
+                            )),
+                            first.getBean(ReliableEventPublisher.class).publish(new ReliableEvent<>(
+                                    "test", "shutdown-second-" + System.nanoTime(), Map.of("value", 2),
+                                    Instant.now().minusSeconds(1), Map.of()
+                            ))
+                    ));
+            assertThat(firstStarted.await(10, TimeUnit.SECONDS)).isTrue();
+            await().atMost(Duration.ofSeconds(10)).until(() ->
+                    first.getBean(ReliableEventScheduler.class).outstandingCount() == 2);
+
+            closer.start();
+            await().atMost(Duration.ofSeconds(5)).untilAsserted(() ->
+                    assertThat(first.getBean(ReliableEventScheduler.class).isRunning()).isFalse());
+            assertThat(closer.isAlive()).isTrue();
+            assertThat(jdbc.queryForObject(
+                    "SELECT status FROM reliable_event_outbox WHERE id = ?",
+                    Integer.class, ids.get(1).value()
+            )).isZero();
+            assertThat(jdbc.queryForObject(
+                    "SELECT attempt_count FROM reliable_event_outbox WHERE id = ?",
+                    Integer.class, ids.get(1).value()
+            )).isZero();
+            assertThat(jdbc.queryForObject(
+                    "SELECT lease_owner FROM reliable_event_outbox WHERE id = ?",
+                    String.class, ids.get(1).value()
+            )).isNull();
+
+            releaseFirst.countDown();
+            closer.join(TimeUnit.SECONDS.toMillis(10));
+            assertThat(closer.isAlive()).isFalse();
+            assertThat(jdbc.queryForObject(
+                    "SELECT status FROM reliable_event_outbox WHERE id = ?",
+                    Integer.class, ids.get(0).value()
+            )).isEqualTo(2);
+            assertThat(jdbc.queryForObject(
+                    "SELECT status FROM reliable_event_outbox WHERE id = ?",
+                    Integer.class, ids.get(1).value()
+            )).isZero();
+            assertThat(firstInstanceSends.get()).isOne();
+
+            BlockingSenderApplication.sender = event -> {
+                secondInstanceSends.incrementAndGet();
+                return new SendReceipt("second-instance");
+            };
+            try (ConfigurableApplicationContext second =
+                         new SpringApplicationBuilder(BlockingSenderApplication.class)
+                                 .properties(properties).run()) {
+                await().atMost(Duration.ofSeconds(20)).pollInterval(Duration.ofMillis(50))
+                        .untilAsserted(() -> assertThat(jdbc.queryForObject(
+                                "SELECT status FROM reliable_event_outbox WHERE id = ?",
+                                Integer.class, ids.get(1).value()
+                        )).isEqualTo(2));
+            }
+            assertThat(jdbc.queryForObject(
+                    "SELECT attempt_count FROM reliable_event_outbox WHERE id = ?",
+                    Integer.class, ids.get(1).value()
+            )).isOne();
+            assertThat(secondInstanceSends.get()).isOne();
+        } finally {
+            releaseFirst.countDown();
+            closer.join(TimeUnit.SECONDS.toMillis(10));
+            first.close();
+            BlockingSenderApplication.sender = null;
+        }
+    }
+
+    @Test
+    void timedOutShutdownLeavesPublishingEventForLeaseRecovery() throws Exception {
+        DriverManagerDataSource dataSource = new DriverManagerDataSource(
+                MYSQL.getJdbcUrl(), MYSQL.getUsername(), MYSQL.getPassword()
+        );
+        new ResourceDatabasePopulator(
+                new ClassPathResource("schema/reliable-event-outbox.sql")
+        ).execute(dataSource);
+        JdbcTemplate jdbc = new JdbcTemplate(dataSource);
+        CountDownLatch firstStarted = new CountDownLatch(1);
+        CountDownLatch releaseFirst = new CountDownLatch(1);
+        AtomicInteger secondInstanceSends = new AtomicInteger();
+        BlockingSenderApplication.sender = event -> {
+            firstStarted.countDown();
+            while (releaseFirst.getCount() != 0) {
+                try {
+                    releaseFirst.await(50, TimeUnit.MILLISECONDS);
+                } catch (InterruptedException ignored) {
+                    // Exercise an external send that does not respond to interruption.
+                }
+            }
+            return new SendReceipt("late-first-instance");
+        };
+        String[] properties = {
+                "spring.main.web-application-type=none",
+                "spring.datasource.url=" + MYSQL.getJdbcUrl(),
+                "spring.datasource.username=" + MYSQL.getUsername(),
+                "spring.datasource.password=" + MYSQL.getPassword(),
+                "reliable-event.poll-interval=50ms",
+                "reliable-event.worker-threads=1",
+                "reliable-event.worker-queue-capacity=0",
+                "reliable-event.shutdown-timeout=100ms",
+                "reliable-event.initial-retry-delay=100ms",
+                "reliable-event.max-retry-delay=100ms"
+        };
+        ConfigurableApplicationContext first = new SpringApplicationBuilder(BlockingSenderApplication.class)
+                .properties(properties).run();
+        try {
+            EventId eventId = new TransactionTemplate(first.getBean(PlatformTransactionManager.class))
+                    .execute(status -> first.getBean(ReliableEventPublisher.class).publish(
+                            new ReliableEvent<>("test", "shutdown-timeout-" + System.nanoTime(),
+                                    Map.of("value", 1), Instant.now().minusSeconds(1), Map.of())
+                    ));
+            assertThat(eventId).isNotNull();
+            assertThat(firstStarted.await(10, TimeUnit.SECONDS)).isTrue();
+            assertThat(jdbc.queryForObject(
+                    "SELECT status FROM reliable_event_outbox WHERE id = ?",
+                    Integer.class, eventId.value()
+            )).isEqualTo(1);
+
+            first.close();
+            assertThat(jdbc.queryForObject(
+                    "SELECT status FROM reliable_event_outbox WHERE id = ?",
+                    Integer.class, eventId.value()
+            )).isEqualTo(1);
+            assertThat(jdbc.queryForObject(
+                    "SELECT attempt_count FROM reliable_event_outbox WHERE id = ?",
+                    Integer.class, eventId.value()
+            )).isOne();
+            jdbc.update("""
+                    UPDATE reliable_event_outbox
+                    SET lease_until = TIMESTAMPADD(SECOND, -1, UTC_TIMESTAMP(3))
+                    WHERE id = ?
+                    """, eventId.value());
+
+            BlockingSenderApplication.sender = event -> {
+                secondInstanceSends.incrementAndGet();
+                return new SendReceipt("recovered-by-second-instance");
+            };
+            try (ConfigurableApplicationContext second =
+                         new SpringApplicationBuilder(BlockingSenderApplication.class)
+                                 .properties(properties).run()) {
+                await().atMost(Duration.ofSeconds(20)).pollInterval(Duration.ofMillis(50))
+                        .untilAsserted(() -> assertThat(jdbc.queryForObject(
+                                "SELECT status FROM reliable_event_outbox WHERE id = ?",
+                                Integer.class, eventId.value()
+                        )).isEqualTo(2));
+            }
+            assertThat(jdbc.queryForObject(
+                    "SELECT attempt_count FROM reliable_event_outbox WHERE id = ?",
+                    Integer.class, eventId.value()
+            )).isEqualTo(2);
+            assertThat(secondInstanceSends.get()).isOne();
+        } finally {
+            releaseFirst.countDown();
+            first.close();
+            BlockingSenderApplication.sender = null;
+        }
+    }
+
+    @Test
     void scheduledRoundsRecoverAnExpiredLeaseAndPublishIt() {
         DriverManagerDataSource dataSource = new DriverManagerDataSource(
                 MYSQL.getJdbcUrl(), MYSQL.getUsername(), MYSQL.getPassword()

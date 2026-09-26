@@ -1,6 +1,6 @@
 # ReliableEvent 项目方向文档
 
-> 状态：方向已冻结，可以据此拆解任务和编码  
+> 状态：`0.1.0` 范围已更新；2026-09-26 取消 M5.2 私有优惠券链路验收
 > 日期：2026-09-20  
 > 数据库基线更正：2026-09-23，第一版由 MySQL 5.7 调整为 MySQL 8.0
 > 第一目标版本：`0.1.0`
@@ -47,7 +47,7 @@ ReliableEvent 将业务数据和 Outbox 事件写入同一个本地事务。事�
 6. 达到最大尝试次数后进入死信状态；
 7. 能观察积压数量、发布延迟、成功数、失败数和死信数；
 8. 有自动化测试复现上述行为，而不只是在文档中声称支持；
-9. 在私有优惠券项目中至少完成一条业务链路的接入；
+9. 原创示例能从空环境运行，验证业务事务、真实 Broker 发布与消费者按稳定身份去重；
 10. 所有性能数字都能通过仓库内脚本复现。
 
 ## 5. 明确不做
@@ -203,6 +203,7 @@ CREATE TABLE reliable_event_outbox (
     headers           JSON NULL,
     status            TINYINT NOT NULL,
     next_attempt_at   DATETIME(3) NOT NULL,
+    first_available_at DATETIME(3) NULL,
     attempt_count     INT NOT NULL DEFAULT 0,
     max_attempts      INT NOT NULL,
     lease_owner       VARCHAR(128) NULL,
@@ -225,8 +226,8 @@ CREATE TABLE reliable_event_outbox (
 - `next_attempt_at` 同时表达首次可用时间和下一次重试时间，避免扫描条件出现复杂 OR；
 - `lease_owner + lease_until` 用于宕机恢复；
 - `version` 用于 MySQL 8.0 条件更新抢占；
-- `last_error` 只保存截断后的异常摘要，不保存完整敏感数据；
-- 已发布事件按照保留时间批量归档或删除，不无限增长。
+- `last_error` 保存截断后的异常类名与消息；异常消息仍可能包含敏感文本，运维访问需受控；
+- `0.1.0` 不提供自动归档或删除。部署方需监测表增长；删除已发布行会失去该事件键的持久去重记录，后续清理方案必须先解决身份保留与备份问题。
 
 ## 10. MySQL 8.0 抢占策略
 
@@ -236,13 +237,14 @@ MySQL 8.0 支持 `SKIP LOCKED`，但 `0.1.0` 仍保留已经实现和验证的�
 UPDATE reliable_event_outbox
 SET status = 1,
     lease_owner = ?,
-    lease_until = ?,
+    lease_until = TIMESTAMPADD(MICROSECOND, ?, UTC_TIMESTAMP(3)),
     attempt_count = attempt_count + 1,
     version = version + 1,
-    updated_at = NOW(3)
+    updated_at = ?
 WHERE id = ?
   AND status IN (0, 3)
-  AND next_attempt_at <= NOW(3)
+  AND next_attempt_at <= ?
+  AND attempt_count < max_attempts
   AND version = ?;
 ```
 
@@ -291,7 +293,7 @@ delay = min(initialDelay × 2^(attempt-1), maxDelay) + jitter
 不可重试：
 
 - 事件类型没有目标映射；
-- Payload无法序列化；
+- 消息属性或 Body 在发送适配阶段不合法；
 - Topic配置非法；
 - 超过Broker允许的消息大小。
 
@@ -299,13 +301,13 @@ delay = min(initialDelay × 2^(attempt-1), maxDelay) + jitter
 
 ## 13. 租约与宕机恢复
 
-租约必须大于 RocketMQ 发送超时和正常排队时间。状态更新必须校验租约所有者，避免旧 Worker 在租约失效后覆盖新 Worker 的结果。
+租约必须大于有效的 RocketMQ 单次请求超时，并为发送和状态更新留出余量。排队候选尚未抢占租约。状态更新必须校验租约所有者，避免旧 Worker 在租约失效后覆盖新 Worker 的结果。Payload 序列化失败发生在事务内登记阶段，不会生成一条 `DEAD` Outbox 行。
 
 恢复线程扫描：
 
 ```text
 status = PUBLISHING
-AND lease_until < NOW(3)
+AND lease_until <= UTC_TIMESTAMP(3)
 ```
 
 将其转为 `RETRY_WAIT`，并记录租约过期原因。
@@ -319,21 +321,26 @@ AND lease_until < NOW(3)
 ```yaml
 reliable-event:
   enabled: true
+  scheduling-enabled: true
   poll-interval: 1s
   claim-batch-size: 50
+  recovery-batch-size: 50
   worker-threads: 8
   worker-queue-capacity: 200
+  shutdown-timeout: 20s
   lease-duration: 30s
   max-attempts: 8
   initial-retry-delay: 1s
   max-retry-delay: 5m
-  published-retention: 7d
-  require-active-transaction: true
   rocketmq:
+    endpoints: localhost:8081
+    request-timeout: 5s
     mappings:
-      coupon-task-execute:
-        destination: coupon-task-topic:execute
+      order-created:
+        destination: orders-topic:created
 ```
+
+`orders-topic` 是示意值，部署时须创建相应 Topic。活动事务是 `publish` 的固定要求；`0.1.0` 没有 `require-active-transaction` 或 `published-retention` 配置。当前全部配置及默认值见[接入与运维指南](OPERATIONS.md)。
 
 自动配置必须满足：
 
@@ -452,9 +459,9 @@ Payload默认不完整打印，避免泄漏手机号、邮箱等敏感信息。
 
 禁止在没有报告和复现命令的情况下使用“高性能”“生产级”等表述。
 
-## 19. 优惠券项目落地计划
+## 19. 已取消的优惠券项目落地计划（历史记录）
 
-优惠券项目保持私有，只通过 Maven依赖接入本仓库产物。
+2026-09-26 决定取消 M5.2 私有优惠券链路的后续实施与验收。以下是原计划，仅供追溯，不属于 `0.1.0` 范围或发布门槛。此前私有项目中已写入的接入代码与聚焦测试不等于完整业务验收；本仓库不宣称该链路已落地，也不对私有项目执行迁移或灰度。
 
 ### 第一阶段：创建发券任务
 
@@ -542,7 +549,7 @@ XXL-Job适合集中式任务调度。ReliableEvent解决的是业务事务与消
 ### M5：落地与证明
 
 - 原创示例应用；
-- 优惠券项目第一阶段私有接入；
+- M5.2 私有优惠券接入已取消；
 - 基准测试；
 - 架构、故障语义和使用文档；
 - `0.1.0` 发布检查。
@@ -556,15 +563,15 @@ XXL-Job适合集中式任务调度。ReliableEvent解决的是业务事务与消
 - MySQL 8.0和RocketMQ版本明确固定；
 - README能够在15分钟内指导用户运行示例；
 - 至少一次语义和重复消息窗口写入文档；
-- 不包含优惠券项目受版权保护的代码；
+- 公开示例只使用原创代码，不包含私有优惠券项目代码；
 - 不使用未经验证的性能宣传；
-- 优惠券项目完成至少一个场景的私有接入验证。
+- 原创示例从空环境完成事务登记、真实 Broker 发布和消费幂等验证。
 
 ## 23. 简历表述边界
 
 可以表述：
 
-> 设计并实现基于 Transactional Outbox 的 RocketMQ 可靠消息 Spring Boot Starter，使业务数据与待发布事件在同一本地事务中提交；基于 MySQL 8.0 条件更新和任务租约实现多实例事件抢占、失败重试及宕机恢复，并在优惠券任务创建链路完成落地验证。
+> 设计并实现基于 Transactional Outbox 的 RocketMQ 可靠消息 Spring Boot Starter，使业务数据与待发布事件在同一本地事务中提交；基于 MySQL 8.0 条件更新和任务租约实现多实例事件抢占、失败重试及宕机恢复，并以原创订单示例验证真实 Broker 发布与消费幂等。
 
 不能表述：
 
@@ -578,12 +585,12 @@ XXL-Job适合集中式任务调度。ReliableEvent解决的是业务事务与消
 
 ## 24. 暂缓决定
 
+M5.4 已确定 Maven `groupId` 为 `dev.reliableevent`，拟发布父 POM 与五个库模块；源码许可证为 [Apache-2.0](../LICENSE)。公开工件仓库和正式版本尚未确定。
+
 以下事项不阻塞M0，在真正需要时决定：
 
-- Maven `groupId` 和公开发布坐标；
-- 开源许可证；
 - 数据库迁移使用 Flyway 还是仅提供SQL；
-- 已发布事件采用删除还是归档；
+- 后续版本的已发布事件采用删除还是归档，以及如何保留重复登记身份；`0.1.0` 已确定不自动清理；
 - 是否在 `0.2.0` 增加人工重放接口；
 - 是否在 `0.2.0` 经过基准对比后增加 `SKIP LOCKED` 替代策略。
 

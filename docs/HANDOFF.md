@@ -67,4 +67,4 @@ mvn verify
 
 M5.3 已按[实施协议](implementation/M5_3_REPRODUCIBLE_BENCHMARK.md)完成；如需复测或改变负载，使用[基准模块](../reliable-event-benchmark/README.md)的命令，并将新结果与现有[完成记录](progress/M5_3_COMPLETED.md)分开标记。
 
-M5.2 暂缓验收。私有优惠券项目“创建发券任务”链路已写入 Outbox 接入代码并通过聚焦集成测试，但端到端业务幂等和真实环境故障演练仍待完成，见[实施进度](progress/M5_2_IMPLEMENTATION_PROGRESS.md)及[实施协议](implementation/M5_2_PRIVATE_COUPON_INTEGRATION.md)。M5.3 完成不代表 M5.2 已验收；`0.1.0` 发布检查仍须处理未完成的验收项。M5.1 结果见 [完成记录](progress/M5_1_COMPLETED.md)。
+M5.2 私有优惠券链路已取消，不再执行完整业务验收，也不属于 `0.1.0` 发布门槛。取消前的接入代码和聚焦测试见[历史进度](progress/M5_2_IMPLEMENTATION_PROGRESS.md)；不能表述为业务链路已验收。M5.4 已核对公共库、原创示例、基准证据、文档与本地工件，结论为[暂缓正式发布](implementation/M5_4_RELEASE_CHECK.md#m545-最终决定与待办)：下一步固定本次变更的 commit，确定公开工件仓库与正式版本，再从干净检出复测和验证外部下载。M5.1 结果见[完成记录](progress/M5_1_COMPLETED.md)。

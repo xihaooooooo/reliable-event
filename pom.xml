@@ -18,6 +18,18 @@
 
     <name>ReliableEvent</name>
     <description>Reliable event publishing with a transactional outbox</description>
+    <url>https://github.com/xihaooooooo/reliable-event</url>
+    <licenses>
+        <license>
+            <name>Apache License, Version 2.0</name>
+            <url>https://www.apache.org/licenses/LICENSE-2.0.txt</url>
+            <distribution>repo</distribution>
+        </license>
+    </licenses>
+    <scm>
+        <connection>scm:git:https://github.com/xihaooooooo/reliable-event.git</connection>
+        <url>https://github.com/xihaooooooo/reliable-event</url>
+    </scm>
 
     <modules>
         <module>reliable-event-core</module>
@@ -35,4 +47,19 @@
         <rocketmq-client.version>5.2.1</rocketmq-client.version>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
     </properties>
+
+    <build>
+        <resources>
+            <resource>
+                <directory>src/main/resources</directory>
+            </resource>
+            <resource>
+                <directory>${maven.multiModuleProjectDirectory}</directory>
+                <includes>
+                    <include>LICENSE</include>
+                </includes>
+                <targetPath>META-INF</targetPath>
+            </resource>
+        </resources>
+    </build>
 </project>

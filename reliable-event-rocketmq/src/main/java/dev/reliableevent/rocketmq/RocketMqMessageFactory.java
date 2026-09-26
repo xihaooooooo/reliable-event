@@ -102,7 +102,7 @@ final class RocketMqMessageFactory {
             );
         }
         Map<String, String> headers = new LinkedHashMap<>();
-        root.properties().forEach(entry -> {
+        root.fields().forEachRemaining(entry -> {
             if (!entry.getValue().isTextual()) {
                 throw EventSendException.nonRetryable(
                         "Reliable event header " + safeHeaderName(entry.getKey())

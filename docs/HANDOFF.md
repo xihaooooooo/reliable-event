@@ -65,4 +65,4 @@ mvn verify
 
 ## 下一步
 
-按 M5 规划继续私有优惠券场景接入、可复现基准测试和 `0.1.0` 发布检查。M5.1 结果见 [完成记录](progress/M5_1_COMPLETED.md)，协议见 [实施文档](implementation/M5_1_ORIGINAL_EXAMPLE_APPLICATION.md)。
+私有优惠券项目“创建发券任务”链路已写入 Outbox 接入代码并通过聚焦集成测试；M5.2 的端到端业务幂等和真实环境故障演练仍待验收，见[实施进度](progress/M5_2_IMPLEMENTATION_PROGRESS.md)及[实施协议](implementation/M5_2_PRIVATE_COUPON_INTEGRATION.md)。验收后再进行可复现基准测试和 `0.1.0` 发布检查。M5.1 结果见 [完成记录](progress/M5_1_COMPLETED.md)，协议见 [实施文档](implementation/M5_1_ORIGINAL_EXAMPLE_APPLICATION.md)。

@@ -27,6 +27,7 @@
 - [M4.4：停止抢占、等待在途发送与优雅停机](implementation/M4_4_GRACEFUL_SHUTDOWN.md)：定义有界停机、排队候选撤销、在途发送等待、Producer 关闭顺序和超时语义。
 - [M4.5：Micrometer 指标、结构化日志与 M4 总验收](implementation/M4_5_OBSERVABILITY_AND_M4_ACCEPTANCE.md)：冻结指标口径、日志字段、首次可用时间迁移和真实服务验收。
 - [M5.1：原创示例应用与端到端幂等演示](implementation/M5_1_ORIGINAL_EXAMPLE_APPLICATION.md)：定义公开示例的业务事务、自动发布、消费去重、本地运行与验收证据。
+- [M5.2：私有优惠券项目首条业务链路接入](implementation/M5_2_PRIVATE_COUPON_INTEGRATION.md)：定义创建发券任务链路的接入前核对、事务与消息身份、切换方式及验收证据。
 
 ## 进度记录
 
@@ -47,6 +48,7 @@
 - [M4.4 阶段完成记录](progress/M4_4_COMPLETED.md)：记录有界停机、Producer 关闭顺序、超时恢复与全仓回归结果。
 - [M4.5 阶段完成记录](progress/M4_5_COMPLETED.md)：记录指标、结构化日志、数据库迁移与 M4 总验收结果。
 - [M5.1 阶段完成记录](progress/M5_1_COMPLETED.md)：记录原创示例、真实订单链路、重复消息去重和完整回归结果。
+- [M5.2 实施进度](progress/M5_2_IMPLEMENTATION_PROGRESS.md)：记录私有项目接入代码、已运行测试与尚未通过的业务验收项。
 
 ## 对外表述
 

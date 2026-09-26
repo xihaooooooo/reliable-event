@@ -1,0 +1,4 @@
+group,run_id,valid,registered,publish_events_per_second,steady_events_per_second,p50_ms,p95_ms,p99_ms,mysql_cpu_pct_average,innodb_row_lock_waits_delta,sender_failure_rate,duplicate_message_rate
+baseline,m53-pilot-a-base-1,True,100,59.20663114268798,72.87933094384708,1290.0,1684.1,1696.01,3.175,0.0,0.0,0.0
+multi,m53-pilot-a-multi-1,True,100,54.3773790103317,79.84293193717278,1178.5,1834.05,1845.0,1.115,0.0,0.0,0.0
+unknown,m53-pilot-a-unknown-1,True,100,35.52397868561279,72.96650717703349,1866.5,1924.05,1944.1900000000053,1.025,0.0,0.009900990099009901,0.009900990099009901

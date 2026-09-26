@@ -4,7 +4,7 @@ ReliableEvent 是一个面向 Spring Boot 3 与 RocketMQ 的可靠消息 Starter
 
 它通过 Transactional Outbox 模式，让业务数据与待发布事件在同一个 MySQL 本地事务中提交，再由后台发布器完成消息发送、失败重试、租约恢复和死信处理。
 
-当前仓库已完成 M0 至 M5.1：业务方可以在活动事务中登记事件，模块会持久化 JSON Payload、避免重复登记。Starter 启动后按固定延迟恢复过期租约并扫描到期事件，将候选放入有界本地执行器；候选只有在线程开始执行时才使用版本号条件抢占，在事务外通过 RocketMQ 5.x gRPC 适配同步发送，再按版本、租约 Owner 和有效期更新状态。Context 关闭时会停止新抢占、撤销排队候选，并在有界时间内等待在途发送和状态更新。存在 `MeterRegistry` 时还会记录发布、延迟、积压、死信及租约恢复指标。
+当前仓库已完成 M0 至 M5.1，以及独立的 M5.3 基准测试；M5.2 私有业务验收暂缓。业务方可以在活动事务中登记事件，模块会持久化 JSON Payload、避免重复登记。Starter 启动后按固定延迟恢复过期租约并扫描到期事件，将候选放入有界本地执行器；候选只有在线程开始执行时才使用版本号条件抢占，在事务外通过 RocketMQ 5.x gRPC 适配同步发送，再按版本、租约 Owner 和有效期更新状态。Context 关闭时会停止新抢占、撤销排队候选，并在有界时间内等待在途发送和状态更新。存在 `MeterRegistry` 时还会记录发布、延迟、积压、死信及租约恢复指标。
 
 版本号条件抢占已经通过真实 MySQL 8.0 双 Worker 并发竞争测试。发送失败后事件会按照带随机抖动的指数退避进入 `RETRY_WAIT`；达到最大尝试次数或发生明确不可重试错误时进入 `DEAD`，不再自动扫描。租约使用数据库时间计算，错误 Owner、旧版本和过期租约都不能完成状态更新；过期的 `PUBLISHING` 事件可以限量、按快照条件恢复为 `RETRY_WAIT` 或 `DEAD`。独立 JVM 故障测试验证了至少一次语义窗口；真实 RocketMQ 5.5.0 测试进一步验证了 Topic/Tag/Key/Body/属性映射、Broker 不可用恢复，以及结果未知后重投产生不同 Message ID 的预期重复消息。
 
@@ -27,6 +27,8 @@ ReliableEvent 是一个面向 Spring Boot 3 与 RocketMQ 的可靠消息 Starter
 文档导航及当前第一步见 [项目文档](docs/README.md)。
 
 可按 [原创订单示例](reliable-event-example/README.md) 从空 MySQL 与 RocketMQ 环境启动，观察业务事务、自动发布、Broker 故障恢复和消费幂等。
+
+可按 [基准测试模块](reliable-event-benchmark/README.md) 在独立 MySQL 与 RocketMQ 环境运行 M5.3 实验并生成原始样本、执行计划和报告。本次 26 轮实测、结果解释及原始证据见 [M5.3 完成记录](docs/progress/M5_3_COMPLETED.md)。
 
 ## 验证当前实现
 

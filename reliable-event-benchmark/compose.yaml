@@ -1,0 +1,38 @@
+name: reliable-event-benchmark
+services:
+  mysql:
+    image: mysql:8.0.36
+    environment:
+      MYSQL_DATABASE: reliable_event_benchmark
+      MYSQL_USER: benchmark
+      MYSQL_PASSWORD: benchmark
+      MYSQL_ROOT_PASSWORD: benchmark-root
+      TZ: UTC
+    ports:
+      - "3308:3306"
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h localhost -u root -pbenchmark-root --silent"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    volumes:
+      - benchmark-mysql-data:/var/lib/mysql
+
+  nameserver:
+    image: apache/rocketmq:5.5.0
+    command: ["sh", "mqnamesrv"]
+
+  broker:
+    image: apache/rocketmq:5.5.0
+    depends_on:
+      - nameserver
+    environment:
+      NAMESRV_ADDR: nameserver:9876
+    command: ["sh", "mqbroker", "--enable-proxy", "-c", "/home/rocketmq/rocketmq-5.5.0/conf/benchmark-broker.conf"]
+    ports:
+      - "8081:8081"
+    volumes:
+      - ./broker.conf:/home/rocketmq/rocketmq-5.5.0/conf/benchmark-broker.conf:ro
+
+volumes:
+  benchmark-mysql-data:

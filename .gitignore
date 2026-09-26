@@ -3,6 +3,8 @@ target/
 .vscode/
 *.iml
 *.log
+__pycache__/
+*.pyc
+reliable-event-benchmark/results/
 .DS_Store
 Thumbs.db
-

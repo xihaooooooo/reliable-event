@@ -1,0 +1,30 @@
+spring:
+  main:
+    web-application-type: none
+  datasource:
+    url: ${BENCHMARK_JDBC_URL:jdbc:mysql://localhost:3308/reliable_event_benchmark?connectionTimeZone=UTC}
+    username: ${BENCHMARK_DB_USER:benchmark}
+    password: ${BENCHMARK_DB_PASSWORD:benchmark}
+    hikari:
+      maximum-pool-size: ${BENCHMARK_DB_POOL_SIZE:16}
+
+reliable-event:
+  enabled: ${BENCHMARK_PUBLISHING_ENABLED:false}
+  poll-interval: ${BENCHMARK_POLL_INTERVAL:1s}
+  claim-batch-size: ${BENCHMARK_CLAIM_BATCH_SIZE:50}
+  worker-threads: ${BENCHMARK_WORKER_THREADS:8}
+  worker-queue-capacity: ${BENCHMARK_WORKER_QUEUE_CAPACITY:200}
+  rocketmq:
+    endpoints: ${BENCHMARK_ROCKETMQ_ENDPOINT:localhost:8081}
+    mappings:
+      benchmark-event:
+        destination: reliable-event-benchmark:benchmark
+
+benchmark:
+  mode: ${BENCHMARK_MODE:report}
+  run-id: ${BENCHMARK_RUN_ID:local}
+  count: ${BENCHMARK_COUNT:100}
+  batch-size: ${BENCHMARK_BATCH_SIZE:100}
+  output: ${BENCHMARK_OUTPUT:benchmark-output.csv}
+  ready-file: ${BENCHMARK_READY_FILE:benchmark-ready.txt}
+  receiver-group: ${BENCHMARK_RECEIVER_GROUP:reliable-event-benchmark-consumer}

@@ -5,6 +5,8 @@ import dev.reliableevent.ReliableEventPublisher;
 import dev.reliableevent.internal.publication.EventSender;
 import dev.reliableevent.jdbc.DeadEventOperations;
 import dev.reliableevent.jdbc.JdbcDeadEventOperations;
+import dev.reliableevent.jdbc.JdbcPublishedEventRetention;
+import dev.reliableevent.jdbc.PublishedRetentionResult;
 import dev.reliableevent.jdbc.internal.cycle.JdbcEventPublicationCycle;
 import dev.reliableevent.jdbc.internal.publication.JdbcEventPublicationWorker;
 import dev.reliableevent.jdbc.internal.recovery.JdbcExpiredLeaseRecovery;
@@ -46,6 +48,43 @@ class ReliableEventAutoConfigurationTest {
                     ReliableEventPublicationAutoConfiguration.class
             ))
             .withPropertyValues("reliable-event.scheduling-enabled=false");
+
+    @Test
+    void publishedRetentionIsOffByDefaultAndRequiresExplicitDuration() {
+        jdbcRunner().withBean(EventSender.class, () -> mock(EventSender.class))
+                .run(context -> {
+                    assertThat(context).hasNotFailed();
+                    assertThat(context).doesNotHaveBean(JdbcPublishedEventRetention.class);
+                    assertThat(context).doesNotHaveBean(PublishedRetentionScheduler.class);
+                });
+
+        jdbcRunner().withBean(EventSender.class, () -> mock(EventSender.class))
+                .withPropertyValues("reliable-event.published-retention-enabled=true")
+                .run(context -> assertThat(context).hasFailed());
+    }
+
+    @Test
+    void enabledRetentionHasBoundedSettingsAndScheduler() {
+        JdbcPublishedEventRetention cleaner = mock(JdbcPublishedEventRetention.class);
+        when(cleaner.runOnce(Duration.ofDays(7), 10))
+                .thenReturn(new PublishedRetentionResult(0, 0, 0));
+        jdbcRunner().withBean(EventSender.class, () -> mock(EventSender.class))
+                .withBean(JdbcPublishedEventRetention.class, () -> cleaner)
+                .withPropertyValues("reliable-event.published-retention-enabled=true",
+                        "reliable-event.published-retention=7d",
+                        "reliable-event.cleanup-batch-size=10",
+                        "reliable-event.cleanup-interval=1h")
+                .run(context -> {
+                    assertThat(context).hasNotFailed();
+                    assertThat(context).hasSingleBean(PublishedRetentionScheduler.class);
+                    assertThat(context.getBean(JdbcPublishedEventRetention.class)).isSameAs(cleaner);
+                });
+        jdbcRunner().withBean(EventSender.class, () -> mock(EventSender.class))
+                .withPropertyValues("reliable-event.published-retention-enabled=true",
+                        "reliable-event.published-retention=7d",
+                        "reliable-event.cleanup-batch-size=1001")
+                .run(context -> assertThat(context).hasFailed());
+    }
 
     @Test
     void deadOperationsRequireExplicitOptInWithoutAffectingPublisher() {
@@ -338,7 +377,7 @@ class ReliableEventAutoConfigurationTest {
                 "reliable-event.worker-queue-capacity=-1",
                 "reliable-event.worker-threads=2147483647",
                 "reliable-event.shutdown-timeout=0ms",
-                "reliable-event.published-retention=7d"
+                "reliable-event.unrecognized-option=true"
         }) {
             jdbcRunner().withBean(EventSender.class, () -> mock(EventSender.class))
                     .withPropertyValues(property)

@@ -227,7 +227,7 @@ CREATE TABLE reliable_event_outbox (
 - `lease_owner + lease_until` 用于宕机恢复；
 - `version` 用于 MySQL 8.0 条件更新抢占；
 - `last_error` 保存截断后的异常类名与消息；异常消息仍可能包含敏感文本，运维访问需受控；
-- `0.1.0` 不提供自动归档或删除。部署方需监测表增长；删除已发布行会失去该事件键的持久去重记录，后续清理方案必须先解决身份保留与备份问题。
+- 原始 `0.1.0` 范围不提供自动归档或删除。后续 M7 已采用永久身份表保存登记键，并增加默认关闭的 `PUBLISHED` 行清理；该变更尚须重新执行正式发布检查。
 
 ## 10. MySQL 8.0 抢占策略
 
@@ -340,7 +340,7 @@ reliable-event:
         destination: orders-topic:created
 ```
 
-`orders-topic` 是示意值，部署时须创建相应 Topic。活动事务是 `publish` 的固定要求；`0.1.0` 没有 `require-active-transaction` 或 `published-retention` 配置。当前全部配置及默认值见[接入与运维指南](OPERATIONS.md)。
+`orders-topic` 是示意值，部署时须创建相应 Topic。活动事务是 `publish` 的固定要求；没有 `require-active-transaction=false` 分支。M7 新增默认关闭的 `published-retention` 配置，当前全部配置及默认值见[接入与运维指南](OPERATIONS.md)。
 
 自动配置必须满足：
 

@@ -8,6 +8,7 @@ import dev.reliableevent.jdbc.internal.model.ExpiredLeaseCandidate;
 import dev.reliableevent.jdbc.internal.model.OutboxCounts;
 import dev.reliableevent.internal.model.StoredEvent;
 import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.dao.DuplicateKeyException;
 import org.springframework.jdbc.support.GeneratedKeyHolder;
 import org.springframework.jdbc.support.KeyHolder;
 
@@ -15,14 +16,22 @@ import java.sql.Statement;
 import java.sql.Timestamp;
 import java.time.Duration;
 import java.time.Instant;
+import java.time.LocalDateTime;
+import java.time.ZoneOffset;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
 
 public final class JdbcOutboxRepository {
 
+    private static final String INSERT_IDENTITY = """
+            INSERT INTO reliable_event_identity (event_type, event_key, registered_at)
+            VALUES (?, ?, ?)
+            """;
+
     private static final String INSERT_EVENT = """
             INSERT INTO reliable_event_outbox (
+                id,
                 event_type,
                 event_key,
                 payload,
@@ -33,8 +42,7 @@ public final class JdbcOutboxRepository {
                 max_attempts,
                 created_at,
                 updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON DUPLICATE KEY UPDATE id = LAST_INSERT_ID(id)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """;
 
     private final JdbcTemplate jdbcTemplate;
@@ -53,36 +61,38 @@ public final class JdbcOutboxRepository {
             int maxAttempts
     ) {
         KeyHolder keyHolder = new GeneratedKeyHolder();
-        jdbcTemplate.update(connection -> {
-            var statement = connection.prepareStatement(INSERT_EVENT, Statement.RETURN_GENERATED_KEYS);
-            statement.setString(1, eventType);
-            statement.setString(2, eventKey);
-            statement.setString(3, payloadJson);
-            statement.setString(4, headersJson);
-            statement.setInt(5, EventStatus.PENDING.code());
-            statement.setTimestamp(6, Timestamp.from(availableAt));
-            statement.setTimestamp(7, Timestamp.from(availableAt));
-            statement.setInt(8, maxAttempts);
-            statement.setTimestamp(9, Timestamp.from(createdAt));
-            statement.setTimestamp(10, Timestamp.from(createdAt));
-            return statement;
-        }, keyHolder);
-
+        try {
+            jdbcTemplate.update(connection -> {
+                var statement = connection.prepareStatement(INSERT_IDENTITY, Statement.RETURN_GENERATED_KEYS);
+                statement.setString(1, eventType);
+                statement.setString(2, eventKey);
+                statement.setTimestamp(3, Timestamp.from(createdAt));
+                return statement;
+            }, keyHolder);
+        } catch (DuplicateKeyException duplicate) {
+            // The generated primary key is never supplied; the only possible duplicate
+            // for this insert is the unique business identity. A locking read sees a
+            // concurrent insert after its owner commits, even under REPEATABLE READ.
+            Long existingId = jdbcTemplate.queryForObject("""
+                    SELECT id FROM reliable_event_identity
+                    WHERE event_type = ? AND event_key = ? FOR UPDATE
+                    """, Long.class, eventType, eventKey);
+            if (existingId == null) {
+                throw new IllegalStateException("Duplicate identity has no existing id", duplicate);
+            }
+            return new EventId(existingId);
+        }
         Number generatedKey = keyHolder.getKey();
-        if (generatedKey != null) {
-            return new EventId(generatedKey.longValue());
+        if (generatedKey == null) {
+            throw new IllegalStateException("Identity insert completed without returning an event id");
         }
-
-        Long existingId = jdbcTemplate.queryForObject(
-                "SELECT id FROM reliable_event_outbox WHERE event_type = ? AND event_key = ?",
-                Long.class,
-                eventType,
-                eventKey
-        );
-        if (existingId == null) {
-            throw new IllegalStateException("Outbox insert completed without returning an event id");
-        }
-        return new EventId(existingId);
+        EventId id = new EventId(generatedKey.longValue());
+        jdbcTemplate.update(INSERT_EVENT,
+                id.value(), eventType, eventKey, payloadJson, headersJson,
+                EventStatus.PENDING.code(), Timestamp.from(availableAt),
+                Timestamp.from(availableAt), maxAttempts,
+                Timestamp.from(createdAt), Timestamp.from(createdAt));
+        return id;
     }
 
     public List<EventCandidate> findDueEventCandidates(Instant now, int limit) {
@@ -246,6 +256,7 @@ public final class JdbcOutboxRepository {
     }
 
     public void markPublished(ClaimedEvent claimedEvent, Instant publishedAt) {
+        // MySQL DATETIME has no zone. Bind a UTC wall time regardless of the JVM zone.
         int updated = jdbcTemplate.update(
                 """
                 UPDATE reliable_event_outbox
@@ -262,8 +273,8 @@ public final class JdbcOutboxRepository {
                   AND lease_until > UTC_TIMESTAMP(3)
                 """,
                 EventStatus.PUBLISHED.code(),
-                Timestamp.from(publishedAt),
-                Timestamp.from(publishedAt),
+                LocalDateTime.ofInstant(publishedAt, ZoneOffset.UTC),
+                LocalDateTime.ofInstant(publishedAt, ZoneOffset.UTC),
                 claimedEvent.event().id().value(),
                 EventStatus.PUBLISHING.code(),
                 claimedEvent.claimVersion(),

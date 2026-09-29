@@ -59,6 +59,7 @@ class OrderExampleMysqlIntegrationTest {
         jdbc.update("DELETE FROM example_order_effect");
         jdbc.update("DELETE FROM example_consumed_event");
         jdbc.update("DELETE FROM reliable_event_outbox");
+        jdbc.update("DELETE FROM reliable_event_identity");
         jdbc.update("DELETE FROM example_order");
         context = new SpringApplicationBuilder(ExampleApplication.class, FakeSender.class)
                 .run(

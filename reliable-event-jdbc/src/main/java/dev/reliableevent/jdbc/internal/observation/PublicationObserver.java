@@ -4,6 +4,7 @@ import dev.reliableevent.internal.publication.EventSendFailureType;
 import dev.reliableevent.internal.publication.SendReceipt;
 import dev.reliableevent.jdbc.internal.model.ClaimedEvent;
 import dev.reliableevent.jdbc.internal.model.ExpiredLeaseCandidate;
+import dev.reliableevent.jdbc.PublishedRetentionResult;
 
 import java.time.Instant;
 
@@ -19,4 +20,8 @@ public interface PublicationObserver {
     default void leaseRecovered(ExpiredLeaseCandidate candidate, boolean dead) { }
 
     default void refreshSnapshot() { }
+
+    default void cleanupCompleted(PublishedRetentionResult result, long elapsedNanos) { }
+
+    default void cleanupFailed() { }
 }

@@ -1,6 +1,7 @@
 package dev.reliableevent.autoconfigure;
 
 import dev.reliableevent.rocketmq.RocketMqDestination;
+import dev.reliableevent.jdbc.JdbcPublishedEventRetention;
 import org.springframework.boot.context.properties.ConfigurationProperties;
 
 import java.time.Duration;
@@ -13,6 +14,10 @@ public class ReliableEventProperties {
 
     private boolean enabled = true;
     private boolean deadOperationsEnabled = false;
+    private boolean publishedRetentionEnabled = false;
+    private Duration publishedRetention;
+    private int cleanupBatchSize = 100;
+    private Duration cleanupInterval = Duration.ofHours(1);
     private int claimBatchSize = 50;
     private int recoveryBatchSize = 50;
     private boolean schedulingEnabled = true;
@@ -32,6 +37,16 @@ public class ReliableEventProperties {
     public void setDeadOperationsEnabled(boolean deadOperationsEnabled) {
         this.deadOperationsEnabled = deadOperationsEnabled;
     }
+    public boolean isPublishedRetentionEnabled() { return publishedRetentionEnabled; }
+    public void setPublishedRetentionEnabled(boolean publishedRetentionEnabled) {
+        this.publishedRetentionEnabled = publishedRetentionEnabled;
+    }
+    public Duration getPublishedRetention() { return publishedRetention; }
+    public void setPublishedRetention(Duration publishedRetention) { this.publishedRetention = publishedRetention; }
+    public int getCleanupBatchSize() { return cleanupBatchSize; }
+    public void setCleanupBatchSize(int cleanupBatchSize) { this.cleanupBatchSize = cleanupBatchSize; }
+    public Duration getCleanupInterval() { return cleanupInterval; }
+    public void setCleanupInterval(Duration cleanupInterval) { this.cleanupInterval = cleanupInterval; }
     public int getClaimBatchSize() { return claimBatchSize; }
     public void setClaimBatchSize(int claimBatchSize) { this.claimBatchSize = claimBatchSize; }
     public int getRecoveryBatchSize() { return recoveryBatchSize; }
@@ -86,6 +101,18 @@ public class ReliableEventProperties {
         if (maximum < initial) {
             throw invalid("max-retry-delay", "must be at least initial-retry-delay");
         }
+    }
+
+    public void validateRetention() {
+        if (!publishedRetentionEnabled) {
+            return;
+        }
+        positiveMillis(publishedRetention, "published-retention");
+        if (cleanupBatchSize < 1 || cleanupBatchSize > JdbcPublishedEventRetention.MAX_BATCH_SIZE) {
+            throw invalid("cleanup-batch-size", "must be between 1 and "
+                    + JdbcPublishedEventRetention.MAX_BATCH_SIZE);
+        }
+        positiveMillis(cleanupInterval, "cleanup-interval");
     }
 
     public void validateRocketMq(boolean requireEndpoint, boolean requireMappings) {

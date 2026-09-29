@@ -3,6 +3,8 @@ package dev.reliableevent.example;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import dev.reliableevent.EventId;
+import dev.reliableevent.ReliableEvent;
+import dev.reliableevent.ReliableEventPublisher;
 import dev.reliableevent.internal.publication.EventSendException;
 import dev.reliableevent.internal.publication.EventSender;
 import dev.reliableevent.jdbc.DeadEventDetails;
@@ -34,6 +36,7 @@ import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.datasource.DriverManagerDataSource;
 import org.springframework.jdbc.datasource.init.ResourceDatabasePopulator;
 import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.support.TransactionTemplate;
 import org.testcontainers.containers.GenericContainer;
 import org.testcontainers.containers.MySQLContainer;
 import org.testcontainers.containers.Network;
@@ -359,6 +362,66 @@ class ExampleApplicationEndToEndTest {
         }
     }
 
+    @Test
+    void publishedRetentionKeepsIdentityAndDoesNotSendAgain() throws Exception {
+        startApplication(true, false, 8,
+                "--reliable-event.published-retention-enabled=true",
+                "--reliable-event.published-retention=1s",
+                "--reliable-event.cleanup-interval=100ms",
+                "--reliable-event.cleanup-batch-size=10");
+        ClientConfiguration configuration = ClientConfiguration.newBuilder()
+                .setEndpoints("localhost:8081")
+                .setRequestTimeout(Duration.ofSeconds(10))
+                .enableSsl(false)
+                .build();
+        try (SimpleConsumer probe = PROVIDER.newSimpleConsumerBuilder()
+                .setClientConfiguration(configuration)
+                .setConsumerGroup(PROBE_GROUP)
+                .setAwaitDuration(Duration.ofSeconds(3))
+                .setSubscriptionExpressions(Map.of(TOPIC, FilterExpression.SUB_ALL))
+                .build()) {
+            Created created = postOrder("retained", 1);
+            List<MessageView> first = receiveFor(probe, Long.toString(created.orderId()), 1);
+            assertThat(first.get(0).getProperties())
+                    .containsEntry("reliable_event_id", Long.toString(created.eventId()));
+            await().atMost(Duration.ofSeconds(30)).pollInterval(Duration.ofMillis(100))
+                    .untilAsserted(() -> {
+                        assertThat(effectCount(created.orderId())).isOne();
+                        assertThat(jdbc.queryForObject(
+                                "SELECT COUNT(*) FROM reliable_event_outbox WHERE id = ?",
+                                Long.class, created.eventId())).isZero();
+                    });
+            assertThat(jdbc.queryForObject(
+                    "SELECT COUNT(*) FROM reliable_event_identity WHERE id = ?",
+                    Long.class, created.eventId())).isOne();
+
+            EventId repeated = new TransactionTemplate(context.getBean(PlatformTransactionManager.class))
+                    .execute(status -> context.getBean(ReliableEventPublisher.class).publish(
+                            new ReliableEvent<>(OrderService.EVENT_TYPE,
+                                    Long.toString(created.orderId()),
+                                    new OrderCreatedPayload(created.orderId(), "changed", 99),
+                                    Instant.now(), Map.of())));
+            assertThat(repeated).isEqualTo(new EventId(created.eventId()));
+            assertThat(jdbc.queryForObject(
+                    "SELECT COUNT(*) FROM reliable_event_outbox WHERE id = ?",
+                    Long.class, created.eventId())).isZero();
+            assertThat(effectCount(created.orderId())).isOne();
+            Created fresh = postOrder("after-cleanup", 2);
+            assertThat(fresh.eventId()).isGreaterThan(created.eventId());
+            assertThat(receiveFor(probe, Long.toString(fresh.orderId()), 1).get(0).getProperties())
+                    .containsEntry("reliable_event_id", Long.toString(fresh.eventId()));
+            await().atMost(Duration.ofSeconds(30)).pollInterval(Duration.ofMillis(100))
+                    .untilAsserted(() -> assertThat(effectCount(fresh.orderId())).isOne());
+            long deadline = System.nanoTime() + Duration.ofSeconds(3).toNanos();
+            while (System.nanoTime() < deadline) {
+                for (MessageView message : probe.receive(8, Duration.ofSeconds(15))) {
+                    assertThat(message.getKeys()).doesNotContain(Long.toString(created.orderId()));
+                    probe.ack(message);
+                }
+            }
+        }
+    }
+
     private DeadEventReplayResult replayAfterSignal(DeadEventOperations operations,
                                                      DeadEventDetails inspected, String operator,
                                                      CountDownLatch ready, CountDownLatch start)
@@ -382,8 +445,12 @@ class ExampleApplicationEndToEndTest {
     }
 
     private void startApplication(boolean scheduling, boolean deadOperations, int maxAttempts) {
-        context = new SpringApplicationBuilder(ExampleApplication.class)
-                .run(
+        startApplication(scheduling, deadOperations, maxAttempts, new String[0]);
+    }
+
+    private void startApplication(boolean scheduling, boolean deadOperations, int maxAttempts,
+                                  String... extraProperties) {
+        String[] properties = new String[] {
                         "--server.port=0",
                         "--spring.datasource.url=" + MYSQL.getJdbcUrl(),
                         "--spring.datasource.username=" + MYSQL.getUsername(),
@@ -399,7 +466,11 @@ class ExampleApplicationEndToEndTest {
                         "--reliable-event.rocketmq.endpoints=localhost:8081",
                         "--reliable-event.rocketmq.request-timeout=10s",
                         "--reliable-event.rocketmq.mappings.order-created.destination=" + TOPIC + ":created"
-                );
+                };
+        String[] all = java.util.Arrays.copyOf(properties, properties.length + extraProperties.length);
+        System.arraycopy(extraProperties, 0, all, properties.length, extraProperties.length);
+        context = new SpringApplicationBuilder(ExampleApplication.class)
+                .run(all);
     }
 
     private JdbcEventPublicationWorker worker(EventSender sender, Clock clock) {

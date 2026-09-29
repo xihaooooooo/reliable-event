@@ -1814,8 +1814,8 @@ class ReliableEventIntegrationTest {
         return jdbcTemplate.queryForObject(
                 "SELECT published_at FROM reliable_event_outbox WHERE id = ?",
                 (resultSet, rowNumber) -> {
-                    var timestamp = resultSet.getTimestamp("published_at");
-                    return timestamp == null ? null : timestamp.toInstant();
+                    var utc = resultSet.getObject("published_at", java.time.LocalDateTime.class);
+                    return utc == null ? null : utc.toInstant(ZoneOffset.UTC);
                 },
                 eventId.value()
         );

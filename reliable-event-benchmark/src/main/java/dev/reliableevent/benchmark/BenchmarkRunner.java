@@ -83,6 +83,7 @@ final class BenchmarkRunner implements ApplicationRunner {
 
     private void reset() {
         jdbc.execute("TRUNCATE TABLE reliable_event_outbox");
+        jdbc.execute("TRUNCATE TABLE reliable_event_identity");
         System.out.println("BENCHMARK_RESET_OK");
     }
 
@@ -110,6 +111,11 @@ final class BenchmarkRunner implements ApplicationRunner {
             }
             jdbc.update(sql, parameters);
         }
+        jdbc.update("""
+                INSERT INTO reliable_event_identity (id, event_type, event_key, registered_at)
+                SELECT id, event_type, event_key, created_at
+                FROM reliable_event_outbox
+                """);
         System.out.println("BENCHMARK_SEEDED=" + count);
     }
 

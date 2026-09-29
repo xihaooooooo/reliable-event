@@ -8,6 +8,7 @@ import dev.reliableevent.jdbc.internal.model.ClaimedEvent;
 import dev.reliableevent.jdbc.internal.model.ExpiredLeaseCandidate;
 import dev.reliableevent.jdbc.internal.model.OutboxCounts;
 import dev.reliableevent.jdbc.internal.persistence.JdbcOutboxRepository;
+import dev.reliableevent.jdbc.PublishedRetentionResult;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import org.junit.jupiter.api.Test;
 
@@ -39,6 +40,8 @@ class MicrometerPublicationObserverTest {
         observer.leaseRecovered(new ExpiredLeaseCandidate(new EventId(2), 1, "worker-1",
                 availableAt, 2, 2), true);
         observer.refreshSnapshot();
+        observer.cleanupCompleted(new PublishedRetentionResult(3, 2, 60), 1_000_000);
+        observer.cleanupFailed();
 
         assertThat(registry.get("reliable_event.publish.success").counter().count()).isEqualTo(1);
         assertThat(registry.get("reliable_event.publish.failure").counter().count()).isEqualTo(1);
@@ -54,6 +57,11 @@ class MicrometerPublicationObserverTest {
                 .counter().count()).isEqualTo(1);
         assertThat(registry.get("reliable_event.backlog").gauge().value()).isEqualTo(3);
         assertThat(registry.get("reliable_event.dead").gauge().value()).isEqualTo(2);
+        assertThat(registry.get("reliable_event.retention.deleted").counter().count()).isEqualTo(2);
+        assertThat(registry.get("reliable_event.retention.failed").counter().count()).isEqualTo(1);
+        assertThat(registry.get("reliable_event.retention.duration").timer().count()).isEqualTo(1);
+        assertThat(registry.get("reliable_event.retention.oldest_eligible_age").gauge().value())
+                .isEqualTo(60);
         assertThat(registry.getMeters()).allSatisfy(meter ->
                 assertThat(meter.getId().getTags()).allSatisfy(tag ->
                         assertThat(tag.getKey()).isIn("outcome", "result")));

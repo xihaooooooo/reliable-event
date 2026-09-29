@@ -36,10 +36,11 @@
 - [M6.2：单条重放与原子审计（已完成）](implementation/M6_2_CONTROLLED_REPLAY.md)：带版本保护的重新入队及同事务审计。
 - [M6.3：Starter 接入与人工操作流程（已完成）](implementation/M6_3_STARTER_OPERATIONS.md)：对外 Java 接口、授权责任和操作示例。
 - [M6.4：端到端验收与交接（已完成）](implementation/M6_4_ACCEPTANCE.md)：真实服务验证、运维文档与最终回归。
-- [M7：已发布事件保留与清理计划（待实施）](implementation/M7_PUBLISHED_EVENT_RETENTION.md)：以独立身份表保留登记去重，分批清理到期的已发布记录，并定义迁移与验收门槛。
+- [M7：已发布事件保留与清理计划（已完成）](implementation/M7_PUBLISHED_EVENT_RETENTION.md)：以独立身份表保留登记去重，分批清理到期的已发布记录，并定义迁移与验收门槛。
 
 ## 进度记录
 
+- [M7 完成记录](progress/M7_COMPLETED.md)：身份表迁移、分批清理、真实服务验收、全仓回归与上线边界。
 - [M6 完成记录](progress/M6_COMPLETED.md)：真实服务重放、双操作者竞争、未知结果重复消息、回归结果与剩余边界。
 - [MySQL 8.0 基线更正记录](progress/MYSQL_8_BASELINE.md)：记录服务端版本调整、并发策略取舍和完整回归结果。
 - [M0 阶段完成记录](progress/M0_COMPLETED.md)：简要说明已经完成和验证的内容，以及下一步工作。

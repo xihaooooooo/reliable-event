@@ -15,12 +15,22 @@
 
 | 数据库现状 | 操作 |
 | --- | --- |
-| 没有 Outbox 表 | 执行[正式建表 SQL](../reliable-event-jdbc/src/main/resources/schema/reliable-event-outbox.sql)，核对唯一键 `uk_event_identity`、两个发布/恢复扫描索引和 `idx_dead_list`。 |
+| 没有 Outbox 表 | 执行[正式建表 SQL](../reliable-event-jdbc/src/main/resources/schema/reliable-event-outbox.sql)，创建 Outbox 和身份表，并核对两表的 `uk_event_identity`、发布/恢复/死信扫描索引及 `idx_published_retention`。 |
 | 已有 M4.4 表、缺少 `first_available_at` | 先备份并确认表版本，再依次**执行一次**[M4.5 增量 SQL](../reliable-event-jdbc/src/main/resources/schema/reliable-event-outbox-m4-5.sql)和[M6.1 增量 SQL](../reliable-event-jdbc/src/main/resources/schema/reliable-event-outbox-m6-1.sql)。 |
 | 已有 M4.5 表、缺少 `idx_dead_list` | 使用 M6.1 查询前，先备份并**执行一次**[M6.1 增量 SQL](../reliable-event-jdbc/src/main/resources/schema/reliable-event-outbox-m6-1.sql)。 |
 | 来源或结构不明的旧表 | 对照正式 SQL 逐列、逐索引核对，先制定迁移方案；不能仅因 `CREATE TABLE IF NOT EXISTS` 成功就认为旧表已升级。 |
 
 Starter 不会自动建表或运行迁移。迁移前确认目标库、备份、应用停发窗口及数据库权限；迁移后用 `SHOW CREATE TABLE reliable_event_outbox` 核对。存量 M4.4 行的 `first_available_at` 无法可靠回填，允许为 `NULL`：这些事件继续发布，但不产生 `reliable_event.publish.lag` 样本。新登记行会写入该列。不要用当前 `next_attempt_at` 或 `created_at` 伪造历史首次可用时间。
+
+M7 写入协议要求 `reliable_event_identity` 与 Outbox 同库、同一事务。新库使用正式建表 SQL 创建两表。已有库按以下顺序升级：
+
+1. 保持 `published-retention-enabled=false`，备份 Outbox、身份与重放审计相关数据，暂停所有事件登记入口并等待在途业务事务结束。旧实例仍可完成发送，但不得继续登记。
+2. 如旧表缺少 M4.5/M6.1 字段或索引，先按适用版本执行相应增量 SQL。执行一次[身份表创建与全量回填 SQL](../reliable-event-jdbc/src/main/resources/schema/reliable-event-identity-m7-1.sql)，再运行[一致性核对 SQL](../reliable-event-jdbc/src/main/resources/schema/reliable-event-identity-m7-1-check.sql)。三个异常计数在首次迁移时均须为零；核对最大 ID 与身份表的 `AUTO_INCREMENT` 起点。回填包含全部状态，不只包含 `PUBLISHED`。
+3. 执行一次[M7 清理扫描索引 SQL](../reliable-event-jdbc/src/main/resources/schema/reliable-event-outbox-m7-2.sql)。保持登记暂停，直到所有实例都运行新的身份表登记协议，再恢复入口。验证新登记、重复登记、回滚及双表一致性后，才单独考虑打开清理开关。
+
+身份表不可用时新发布器会失败，不能降级为旧协议。清理开始后，关闭清理开关即可暂停删除，但不能直接回滚到旧版发布器；旧版无法识别已清理行的身份。恢复备份时应让 Outbox、身份及重放审计位于相容的数据时间点。`DATETIME(3)` 按 UTC 解释，数据源应使用 UTC 连接时区；M7 的成功发布时刻按 UTC 写入。
+
+开启清理前还须抽查存量 `published_at` 的时区口径。旧版使用应用时钟和 JDBC `Timestamp` 写入；若曾以非 UTC 连接时区运行，先确定历史数据代表的真实时刻并制定修正方案，不能把本地墙上时间直接当成 UTC 清理截止时间。
 
 使用 M6.2 JDBC 重放前，还须在同一业务库**执行一次**[重放审计表 SQL](../reliable-event-jdbc/src/main/resources/schema/reliable-event-replay-audit-m6-2.sql)。新建 Outbox 表或执行 M6.1 增量 SQL 都不会创建该审计表；重放类不会自动迁移数据库。审计表保留操作者、原因和旧失败摘要，应设置独立的访问和保留策略。
 
@@ -59,6 +69,8 @@ reliable-event:
 | `rocketmq.access-key` / `rocketmq.secret-key` | 无 | 使用静态凭据时必须同时配置；也可提供 `SessionCredentialsProvider`。 |
 
 核心时长和批次在启动时校验。实际发送、状态更新与数据库负载也会消耗租约时间；仅满足 `lease-duration > request-timeout` 不保证任何外部调用都在租约内完成。无 `MeterRegistry` 时发布功能仍运行，但不注册本项目 Micrometer 指标。
+
+M7 清理默认关闭。确认迁移与新写入一致后，设置 `published-retention-enabled=true`，并显式指定正数 `published-retention`（例如 `30d`）。`cleanup-batch-size` 默认 100、范围 1–1000；`cleanup-interval` 默认 `1h`，至少 `1ms`。JDBC 模块也提供 `JdbcPublishedEventRetention.runOnce(retention, batchSize)` 供受控单轮执行，返回扫描数、删除数和剩余最老到期行年龄。自动清理与发布扫描独立运行，只删除 `status=PUBLISHED` 且 `published_at` 早于数据库 UTC 截止时间的行。配置变更需重启应用；停机等待复用 `shutdown-timeout`，数据库调用不响应中断时可能在超时后结束。
 
 ## 状态与只读排查
 
@@ -101,7 +113,7 @@ SELECT a.id, a.event_id, a.previous_version, a.new_version,
        a.previous_attempt_count, a.replayed_at, a.result,
        o.status, o.version, o.attempt_count, o.published_at
 FROM reliable_event_replay_audit a
-JOIN reliable_event_outbox o ON o.id = a.event_id
+LEFT JOIN reliable_event_outbox o ON o.id = a.event_id
 WHERE a.id = ?;
 ```
 
@@ -151,16 +163,17 @@ LIMIT 50;
 
 - `reliable_event.publish.success` / `reliable_event.publish.failure` 是 Sender 单次尝试的结果计数。`reliable_event.publish.duration` 测单次发送耗时；`reliable_event.publish.lag` 从首次计划可用时间到成功回执，不包括随后状态提交或消费完成。旧行 `first_available_at IS NULL` 时不产生 lag 样本。
 - `reliable_event.backlog` 是 `PENDING + RETRY_WAIT` 的数据库快照，含未来事件；`reliable_event.dead` 是 `DEAD` 快照。首次成功采样前 Gauge 为 `NaN`，多实例看到同一张表，不能将这些 Gauge 跨实例相加。`reliable_event.lease.expired` 在成功恢复过期租约后计数。
+- 启用 M7 清理且应用提供 `MeterRegistry` 时，`reliable_event.retention.deleted` 计删除行数，`reliable_event.retention.duration` 计单轮时长，`reliable_event.retention.failed` 计失败轮次，`reliable_event.retention.oldest_eligible_age` 为本实例最近成功轮次后剩余最老到期行的年龄（秒）。该 Gauge 是本地采样值，多实例不应求和；未成功执行前为 `NaN`。
 - 正常关闭时停止新抢占，撤销尚未抢占的排队候选，并在 `shutdown-timeout` 内等待在途发送及状态更新。该超时不限制默认 Producer 的 `close()` 或整个 Spring Context 的关闭时间。超时、进程退出或外部调用无视中断时，遗留租约由后续实例恢复，可能产生重复消息。
 - 当前没有租约续期、`DEAD` 自动重放或通用消费者框架。人工重放须由应用显式调用并鉴权。`scheduling-enabled=false` 时显式 `runOnce()` 不受自动运行时的容量和停机等待管理，调用方自行协调。
 
 ## 数据增长与保留
 
-`0.1.0` **不提供自动归档或删除**。`PUBLISHED` 和 `DEAD` 行会留在 Outbox 表中；部署方应监测表行数、磁盘、索引与备份耗时，并制定自己的容量和保留方案。M5.3 的 1 万、10 万、100 万历史行实验提供了特定环境下的扫描证据，不是无限增长保证。
+M7 提供默认关闭的 `PUBLISHED` 行分批清理，保留期从生产端成功记录的 `published_at` 计算；它不证明消费者已完成。清理后 Outbox 中的 Payload、Headers 和状态历史不可在线查询，`reliable_event_identity` 则永久保留事件 ID、类型和业务键，以保证重复登记不重新入队。`PENDING`、`PUBLISHING`、`RETRY_WAIT`、`DEAD` 不清理；没有在线完整消息归档。开启前应确定完整消息的备份和排障窗口，监测身份表及审计表增长、索引、备份耗时和磁盘空间。M5.3 的旧基准来自 M7 写入协议之前，不能直接当作新协议的性能数字。
 
 M6.2 的重放审计行同样会持续积累；其中的操作者、原因与旧失败摘要应按业务数据保护要求控制访问、备份和保留期限。
 
-不要直接删除 `PUBLISHED` 行来释放空间：`(event_type, event_key)` 唯一键也是重复登记的持久记录，删除后同一业务键可能再次插入并发布。任何未来归档/清理方案都必须先定义业务身份的保留期限、备份与恢复、去重连续性，以及只处理可安全清理的终态行；不得清理 `PENDING`、`PUBLISHING`、`RETRY_WAIT`，也不能无处置地删除 `DEAD`。本版本不附带清理脚本。
+不要绕开 M7 的身份校验手工删除 Outbox 行，也不要删除身份表中的历史键。缺少身份或身份与 Outbox 不匹配时，自动删除会跳过该行；应关闭清理、调查并修复一致性。清理开关关闭后，新写入仍必须使用身份表协议。审计查询使用 `LEFT JOIN`；Outbox 行已清理时审计仍在，不能把联查中的空 Outbox 字段误判为审计丢失。数据库物理空间回收由运维另行安排。
 
 ## 相关文档
 

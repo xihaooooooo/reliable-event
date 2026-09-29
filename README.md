@@ -30,6 +30,8 @@ ReliableEvent 是一个面向 Spring Boot 3 与 RocketMQ 的可靠消息 Starter
 
 ## 验证当前实现
 
+M7 在原发布链路之外加入永久身份表与默认关闭的已发布行清理。M5.3 的旧性能数字尚未按新登记协议复测，M7 也未进入此前的正式发布候选检查。
+
 启动 Docker 后执行：
 
 ```bash
@@ -43,6 +45,8 @@ mvn verify
 计划对外提供父 POM `dev.reliableevent:reliable-event-parent` 和五个库工件：`reliable-event-core`、`reliable-event-jdbc`、`reliable-event-rocketmq`、`reliable-event-spring-boot-autoconfigure`、`reliable-event-spring-boot-starter`。示例与基准模块是源码仓库中的验证材料，不作为库工件发布。
 
 ## 当前 Starter 接入方式
+
+M7 起，新建库的正式建表 SQL 同时创建 Outbox 和永久登记身份表。已有 Outbox 表的部署必须先按[运维指南](docs/OPERATIONS.md#建表和迁移)暂停事件登记、回填及核对身份，再切换所有应用实例；不能仅重新执行 `CREATE TABLE IF NOT EXISTS` 完成升级。
 
 引入 `dev.reliableevent:reliable-event-spring-boot-starter:0.1.0-SNAPSHOT`，配置应用的数据源并创建 [Outbox 表](reliable-event-jdbc/src/main/resources/schema/reliable-event-outbox.sql)。已有 M4.4 表先执行 [M4.5 增量 SQL](reliable-event-jdbc/src/main/resources/schema/reliable-event-outbox-m4-5.sql)。然后提供 RocketMQ 5.x Proxy 地址与事件目标：
 
@@ -60,6 +64,8 @@ reliable-event:
 提供 Micrometer `MeterRegistry` 后，Starter 注册 [M4.5 指标](docs/implementation/M4_5_OBSERVABILITY_AND_M4_ACCEPTANCE.md)；不提供 Registry 时发布功能照常运行。`reliable_event.publish.success` 表示生产端成功回执次数，不代表唯一事件数或消费者处理完成。数据库积压和死信 Gauge 在多实例上展示同一份表的快照，不应跨实例求和。
 
 处理 `DEAD` 事件时，先执行[审计表迁移](reliable-event-jdbc/src/main/resources/schema/reliable-event-replay-audit-m6-2.sql)，再设置 `reliable-event.dead-operations-enabled=true`，即可向应用注入 `DeadEventOperations` 查询与单条重放接口。默认不开启管理 Bean，也不提供 HTTP 端点。调用方须鉴权、核对 Broker 和消费者事实，并保存真实操作者与原因；步骤见[运维指南](docs/OPERATIONS.md)和[公开示例](reliable-event-example/README.md#人工处理-dead-事件)。
+
+M7 将 `(event_type, event_key) → EventId` 永久保存在 `reliable_event_identity`。完成迁移核对后，可显式配置 `published-retention-enabled=true` 与正数 `published-retention`，按批次清理到期的 `PUBLISHED` 行。清理默认关闭；清理后重复登记仍返回原 ID，不产生新消息。清理一旦执行，就不能回退到旧版只写 Outbox 的发布器。M7 的当前源码尚未纳入此前的正式发布检查。
 
 ## 项目原则
 

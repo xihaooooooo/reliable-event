@@ -127,6 +127,7 @@ class RocketMqPublicationIntegrationTest {
     @BeforeEach
     void clearOutbox() {
         jdbcTemplate.update("DELETE FROM reliable_event_outbox");
+        jdbcTemplate.update("DELETE FROM reliable_event_identity");
     }
 
     @Test

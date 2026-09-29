@@ -65,6 +65,8 @@ MySQL 测试用同一事件身份的两次处理调用证明业务效果只提�
 
 ## 配置与清理
 
+新建示例库时，正式 Outbox SQL 同时创建 `reliable_event_identity`。M7 端到端测试还会以 1 秒测试保留期自动清理已发布行，核对身份仍在、再次登记返回原 ID、Broker 无新消息且消费者业务效果仍为一次。实际应用的清理默认关闭；开启前必须按[运维指南](../docs/OPERATIONS.md#建表和迁移)完成旧数据回填及全实例写入协议切换。示例默认 JDBC URL 使用 `connectionTimeZone=UTC`。
+
 可用 `EXAMPLE_JDBC_URL`、`EXAMPLE_DB_USER`、`EXAMPLE_DB_PASSWORD`、`EXAMPLE_ROCKETMQ_ENDPOINT`、`EXAMPLE_ROCKETMQ_TOPIC`、`EXAMPLE_ROCKETMQ_GROUP`、`EXAMPLE_HTTP_PORT` 覆盖示例配置。Topic 或消费者组改名时需自行创建对应 RocketMQ 资源；`bootstrap.ps1` 初始化的是默认名称。真实凭据不要提交到仓库。
 
 若 HTTP 8090 端口被占用，可在启动应用前设置 `$env:EXAMPLE_HTTP_PORT='18090'`，并在请求 URL 与 `wait-order.ps1 -BaseUrl http://localhost:18090` 中使用相同端口。若容器端口冲突，先用 `docker compose ps` 检查，再修改 `compose.yaml` 的主机端口和相应环境变量。Proxy 测试配置把 Broker 地址发布为 `127.0.0.1`，因此默认固定映射为 8081；更改 Proxy 端口需要同步检查路由可达性。

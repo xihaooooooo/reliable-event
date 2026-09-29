@@ -5,6 +5,7 @@ import dev.reliableevent.internal.publication.SendReceipt;
 import dev.reliableevent.jdbc.internal.model.ClaimedEvent;
 import dev.reliableevent.jdbc.internal.model.ExpiredLeaseCandidate;
 import dev.reliableevent.jdbc.internal.model.OutboxCounts;
+import dev.reliableevent.jdbc.PublishedRetentionResult;
 import dev.reliableevent.jdbc.internal.observation.PublicationObserver;
 import dev.reliableevent.jdbc.internal.persistence.JdbcOutboxRepository;
 import io.micrometer.core.instrument.Counter;
@@ -34,12 +35,16 @@ final class MicrometerPublicationObserver implements PublicationObserver, AutoCl
     private final Counter failure;
     private final Counter recoveredRetry;
     private final Counter recoveredDead;
+    private final Counter cleanupDeleted;
+    private final Counter cleanupFailures;
+    private final Timer cleanupDuration;
     private final Timer successDuration;
     private final Timer lag;
     private final EnumMap<EventSendFailureType, Timer> failedDurations =
             new EnumMap<>(EventSendFailureType.class);
     private final AtomicReference<Double> backlog = new AtomicReference<>(Double.NaN);
     private final AtomicReference<Double> dead = new AtomicReference<>(Double.NaN);
+    private final AtomicReference<Double> oldestEligibleAge = new AtomicReference<>(Double.NaN);
 
     MicrometerPublicationObserver(MeterRegistry registry, JdbcTemplate jdbcTemplate) {
         this(registry, new JdbcOutboxRepository(jdbcTemplate));
@@ -54,6 +59,9 @@ final class MicrometerPublicationObserver implements PublicationObserver, AutoCl
                 .tag("result", "retry_wait").register(registry));
         recoveredDead = own(Counter.builder("reliable_event.lease.expired")
                 .tag("result", "dead").register(registry));
+        cleanupDeleted = own(Counter.builder("reliable_event.retention.deleted").register(registry));
+        cleanupFailures = own(Counter.builder("reliable_event.retention.failed").register(registry));
+        cleanupDuration = own(Timer.builder("reliable_event.retention.duration").register(registry));
         successDuration = own(Timer.builder("reliable_event.publish.duration")
                 .tag("outcome", "success").register(registry));
         failedDurations.put(EventSendFailureType.RETRYABLE, duration("retryable"));
@@ -64,6 +72,8 @@ final class MicrometerPublicationObserver implements PublicationObserver, AutoCl
                 .strongReference(true).register(registry));
         own(Gauge.builder("reliable_event.dead", dead, AtomicReference::get)
                 .strongReference(true).register(registry));
+        own(Gauge.builder("reliable_event.retention.oldest_eligible_age", oldestEligibleAge,
+                AtomicReference::get).strongReference(true).register(registry));
     }
 
     @Override
@@ -104,6 +114,18 @@ final class MicrometerPublicationObserver implements PublicationObserver, AutoCl
             LOG.warn("event=reliable_event.metrics.snapshot_failed exceptionType={}",
                     failure.getClass().getName());
         }
+    }
+
+    @Override
+    public void cleanupCompleted(PublishedRetentionResult result, long elapsedNanos) {
+        cleanupDeleted.increment(result.deleted());
+        cleanupDuration.record(Duration.ofNanos(Math.max(0, elapsedNanos)));
+        oldestEligibleAge.set((double) result.oldestEligibleAgeSeconds());
+    }
+
+    @Override
+    public void cleanupFailed() {
+        cleanupFailures.increment();
     }
 
     @Override

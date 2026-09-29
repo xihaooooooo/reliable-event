@@ -166,7 +166,7 @@ Spring Modulith 在发布应用事件时识别事务事件监听器，并在原�
 - Spring Modulith Registry 的记录单位是“事件到某个监听器的发布”，ReliableEvent 的记录单位是“一个待发送到 RocketMQ 的事件”；
 - Spring Modulith 与应用模块事件和 `@TransactionalEventListener` 深度结合，ReliableEvent 公开的是独立、小型 `ReliableEventPublisher` API；
 - Spring Modulith 的官方外部化支持矩阵未列 RocketMQ，ReliableEvent 则把 RocketMQ 作为唯一首版生产适配；
-- ReliableEvent 当前已显式实现退避、最大尝试次数和 `DEAD`，但尚未实现 Spring Modulith 现有的陈旧处理、批量重提交和清理管理能力。
+- ReliableEvent 已显式实现退避、最大尝试次数、`DEAD` 和过期租约恢复；M6 提供受控单条重放，M7 提供默认关闭的 `PUBLISHED` 行分批清理。仍没有批量重放或与 Spring Modulith 相同的发布管理 API。
 
 #### 可借鉴
 

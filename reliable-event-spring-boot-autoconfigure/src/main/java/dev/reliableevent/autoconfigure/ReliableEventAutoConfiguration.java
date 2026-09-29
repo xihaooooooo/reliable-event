@@ -6,6 +6,7 @@ import dev.reliableevent.internal.publication.EventSender;
 import dev.reliableevent.jdbc.JdbcReliableEventPublisher;
 import dev.reliableevent.jdbc.DeadEventOperations;
 import dev.reliableevent.jdbc.JdbcDeadEventOperations;
+import dev.reliableevent.jdbc.JdbcPublishedEventRetention;
 import dev.reliableevent.jdbc.internal.observation.PublicationObserver;
 import dev.reliableevent.jdbc.internal.recovery.JdbcExpiredLeaseRecovery;
 import dev.reliableevent.jdbc.internal.retry.ExponentialBackoff;
@@ -103,6 +104,35 @@ public class ReliableEventAutoConfiguration {
         DeadEventOperations deadEventOperations(JdbcTemplate jdbcTemplate,
                                                  PlatformTransactionManager transactionManager) {
             return new JdbcDeadEventOperations(jdbcTemplate, transactionManager);
+        }
+    }
+
+    @Configuration(proxyBeanMethods = false)
+    @ConditionalOnClass({JdbcTemplate.class, JdbcPublishedEventRetention.class})
+    @ConditionalOnBean({JdbcTemplate.class, PlatformTransactionManager.class})
+    @ConditionalOnSingleCandidate(DataSource.class)
+    @ConditionalOnProperty(prefix = "reliable-event", name = "published-retention-enabled", havingValue = "true")
+    static class PublishedRetentionConfiguration {
+
+        @Bean
+        @ConditionalOnMissingBean(JdbcPublishedEventRetention.class)
+        JdbcPublishedEventRetention publishedEventRetention(JdbcTemplate jdbcTemplate,
+                                                            PlatformTransactionManager manager,
+                                                            ReliableEventProperties properties) {
+            properties.validateRetention();
+            return new JdbcPublishedEventRetention(jdbcTemplate, manager);
+        }
+
+        @Bean
+        @ConditionalOnMissingBean(PublishedRetentionScheduler.class)
+        PublishedRetentionScheduler publishedRetentionScheduler(JdbcPublishedEventRetention retention,
+                                                                 ReliableEventProperties properties,
+                                                                 ObjectProvider<PublicationObserver> observers) {
+            properties.validateRetention();
+            return new PublishedRetentionScheduler(retention,
+                    observers.getIfAvailable(() -> PublicationObserver.NOOP),
+                    properties.getPublishedRetention(), properties.getCleanupBatchSize(),
+                    properties.getCleanupInterval(), properties.getShutdownTimeout());
         }
     }
 

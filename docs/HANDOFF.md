@@ -2,7 +2,7 @@
 
 ## 当前进度
 
-M0、M1、完整 M2、M3、M4.1 至 M4.5、M5.1 和 M5.3 已完成。项目已经具备经过真实 MySQL、独立 JVM 故障注入和真实 RocketMQ 5.5.0 验证的条件抢占、失败重试、死信闭环、租约恢复、并发接管与普通消息发送能力。Spring Boot Starter 现已自动装配、持续调度、执行有界优雅停机，并在提供 `MeterRegistry` 时记录运行指标。M5.1 新增公开的[原创订单示例](../reliable-event-example/README.md)，展示业务事务、自动发布与消费者按业务键去重；M5.3 新增[独立基准模块](../reliable-event-benchmark/README.md)与[完成记录](progress/M5_3_COMPLETED.md)：
+M0、M1、完整 M2、M3、M4.1 至 M4.5、M5.1、M5.3 和 M6.1 已完成。M6.1 在 JDBC 模块增加只读死信查询与分页，尚未提供重放或 Starter 自动装配。项目已经具备经过真实 MySQL、独立 JVM 故障注入和真实 RocketMQ 5.5.0 验证的条件抢占、失败重试、死信闭环、租约恢复、并发接管与普通消息发送能力。Spring Boot Starter 现已自动装配、持续调度、执行有界优雅停机，并在提供 `MeterRegistry` 时记录运行指标。M5.1 新增公开的[原创订单示例](../reliable-event-example/README.md)，展示业务事务、自动发布与消费者按业务键去重；M5.3 新增[独立基准模块](../reliable-event-benchmark/README.md)与[完成记录](progress/M5_3_COMPLETED.md)：
 
 ```text
 事务内 publish → PENDING → 查询候选版本 → 条件抢占为 PUBLISHING
@@ -68,3 +68,5 @@ mvn verify
 M5.3 已按[实施协议](implementation/M5_3_REPRODUCIBLE_BENCHMARK.md)完成；如需复测或改变负载，使用[基准模块](../reliable-event-benchmark/README.md)的命令，并将新结果与现有[完成记录](progress/M5_3_COMPLETED.md)分开标记。
 
 M5.2 私有优惠券链路已取消，不再执行完整业务验收，也不属于 `0.1.0` 发布门槛。取消前的接入代码和聚焦测试见[历史进度](progress/M5_2_IMPLEMENTATION_PROGRESS.md)；不能表述为业务链路已验收。M5.4 已核对公共库、原创示例、基准证据、文档与本地工件，结论为[暂缓正式发布](implementation/M5_4_RELEASE_CHECK.md#m545-最终决定与待办)：下一步固定本次变更的 commit，确定公开工件仓库与正式版本，再从干净检出复测和验证外部下载。M5.1 结果见[完成记录](progress/M5_1_COMPLETED.md)。
+
+M6 后续从[M6.2 单条重放与原子审计](implementation/M6_2_CONTROLLED_REPLAY.md)继续。M6.1 的新代码与迁移不包含在此前 M5.4 检查的候选源码中；如以当前源码发布，须重新执行相应发布检查。

@@ -31,6 +31,11 @@
 - [M5.2：私有优惠券项目首条业务链路接入（已取消）](implementation/M5_2_PRIVATE_COUPON_INTEGRATION.md)：保留取消前的接入协议供追溯，不属于 `0.1.0` 发布范围。
 - [M5.3：可复现基准测试](implementation/M5_3_REPRODUCIBLE_BENCHMARK.md)：定义独立于私有业务验收的负载、指标口径、实验矩阵、原始证据和完成标准。
 - [M5.4：`0.1.0` 发布检查与交接](implementation/M5_4_RELEASE_CHECK.md)：记录公共库、原创示例、基准证据和工件检查；当前结论为暂缓正式发布，M5.2 已取消。
+- [M6：死信查询与受控重放总计划](implementation/M6_DEAD_LETTER_OPERATIONS.md)：确定后续里程碑的目标、边界、验收结果和小计划划分；不包含 AI。
+- [M6.1：死信查询与排障信息（已完成）](implementation/M6_1_DEAD_EVENT_QUERY.md)：只读列表、详情、分页与敏感字段边界。
+- [M6.2：单条重放与原子审计](implementation/M6_2_CONTROLLED_REPLAY.md)：带版本保护的重新入队及同事务审计。
+- [M6.3：Starter 接入与人工操作流程](implementation/M6_3_STARTER_OPERATIONS.md)：对外 Java 接口、授权责任和操作示例。
+- [M6.4：端到端验收与交接](implementation/M6_4_ACCEPTANCE.md)：真实服务验证、运维文档与最终回归。
 
 ## 进度记录
 

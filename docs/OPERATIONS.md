@@ -15,8 +15,9 @@
 
 | 数据库现状 | 操作 |
 | --- | --- |
-| 没有 Outbox 表 | 执行[正式建表 SQL](../reliable-event-jdbc/src/main/resources/schema/reliable-event-outbox.sql)，核对唯一键 `uk_event_identity` 和两个扫描索引。 |
-| 已有 M4.4 表、缺少 `first_available_at` | 先备份并确认表版本，再**执行一次**[M4.5 增量 SQL](../reliable-event-jdbc/src/main/resources/schema/reliable-event-outbox-m4-5.sql)。 |
+| 没有 Outbox 表 | 执行[正式建表 SQL](../reliable-event-jdbc/src/main/resources/schema/reliable-event-outbox.sql)，核对唯一键 `uk_event_identity`、两个发布/恢复扫描索引和 `idx_dead_list`。 |
+| 已有 M4.4 表、缺少 `first_available_at` | 先备份并确认表版本，再依次**执行一次**[M4.5 增量 SQL](../reliable-event-jdbc/src/main/resources/schema/reliable-event-outbox-m4-5.sql)和[M6.1 增量 SQL](../reliable-event-jdbc/src/main/resources/schema/reliable-event-outbox-m6-1.sql)。 |
+| 已有 M4.5 表、缺少 `idx_dead_list` | 使用 M6.1 查询前，先备份并**执行一次**[M6.1 增量 SQL](../reliable-event-jdbc/src/main/resources/schema/reliable-event-outbox-m6-1.sql)。 |
 | 来源或结构不明的旧表 | 对照正式 SQL 逐列、逐索引核对，先制定迁移方案；不能仅因 `CREATE TABLE IF NOT EXISTS` 成功就认为旧表已升级。 |
 
 Starter 不会自动建表或运行迁移。迁移前确认目标库、备份、应用停发窗口及数据库权限；迁移后用 `SHOW CREATE TABLE reliable_event_outbox` 核对。存量 M4.4 行的 `first_available_at` 无法可靠回填，允许为 `NULL`：这些事件继续发布，但不产生 `reliable_event.publish.lag` 样本。新登记行会写入该列。不要用当前 `next_attempt_at` 或 `created_at` 伪造历史首次可用时间。
@@ -65,6 +66,16 @@ reliable-event:
 | `2` | `PUBLISHED` | 生产端收到有效发送回执并成功写入 Outbox 状态；不代表消费者完成。 |
 | `3` | `RETRY_WAIT` | 发送失败或租约恢复后，等待 `next_attempt_at`。 |
 | `4` | `DEAD` | 不可重试错误或尝试耗尽；不会自动再次扫描。 |
+
+M6.1 提供 JDBC 模块的只读 `JdbcDeadEventQuery`，可用应用已有的 `JdbcTemplate` 创建。`firstPage(50)` 返回事件 ID 倒序的 `DEAD` 列表及可选游标；有游标时用 `nextPage(cursor, 50)` 继续，单页上限 100。`lookup(eventId)` 区分不存在、非死信和死信详情。列表不包含业务键和失败摘要；详情包含 `event_key` 与 `last_error`，须限制访问、避免记录到普通日志。两种查询都不读取 Payload 或 Headers。分页不是一致性快照，期间状态变化后需重新查询。M6.1 尚未接入 Starter 自动装配，也不提供重放接口。
+
+```java
+JdbcDeadEventQuery deadEvents = new JdbcDeadEventQuery(jdbcTemplate);
+DeadEventPage page = deadEvents.firstPage(50);
+DeadEventLookup one = deadEvents.lookup(new EventId(123));
+```
+
+这段能力属于后续 M6 开发，尚未纳入此前 M5.4 的 `0.1.0` 发布检查。
 
 下面的 SQL 在**目标业务库**执行，只读且不读取 Payload/Headers。先确认库名；大表上控制查询频率。`event_key` 可能是业务标识，查询结果按应用的数据访问规则处理。
 

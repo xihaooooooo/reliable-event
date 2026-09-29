@@ -169,6 +169,81 @@ class ReliableEventIntegrationTest {
     }
 
     @Test
+    void deadEventLookupDistinguishesMissingActiveAndDeadWithoutChangingRows() {
+        JdbcDeadEventQuery query = new JdbcDeadEventQuery(jdbcTemplate);
+        EventId pending = inTransaction(() -> publisher.publish(event(401L, NOW)));
+        EventId dead = inTransaction(() -> publisher.publish(new ReliableEvent<>(
+                "safe-type", "sensitive-business-key", Map.of("secret", "payload-sentinel"),
+                NOW, Map.of("token", "header-sentinel"))));
+        Instant deadAt = NOW.plusSeconds(2);
+        jdbcTemplate.update("""
+                UPDATE reliable_event_outbox
+                SET status = ?, attempt_count = 3, version = 7,
+                    last_error = ?, updated_at = ?
+                WHERE id = ?
+                """, EventStatus.DEAD.code(), "restricted-error-sentinel",
+                Timestamp.from(deadAt), dead.value());
+
+        assertThat(query.lookup(new EventId(dead.value() + 1000)))
+                .isInstanceOf(DeadEventLookup.NotFound.class);
+        assertThat(query.lookup(pending)).isEqualTo(new DeadEventLookup.NotDead(pending));
+        DeadEventLookup.Dead result = (DeadEventLookup.Dead) query.lookup(dead);
+        DeadEventDetails details = result.event();
+        assertThat(details.id()).isEqualTo(dead);
+        assertThat(details.eventType()).isEqualTo("safe-type");
+        assertThat(details.eventKey()).isEqualTo("sensitive-business-key");
+        assertThat(details.attemptCount()).isEqualTo(3);
+        assertThat(details.maxAttempts()).isEqualTo(8);
+        assertThat(details.createdAt()).isEqualTo(NOW);
+        assertThat(details.deadAt()).isEqualTo(deadAt);
+        assertThat(details.version()).isEqualTo(7);
+        assertThat(details.lastError()).isEqualTo("restricted-error-sentinel");
+        assertThat(details.toString()).doesNotContain("payload-sentinel", "header-sentinel",
+                "sensitive-business-key", "restricted-error-sentinel");
+        assertThat(statusOf(dead)).isEqualTo(EventStatus.DEAD.code());
+        assertThat(versionOf(dead)).isEqualTo(7);
+        assertThat(attemptCountOf(dead)).isEqualTo(3);
+    }
+
+    @Test
+    void deadEventPagesAreBoundedAndUseStableExclusiveIdCursor() {
+        JdbcDeadEventQuery query = new JdbcDeadEventQuery(jdbcTemplate);
+        List<EventId> ids = inTransaction(() -> List.of(
+                publisher.publish(event(411L, NOW)),
+                publisher.publish(event(412L, NOW)),
+                publisher.publish(event(413L, NOW)),
+                publisher.publish(event(414L, NOW)),
+                publisher.publish(event(415L, NOW)),
+                publisher.publish(event(416L, NOW))
+        ));
+        for (int index : List.of(0, 2, 3, 5)) {
+            jdbcTemplate.update("UPDATE reliable_event_outbox SET status = ? WHERE id = ?",
+                    EventStatus.DEAD.code(), ids.get(index).value());
+        }
+
+        DeadEventPage first = query.firstPage(2);
+        assertThat(first.events()).extracting(DeadEventSummary::id)
+                .containsExactly(ids.get(5), ids.get(3));
+        assertThat(first.nextCursor()).contains(ids.get(3));
+
+        EventId newlyDead = inTransaction(() -> publisher.publish(event(417L, NOW)));
+        jdbcTemplate.update("UPDATE reliable_event_outbox SET status = ? WHERE id = ?",
+                EventStatus.DEAD.code(), newlyDead.value());
+
+        DeadEventPage second = query.nextPage(first.nextCursor().orElseThrow(), 2);
+        assertThat(second.events()).extracting(DeadEventSummary::id)
+                .containsExactly(ids.get(2), ids.get(0));
+        assertThat(second.nextCursor()).isEmpty();
+        assertThat(statusOf(ids.get(1))).isEqualTo(EventStatus.PENDING.code());
+        assertThat(statusOf(ids.get(4))).isEqualTo(EventStatus.PENDING.code());
+        assertThat(query.firstPage(1).events()).extracting(DeadEventSummary::id)
+                .containsExactly(newlyDead);
+        assertThatThrownBy(() -> query.firstPage(0)).isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> query.firstPage(JdbcDeadEventQuery.MAX_PAGE_SIZE + 1))
+                .isInstanceOf(IllegalArgumentException.class);
+    }
+
+    @Test
     void firstAvailabilitySurvivesDuplicateAndRetryAndStatusCountsUseDatabaseRows() {
         Instant firstAvailable = NOW.plusSeconds(60);
         EventId future = inTransaction(() -> publisher.publish(event(140L, firstAvailable)));
@@ -236,6 +311,25 @@ class ReliableEventIntegrationTest {
                     Timestamp.class)).isNull();
         } finally {
             jdbcTemplate.execute("DROP TABLE reliable_event_outbox_legacy");
+        }
+    }
+
+    @Test
+    void deadListIndexMigrationUpgradesAnExistingTable() throws Exception {
+        jdbcTemplate.execute("CREATE TABLE reliable_event_outbox_before_m6 LIKE reliable_event_outbox");
+        try {
+            jdbcTemplate.execute("ALTER TABLE reliable_event_outbox_before_m6 DROP INDEX idx_dead_list");
+            String migration = new String(new ClassPathResource(
+                    "schema/reliable-event-outbox-m6-1.sql").getInputStream().readAllBytes(),
+                    StandardCharsets.UTF_8).replace("ALTER TABLE reliable_event_outbox\n",
+                    "ALTER TABLE reliable_event_outbox_before_m6\n");
+            jdbcTemplate.execute(migration);
+
+            assertThat(jdbcTemplate.queryForList(
+                    "SHOW INDEX FROM reliable_event_outbox_before_m6 WHERE Key_name = 'idx_dead_list'"))
+                    .hasSize(2);
+        } finally {
+            jdbcTemplate.execute("DROP TABLE reliable_event_outbox_before_m6");
         }
     }
 

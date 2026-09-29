@@ -19,5 +19,6 @@ CREATE TABLE IF NOT EXISTS reliable_event_outbox (
     PRIMARY KEY (id),
     UNIQUE KEY uk_event_identity (event_type, event_key),
     KEY idx_publish_scan (status, next_attempt_at, id),
-    KEY idx_lease_recovery (status, lease_until, id)
+    KEY idx_lease_recovery (status, lease_until, id),
+    KEY idx_dead_list (status, id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;

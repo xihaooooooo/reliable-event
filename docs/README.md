@@ -58,7 +58,3 @@
 - [M5.1 阶段完成记录](progress/M5_1_COMPLETED.md)：记录原创示例、真实订单链路、重复消息去重和完整回归结果。
 - [M5.2 实施进度（已取消）](progress/M5_2_IMPLEMENTATION_PROGRESS.md)：记录取消前的私有接入代码、已运行测试和尚未完成的业务验收。
 - [M5.3 完成记录](progress/M5_3_COMPLETED.md)：记录真实基准环境、26 轮矩阵、故障证据、执行计划、原始 ZIP 与回归结果。
-
-## 对外表述
-
-- [简历项目文案](RESUME_PROJECT.md)：根据实际完成进度选择可使用的项目描述。

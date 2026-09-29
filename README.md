@@ -22,8 +22,6 @@ ReliableEvent 是一个面向 Spring Boot 3 与 RocketMQ 的可靠消息 Starter
 
 完整范围、语义和验收标准见 [项目方向文档](docs/PROJECT_DIRECTION.md)。
 
-当前进度对应的简历表述见 [简历项目文案](docs/RESUME_PROJECT.md)。
-
 文档导航及当前第一步见 [项目文档](docs/README.md)。
 
 可按 [原创订单示例](reliable-event-example/README.md) 从空 MySQL 与 RocketMQ 环境启动，观察业务事务、自动发布、Broker 故障恢复和消费幂等。

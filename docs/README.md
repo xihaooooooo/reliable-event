@@ -33,12 +33,14 @@
 - [M5.4：`0.1.0` 发布检查与交接](implementation/M5_4_RELEASE_CHECK.md)：记录公共库、原创示例、基准证据和工件检查；当前结论为暂缓正式发布，M5.2 已取消。
 - [M6：死信查询与受控重放总计划](implementation/M6_DEAD_LETTER_OPERATIONS.md)：确定后续里程碑的目标、边界、验收结果和小计划划分；不包含 AI。
 - [M6.1：死信查询与排障信息（已完成）](implementation/M6_1_DEAD_EVENT_QUERY.md)：只读列表、详情、分页与敏感字段边界。
-- [M6.2：单条重放与原子审计](implementation/M6_2_CONTROLLED_REPLAY.md)：带版本保护的重新入队及同事务审计。
-- [M6.3：Starter 接入与人工操作流程](implementation/M6_3_STARTER_OPERATIONS.md)：对外 Java 接口、授权责任和操作示例。
-- [M6.4：端到端验收与交接](implementation/M6_4_ACCEPTANCE.md)：真实服务验证、运维文档与最终回归。
+- [M6.2：单条重放与原子审计（已完成）](implementation/M6_2_CONTROLLED_REPLAY.md)：带版本保护的重新入队及同事务审计。
+- [M6.3：Starter 接入与人工操作流程（已完成）](implementation/M6_3_STARTER_OPERATIONS.md)：对外 Java 接口、授权责任和操作示例。
+- [M6.4：端到端验收与交接（已完成）](implementation/M6_4_ACCEPTANCE.md)：真实服务验证、运维文档与最终回归。
+- [M7：已发布事件保留与清理计划（待实施）](implementation/M7_PUBLISHED_EVENT_RETENTION.md)：以独立身份表保留登记去重，分批清理到期的已发布记录，并定义迁移与验收门槛。
 
 ## 进度记录
 
+- [M6 完成记录](progress/M6_COMPLETED.md)：真实服务重放、双操作者竞争、未知结果重复消息、回归结果与剩余边界。
 - [MySQL 8.0 基线更正记录](progress/MYSQL_8_BASELINE.md)：记录服务端版本调整、并发策略取舍和完整回归结果。
 - [M0 阶段完成记录](progress/M0_COMPLETED.md)：简要说明已经完成和验证的内容，以及下一步工作。
 - [M1 阶段完成记录](progress/M1_COMPLETED.md)：记录最小发布闭环、验证结果和当前能力边界。

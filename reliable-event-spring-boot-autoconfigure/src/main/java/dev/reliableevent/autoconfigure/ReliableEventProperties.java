@@ -12,6 +12,7 @@ import java.util.Map;
 public class ReliableEventProperties {
 
     private boolean enabled = true;
+    private boolean deadOperationsEnabled = false;
     private int claimBatchSize = 50;
     private int recoveryBatchSize = 50;
     private boolean schedulingEnabled = true;
@@ -27,6 +28,10 @@ public class ReliableEventProperties {
 
     public boolean isEnabled() { return enabled; }
     public void setEnabled(boolean enabled) { this.enabled = enabled; }
+    public boolean isDeadOperationsEnabled() { return deadOperationsEnabled; }
+    public void setDeadOperationsEnabled(boolean deadOperationsEnabled) {
+        this.deadOperationsEnabled = deadOperationsEnabled;
+    }
     public int getClaimBatchSize() { return claimBatchSize; }
     public void setClaimBatchSize(int claimBatchSize) { this.claimBatchSize = claimBatchSize; }
     public int getRecoveryBatchSize() { return recoveryBatchSize; }

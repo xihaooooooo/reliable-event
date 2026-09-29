@@ -22,6 +22,8 @@
 
 Starter 不会自动建表或运行迁移。迁移前确认目标库、备份、应用停发窗口及数据库权限；迁移后用 `SHOW CREATE TABLE reliable_event_outbox` 核对。存量 M4.4 行的 `first_available_at` 无法可靠回填，允许为 `NULL`：这些事件继续发布，但不产生 `reliable_event.publish.lag` 样本。新登记行会写入该列。不要用当前 `next_attempt_at` 或 `created_at` 伪造历史首次可用时间。
 
+使用 M6.2 JDBC 重放前，还须在同一业务库**执行一次**[重放审计表 SQL](../reliable-event-jdbc/src/main/resources/schema/reliable-event-replay-audit-m6-2.sql)。新建 Outbox 表或执行 M6.1 增量 SQL 都不会创建该审计表；重放类不会自动迁移数据库。审计表保留操作者、原因和旧失败摘要，应设置独立的访问和保留策略。
+
 ## 配置与启动
 
 当前 Starter 坐标为 `dev.reliableevent:reliable-event-spring-boot-starter:0.1.0-SNAPSHOT`。应用提供 `DataSource`、`JdbcTemplate`、`PlatformTransactionManager` 和 Jackson `ObjectMapper`；默认装配要求只有一个可选的 `DataSource`。示例配置：
@@ -40,6 +42,7 @@ reliable-event:
 | 配置键（均在 `reliable-event` 下） | 默认值 | 含义与约束 |
 | --- | --- | --- |
 | `enabled` | `true` | 关闭时不装配本项目的发布能力；业务代码仍调用 Publisher 时应先处理依赖关系。 |
+| `dead-operations-enabled` | `false` | 显式开启 `DeadEventOperations` Java Bean；不创建 HTTP 端点，也不代替应用鉴权。 |
 | `scheduling-enabled` | `true` | 关闭自动扫描，保留显式 `JdbcEventPublicationCycle.runOnce()` 路径。变更配置需重启应用。 |
 | `poll-interval` | `1s` | 固定延迟扫描间隔，至少 `1ms`。 |
 | `claim-batch-size` / `recovery-batch-size` | `50` / `50` | 每轮到期候选提交上限 / 过期租约恢复上限，均须为正。 |
@@ -67,15 +70,40 @@ reliable-event:
 | `3` | `RETRY_WAIT` | 发送失败或租约恢复后，等待 `next_attempt_at`。 |
 | `4` | `DEAD` | 不可重试错误或尝试耗尽；不会自动再次扫描。 |
 
-M6.1 提供 JDBC 模块的只读 `JdbcDeadEventQuery`，可用应用已有的 `JdbcTemplate` 创建。`firstPage(50)` 返回事件 ID 倒序的 `DEAD` 列表及可选游标；有游标时用 `nextPage(cursor, 50)` 继续，单页上限 100。`lookup(eventId)` 区分不存在、非死信和死信详情。列表不包含业务键和失败摘要；详情包含 `event_key` 与 `last_error`，须限制访问、避免记录到普通日志。两种查询都不读取 Payload 或 Headers。分页不是一致性快照，期间状态变化后需重新查询。M6.1 尚未接入 Starter 自动装配，也不提供重放接口。
+M6.1 的只读查询可经 Starter 装配的 `DeadEventOperations` 调用；JDBC 模块仍提供 `JdbcDeadEventQuery`。`firstPage(50)` 返回事件 ID 倒序的 `DEAD` 列表及可选游标；有游标时用 `nextPage(cursor, 50)` 继续，单页上限 100。`lookup(eventId)` 区分不存在、非死信和死信详情。列表不包含业务键和失败摘要；详情包含 `event_key` 与 `last_error`，须限制访问、避免记录到普通日志。两种查询都不读取 Payload 或 Headers。分页不是一致性快照，期间状态变化后需重新查询。
+
+M6.2 在 JDBC 模块提供 `JdbcDeadEventReplay`；M6.3 通过 Starter 的同一个 `DeadEventOperations` Bean 提供重放。只有设置 `reliable-event.dead-operations-enabled=true` 才装配该 Bean；默认发布路径不需要此配置。应用必须在调用前鉴权，将真实操作者与明确原因写入请求，并先核对 Broker 和消费者是否已处理该事件，特别是发送结果未知的情况。使用 M6.1 详情中的版本作为预期版本；`Replayed` 返回审计 ID，`NotFound`、`NotDead`、`VersionMismatch` 不会更改事件或写审计。重放只将原事件重新入队，由现有调度器发送；它不能保证只投递一次。
 
 ```java
-JdbcDeadEventQuery deadEvents = new JdbcDeadEventQuery(jdbcTemplate);
+// 应用先完成身份认证，并只对获授权的运维角色开放以下调用。
+DeadEventOperations deadEvents = ...; // 注入 Starter Bean
 DeadEventPage page = deadEvents.firstPage(50);
 DeadEventLookup one = deadEvents.lookup(new EventId(123));
+// 核对 Broker/消费者事实并修复原因后，使用详情中的当前版本：
+if (one instanceof DeadEventLookup.Dead dead) {
+    DeadEventReplayResult result = deadEvents.replay(new DeadEventReplayRequest(
+            dead.event().id(), dead.event().version(), authenticatedOperator,
+            "已核对消费记录并修复目标 Topic"));
+    // 持久记录 result 中的审计 ID，并按下述 SQL 追踪发布状态。
+}
 ```
 
-这段能力属于后续 M6 开发，尚未纳入此前 M5.4 的 `0.1.0` 发布检查。
+这些能力尚未纳入此前 M5.4 的 `0.1.0` 发布检查。成功重放保留原事件身份和 `max_attempts`，将 `attempt_count` 清零开始新一轮尝试，旧失败摘要留在审计表；`first_available_at` 不变，重放后的 `publish.lag` 仍从最初可用时间计算。
+
+人工处置应在受控工单中记录事件 ID、`eventType + eventKey`、查询版本、操作者身份、批准人与原因、Broker 消息身份、消费者去重及业务效果、修复动作、重放结果和审计 ID。应用层先完成身份认证与授权，建议让查询详情和执行重放使用分开的权限；库不内置角色或审批。若 Broker 已接收而消费者已完成业务效果，必须先确定业务上是否仍需重放，不能把 `DEAD` 当作未投递证明。操作者之间共享的版本是一次性预期值；得到 `NotDead` 或 `VersionMismatch` 时重新查询并人工核对，不以新版本自动再次重放。
+
+重放成功仅表示重新入队。先以审计 ID 核对下面的只读 SQL，再持续查看该事件的 `status`、`attempt_count` 和发送日志：`PUBLISHED` 时继续核对消费者业务效果；`RETRY_WAIT` 时结合 `next_attempt_at` 和失败摘要排查；再次进入 `DEAD` 时保留本轮审计与发送证据，修复新失败后才发起新的人工决定。数据库异常或审计写入失败会使重放事务回滚，应先排查数据库与审计表，不手工改 Outbox 状态。`PUBLISHING` 只表示有 Worker 持有租约，需等待其完成或按现有租约恢复规则处理。
+
+可用返回的审计 ID 只读核对本次操作和当前发布状态，不在普通日志中输出审计表内的原因或旧失败摘要：
+
+```sql
+SELECT a.id, a.event_id, a.previous_version, a.new_version,
+       a.previous_attempt_count, a.replayed_at, a.result,
+       o.status, o.version, o.attempt_count, o.published_at
+FROM reliable_event_replay_audit a
+JOIN reliable_event_outbox o ON o.id = a.event_id
+WHERE a.id = ?;
+```
 
 下面的 SQL 在**目标业务库**执行，只读且不读取 Payload/Headers。先确认库名；大表上控制查询频率。`event_key` 可能是业务标识，查询结果按应用的数据访问规则处理。
 
@@ -114,7 +142,7 @@ LIMIT 50;
 | `PENDING`/`RETRY_WAIT` 持续增长 | 区分未来 `next_attempt_at` 与已到期行；确认 `enabled`、`scheduling-enabled`、实例存活、数据库与 Proxy 可达、Topic 映射、线程与批次容量 | 恢复依赖服务并观察后续轮次。容量调整应参考[M5.3 基准](progress/M5_3_COMPLETED.md)的负载边界；不手动改状态来“排空”。 |
 | 同一事件反复进入 `RETRY_WAIT` | `attempt_count`、下一次时间、发送失败日志与 Broker/Proxy 健康 | 修复目标、网络或限流原因；结果未知时先核对 Broker 和消费者身份，避免把重试当成丢失。 |
 | `PUBLISHING` 过期未恢复 | 是否有运行的调度实例、数据库时间与连接、`reliable_event.scheduler.failed` 日志 | 修复调度/数据库异常，再观察条件恢复；旧 Worker 可能仍在外部调用中，不要绕过版本与 Owner 栅栏。 |
-| 出现 `DEAD` | 事件身份、尝试次数、受限访问下的 `last_error`、发送日志与业务影响 | 先定位原因和消费者实际效果，再决定业务补偿。当前没有人工重放 API；不要直接改 `status`、`version` 或租约字段。 |
+| 出现 `DEAD` | 事件身份、尝试次数、受限访问下的 `last_error`、发送日志与业务影响 | 先定位原因并核对 Broker/消费者事实，再决定业务补偿或使用 M6.2 JDBC 单条重放。不要直接改 `status`、`version` 或租约字段。 |
 | `PUBLISHED` 但下游没有效果 | RocketMQ 消费位置、消费者日志、持久化去重与业务事务 | 生产端回执不证明消费成功；由消费方按其业务恢复协议处理。 |
 
 `last_error` 是异常类名与消息的截断摘要，**可能包含敏感异常文本**；只允许受控的排障访问，不导出到公开报告。生产日志不打印 Payload 和 Header 值，调用方也不应把凭据或个人数据放入 Header。`reliable_event.publication.state_update_failed` 表示发送后状态更新失败，不能据此判断 Broker 未接收。
@@ -124,11 +152,13 @@ LIMIT 50;
 - `reliable_event.publish.success` / `reliable_event.publish.failure` 是 Sender 单次尝试的结果计数。`reliable_event.publish.duration` 测单次发送耗时；`reliable_event.publish.lag` 从首次计划可用时间到成功回执，不包括随后状态提交或消费完成。旧行 `first_available_at IS NULL` 时不产生 lag 样本。
 - `reliable_event.backlog` 是 `PENDING + RETRY_WAIT` 的数据库快照，含未来事件；`reliable_event.dead` 是 `DEAD` 快照。首次成功采样前 Gauge 为 `NaN`，多实例看到同一张表，不能将这些 Gauge 跨实例相加。`reliable_event.lease.expired` 在成功恢复过期租约后计数。
 - 正常关闭时停止新抢占，撤销尚未抢占的排队候选，并在 `shutdown-timeout` 内等待在途发送及状态更新。该超时不限制默认 Producer 的 `close()` 或整个 Spring Context 的关闭时间。超时、进程退出或外部调用无视中断时，遗留租约由后续实例恢复，可能产生重复消息。
-- 当前没有租约续期、`DEAD` 自动重放或通用消费者框架。`scheduling-enabled=false` 时显式 `runOnce()` 不受自动运行时的容量和停机等待管理，调用方自行协调。
+- 当前没有租约续期、`DEAD` 自动重放或通用消费者框架。人工重放须由应用显式调用并鉴权。`scheduling-enabled=false` 时显式 `runOnce()` 不受自动运行时的容量和停机等待管理，调用方自行协调。
 
 ## 数据增长与保留
 
 `0.1.0` **不提供自动归档或删除**。`PUBLISHED` 和 `DEAD` 行会留在 Outbox 表中；部署方应监测表行数、磁盘、索引与备份耗时，并制定自己的容量和保留方案。M5.3 的 1 万、10 万、100 万历史行实验提供了特定环境下的扫描证据，不是无限增长保证。
+
+M6.2 的重放审计行同样会持续积累；其中的操作者、原因与旧失败摘要应按业务数据保护要求控制访问、备份和保留期限。
 
 不要直接删除 `PUBLISHED` 行来释放空间：`(event_type, event_key)` 唯一键也是重复登记的持久记录，删除后同一业务键可能再次插入并发布。任何未来归档/清理方案都必须先定义业务身份的保留期限、备份与恢复、去重连续性，以及只处理可安全清理的终态行；不得清理 `PENDING`、`PUBLISHING`、`RETRY_WAIT`，也不能无处置地删除 `DEAD`。本版本不附带清理脚本。
 

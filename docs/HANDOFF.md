@@ -2,7 +2,7 @@
 
 ## 当前进度
 
-M0、M1、完整 M2、M3、M4.1 至 M4.5、M5.1、M5.3 和 M6.1 已完成。M6.1 在 JDBC 模块增加只读死信查询与分页，尚未提供重放或 Starter 自动装配。项目已经具备经过真实 MySQL、独立 JVM 故障注入和真实 RocketMQ 5.5.0 验证的条件抢占、失败重试、死信闭环、租约恢复、并发接管与普通消息发送能力。Spring Boot Starter 现已自动装配、持续调度、执行有界优雅停机，并在提供 `MeterRegistry` 时记录运行指标。M5.1 新增公开的[原创订单示例](../reliable-event-example/README.md)，展示业务事务、自动发布与消费者按业务键去重；M5.3 新增[独立基准模块](../reliable-event-benchmark/README.md)与[完成记录](progress/M5_3_COMPLETED.md)：
+M0、M1、完整 M2、M3、M4.1 至 M4.5、M5.1、M5.3 和 M6.1 至 M6.4 已完成。M6.1 在 JDBC 模块增加只读死信查询与分页；M6.2 增加带版本保护的单条重放和同事务审计；M6.3 将两者通过显式开启的 Java 接口接入 Starter；M6.4 在真实 MySQL 与 RocketMQ 上验证[死信重放、操作者竞争和重复消息幂等](progress/M6_COMPLETED.md)。项目已经具备经过真实 MySQL、独立 JVM 故障注入和真实 RocketMQ 5.5.0 验证的条件抢占、失败重试、死信闭环、租约恢复、并发接管与普通消息发送能力。Spring Boot Starter 现已自动装配、持续调度、执行有界优雅停机，并在提供 `MeterRegistry` 时记录运行指标。M5.1 新增公开的[原创订单示例](../reliable-event-example/README.md)，展示业务事务、自动发布与消费者按业务键去重；M5.3 新增[独立基准模块](../reliable-event-benchmark/README.md)与[完成记录](progress/M5_3_COMPLETED.md)：
 
 ```text
 事务内 publish → PENDING → 查询候选版本 → 条件抢占为 PUBLISHING
@@ -50,7 +50,7 @@ Context 关闭 → 停止新抢占 → 撤销未抢占队列 → 限时等待在
 mvn verify
 ```
 
-2026-09-26 本次全仓共有 134 个测试，覆盖单元、Context、MySQL、独立 JVM、真实 RocketMQ 和原创示例端到端场景，全部通过。M5.3 另有 3 个 Python 报告契约测试通过。基准矩阵 26/26 轮有效，详细环境、指标、限制和证据见 [M5.3 完成记录](progress/M5_3_COMPLETED.md)。
+2026-09-29 使用 JDK 17.0.12 执行全仓 `mvn clean verify`，27 份 Surefire 报告共 148 个测试，0 失败、0 错误、0 跳过，覆盖单元、Context、MySQL、独立 JVM、真实 RocketMQ 和原创示例端到端场景。3 个 Python 报告契约测试亦通过；M5.3 的 26/26 轮有效基准矩阵为 2026-09-26 的历史结果，详细环境、指标、限制和证据见 [M5.3 完成记录](progress/M5_3_COMPLETED.md)。
 
 ## 当前边界
 
@@ -58,7 +58,7 @@ mvn verify
 - 同步 `runOnce()` 仍可在 `scheduling-enabled=false` 时使用，手动调用不纳入自动执行器的容量统计；
 - `shutdown-timeout` 不限制 Producer `close()` 或整个 Context 关闭时间；Spring 生命周期阶段超时应大于它；
 - 尚未实现租约续期；
-- `DEAD` 暂无人工重放接口；
+- `DEAD` 可通过 Starter 显式开启的 `DeadEventOperations` 受控重放；调用方负责鉴权与核对 Broker/消费者事实；
 - 已有 M4.4 表须先执行 [M4.5 增量 SQL](../reliable-event-jdbc/src/main/resources/schema/reliable-event-outbox-m4-5.sql)；存量行首次可用时间无法准确回填，因此不生成对应发布延迟样本；
 - 指标需要应用提供 `MeterRegistry`；积压、死信 Gauge 为数据库快照，多实例不能求和；
 - 当前只验证单 Broker 测试环境；示例展示了按业务 Key 的消费幂等，但 Starter 本身不提供通用消费者框架。
@@ -69,4 +69,4 @@ M5.3 已按[实施协议](implementation/M5_3_REPRODUCIBLE_BENCHMARK.md)完成�
 
 M5.2 私有优惠券链路已取消，不再执行完整业务验收，也不属于 `0.1.0` 发布门槛。取消前的接入代码和聚焦测试见[历史进度](progress/M5_2_IMPLEMENTATION_PROGRESS.md)；不能表述为业务链路已验收。M5.4 已核对公共库、原创示例、基准证据、文档与本地工件，结论为[暂缓正式发布](implementation/M5_4_RELEASE_CHECK.md#m545-最终决定与待办)：下一步固定本次变更的 commit，确定公开工件仓库与正式版本，再从干净检出复测和验证外部下载。M5.1 结果见[完成记录](progress/M5_1_COMPLETED.md)。
 
-M6 后续从[M6.2 单条重放与原子审计](implementation/M6_2_CONTROLLED_REPLAY.md)继续。M6.1 的新代码与迁移不包含在此前 M5.4 检查的候选源码中；如以当前源码发布，须重新执行相应发布检查。
+M6 已按[端到端验收协议](implementation/M6_4_ACCEPTANCE.md)完成，测试与剩余边界见[M6 完成记录](progress/M6_COMPLETED.md)。M6.1 至 M6.4 的新代码与迁移不包含在此前 M5.4 检查的候选源码中；如以当前源码发布，须重新执行相应发布检查。

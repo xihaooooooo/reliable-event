@@ -4,6 +4,8 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import dev.reliableevent.ReliableEventPublisher;
 import dev.reliableevent.internal.publication.EventSender;
 import dev.reliableevent.jdbc.JdbcReliableEventPublisher;
+import dev.reliableevent.jdbc.DeadEventOperations;
+import dev.reliableevent.jdbc.JdbcDeadEventOperations;
 import dev.reliableevent.jdbc.internal.observation.PublicationObserver;
 import dev.reliableevent.jdbc.internal.recovery.JdbcExpiredLeaseRecovery;
 import dev.reliableevent.jdbc.internal.retry.ExponentialBackoff;
@@ -86,6 +88,21 @@ public class ReliableEventAutoConfiguration {
                     jdbcTemplate, transactionManager, properties.getRecoveryBatchSize(), backoff,
                     observers.getIfAvailable(() -> PublicationObserver.NOOP)
             );
+        }
+    }
+
+    @Configuration(proxyBeanMethods = false)
+    @ConditionalOnClass({JdbcTemplate.class, JdbcDeadEventOperations.class})
+    @ConditionalOnBean({JdbcTemplate.class, PlatformTransactionManager.class})
+    @ConditionalOnSingleCandidate(DataSource.class)
+    @ConditionalOnProperty(prefix = "reliable-event", name = "dead-operations-enabled", havingValue = "true")
+    static class DeadEventOperationsConfiguration {
+
+        @Bean
+        @ConditionalOnMissingBean(DeadEventOperations.class)
+        DeadEventOperations deadEventOperations(JdbcTemplate jdbcTemplate,
+                                                 PlatformTransactionManager transactionManager) {
+            return new JdbcDeadEventOperations(jdbcTemplate, transactionManager);
         }
     }
 

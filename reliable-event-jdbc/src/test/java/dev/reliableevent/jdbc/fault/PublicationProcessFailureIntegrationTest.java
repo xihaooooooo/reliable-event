@@ -42,6 +42,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 @Transactional(propagation = Propagation.NOT_SUPPORTED)
 @Sql({
         "classpath:schema/reliable-event-outbox.sql",
+        "classpath:schema/reliable-event-replay-audit-m6-2.sql",
         "classpath:schema/test-business-record.sql",
         "classpath:schema/test-message-delivery.sql",
         "classpath:schema/clear-test-data.sql"

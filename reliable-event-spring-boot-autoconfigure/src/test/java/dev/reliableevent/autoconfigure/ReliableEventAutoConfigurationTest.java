@@ -3,6 +3,8 @@ package dev.reliableevent.autoconfigure;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import dev.reliableevent.ReliableEventPublisher;
 import dev.reliableevent.internal.publication.EventSender;
+import dev.reliableevent.jdbc.DeadEventOperations;
+import dev.reliableevent.jdbc.JdbcDeadEventOperations;
 import dev.reliableevent.jdbc.internal.cycle.JdbcEventPublicationCycle;
 import dev.reliableevent.jdbc.internal.publication.JdbcEventPublicationWorker;
 import dev.reliableevent.jdbc.internal.recovery.JdbcExpiredLeaseRecovery;
@@ -44,6 +46,39 @@ class ReliableEventAutoConfigurationTest {
                     ReliableEventPublicationAutoConfiguration.class
             ))
             .withPropertyValues("reliable-event.scheduling-enabled=false");
+
+    @Test
+    void deadOperationsRequireExplicitOptInWithoutAffectingPublisher() {
+        jdbcRunner().withBean(EventSender.class, () -> mock(EventSender.class))
+                .run(context -> {
+                    assertThat(context).hasNotFailed();
+                    assertThat(context).hasSingleBean(ReliableEventPublisher.class);
+                    assertThat(context).doesNotHaveBean(DeadEventOperations.class);
+                });
+
+        jdbcRunner().withBean(EventSender.class, () -> mock(EventSender.class))
+                .withPropertyValues("reliable-event.dead-operations-enabled=true")
+                .run(context -> {
+                    assertThat(context).hasNotFailed();
+                    assertThat(context).hasSingleBean(ReliableEventPublisher.class);
+                    assertThat(context).hasSingleBean(DeadEventOperations.class);
+                    assertThat(context.getBean(DeadEventOperations.class))
+                            .isInstanceOf(JdbcDeadEventOperations.class);
+                });
+    }
+
+    @Test
+    void customDeadOperationsOverrideIsPreserved() {
+        DeadEventOperations custom = mock(DeadEventOperations.class);
+        jdbcRunner().withBean(EventSender.class, () -> mock(EventSender.class))
+                .withBean(DeadEventOperations.class, () -> custom)
+                .withPropertyValues("reliable-event.dead-operations-enabled=true")
+                .run(context -> {
+                    assertThat(context).hasNotFailed();
+                    assertThat(context).hasSingleBean(DeadEventOperations.class);
+                    assertThat(context.getBean(DeadEventOperations.class)).isSameAs(custom);
+                });
+    }
 
     @Test
     void meterRegistryEnablesOptionalPublicationMetrics() {

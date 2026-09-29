@@ -47,7 +47,21 @@ Outbox 状态编码为 `0=PENDING`、`1=PUBLISHING`、`2=PUBLISHED`、`3=RETRY_W
 mvn -pl reliable-event-example -am '-Dtest=OrderExampleMysqlIntegrationTest,ExampleApplicationEndToEndTest' '-Dsurefire.failIfNoSpecifiedTests=false' test
 ```
 
-MySQL 测试用同一事件身份的两次处理调用证明业务效果只提交一次，并验证业务更新失败时去重记录随事务回滚。端到端测试先通过 HTTP 创建订单，验证自动发送和消费；再在首次真实 Broker 发送成功后丢弃回执，触发重试，验证两条消息有不同的 Broker Message ID、相同的可靠事件身份，消费结果仍只有一次。端到端测试使用固定的本机 8081 端口，运行前先停止示例 Compose 中的 Broker，避免端口冲突。`DEAD` 事件可用上述只读 SQL 查看；示例没有人工重放接口。
+MySQL 测试用同一事件身份的两次处理调用证明业务效果只提交一次，并验证业务更新失败时去重记录随事务回滚。端到端测试先通过 HTTP 创建订单，验证自动发送和消费；再在首次真实 Broker 发送成功后丢弃回执，触发重试，验证两条消息有不同的 Broker Message ID、相同的可靠事件身份，消费结果仍只有一次。M6.4 测试还会启动真实 MySQL 与 RocketMQ：制造 `DEAD`、让两个操作者竞争一次重放、以正确映射重启服务后核对 Starter 自动发送及审计；另在真实 Broker 收到消息但回执丢失后重放，核对稳定身份和消费者的一次业务效果。端到端测试使用固定的本机 8081 端口，运行前先停止示例 Compose 中的 Broker，避免端口冲突。
+
+## 人工处理 DEAD 事件
+
+示例只依赖 Starter，并包含 Java 调用示例 [`DeadEventManualProcedure`](src/main/java/dev/reliableevent/example/DeadEventManualProcedure.java)。要启用其 `DeadEventOperations` 依赖，设置 `reliable-event.dead-operations-enabled=true`；默认关闭，不影响订单发布。启用重放前，在示例 MySQL 库执行一次[重放审计表 SQL](../reliable-event-jdbc/src/main/resources/schema/reliable-event-replay-audit-m6-2.sql)。示例不提供管理 HTTP 端点，实际接入时由应用将此 Java 服务接到已有的受限运维流程，并鉴权。
+
+一次处置按以下顺序进行：
+
+1. 获授权的操作者调用 `list(50)` 定位事件，再调用 `inspect(new EventId(id))` 获取 `DeadEventLookup.Dead` 详情和当前版本。详情中的业务键、失败摘要只在受限界面展示，不写普通日志。
+2. 用事件 ID、业务键和时间核对 Broker 消息、消费者去重记录与业务效果。尤其遇到发送结果未知、超时或状态更新失败时，Broker 可能已经接收；重放可能再次投递，消费者必须保持幂等。
+3. 修复原失败原因，例如 Topic、Proxy、网络或权限。若消费者已完成业务效果，先判断是否需要重放；不能仅凭生产端 `DEAD` 判定消息丢失。
+4. 再次查询当前 `DEAD` 详情，以其版本调用 `replayAfterVerification(details, authenticatedOperator, reason)`。`authenticatedOperator` 取自真实登录身份，`reason` 写明核对事实和修复内容，不能使用固定占位值。`Replayed` 给出审计 ID；`NotFound`、`NotDead` 或 `VersionMismatch` 时重新查询，不自动重试重放。
+5. 用[运维指南中的审计 SQL](../docs/OPERATIONS.md#状态与只读排查)和 Outbox 状态观察该 ID 后续进入 `PENDING`、`PUBLISHING`、`PUBLISHED`、`RETRY_WAIT` 或再次 `DEAD`；`PUBLISHED` 后仍须核对消费者业务效果。审计表和详情均限制访问与保留期限。
+
+可用上面的端到端测试命令复现 M6.4 的两条受控重放路径。目标映射修复路径在重放前关闭扫描，重放后以正确映射重启应用，由 Starter 自动发布；未知结果路径为了确定性使用 JDBC 发布 Worker 显式推进。操作记录和未覆盖边界见[M6 完成记录](../docs/progress/M6_COMPLETED.md)。
 
 ## 配置与清理
 

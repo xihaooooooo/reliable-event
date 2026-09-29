@@ -32,6 +32,7 @@ import org.springframework.boot.autoconfigure.EnableAutoConfiguration;
 import org.springframework.boot.test.autoconfigure.jdbc.AutoConfigureTestDatabase;
 import org.springframework.boot.test.autoconfigure.jdbc.JdbcTest;
 import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 import org.springframework.test.context.jdbc.Sql;
@@ -73,6 +74,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 @Transactional(propagation = Propagation.NOT_SUPPORTED)
 @Sql({
         "classpath:schema/reliable-event-outbox.sql",
+        "classpath:schema/reliable-event-replay-audit-m6-2.sql",
         "classpath:schema/test-business-record.sql",
         "classpath:schema/test-message-delivery.sql",
         "classpath:schema/clear-test-data.sql"
@@ -241,6 +243,180 @@ class ReliableEventIntegrationTest {
         assertThatThrownBy(() -> query.firstPage(0)).isInstanceOf(IllegalArgumentException.class);
         assertThatThrownBy(() -> query.firstPage(JdbcDeadEventQuery.MAX_PAGE_SIZE + 1))
                 .isInstanceOf(IllegalArgumentException.class);
+    }
+
+    @Test
+    void exhaustedDeadEventRequeuesAndPublishesWithAnAtomicAudit() {
+        EventId id = inTransaction(() -> publisher.publish(event(418L, NOW)));
+        jdbcTemplate.update("""
+                UPDATE reliable_event_outbox
+                SET status = ?, attempt_count = max_attempts, version = 7, last_error = ?
+                WHERE id = ?
+                """, EventStatus.DEAD.code(), "previous-failure", id.value());
+        JdbcDeadEventReplay replay = new JdbcDeadEventReplay(jdbcTemplate, transactionManager);
+
+        var result = replay.replay(new DeadEventReplayRequest(id, 7, " operator-1 ", " fixed topic "));
+
+        assertThat(result).isInstanceOf(DeadEventReplayResult.Replayed.class);
+        var success = (DeadEventReplayResult.Replayed) result;
+        assertThat(success.id()).isEqualTo(id);
+        assertThat(success.previousVersion()).isEqualTo(7);
+        assertThat(success.newVersion()).isEqualTo(8);
+        assertThat(success.auditId()).isPositive();
+        assertThat(success.replayedAt()).isBetween(
+                Instant.now().minusSeconds(10), Instant.now().plusSeconds(10));
+        assertThat(statusOf(id)).isEqualTo(EventStatus.PENDING.code());
+        assertThat(attemptCountOf(id)).isZero();
+        assertThat(versionOf(id)).isEqualTo(8);
+        assertThat(leaseOwnerOf(id)).isNull();
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT last_error FROM reliable_event_outbox WHERE id = ?", String.class, id.value()))
+                .isNull();
+        assertThat(jdbcTemplate.queryForObject("""
+                SELECT previous_attempt_count FROM reliable_event_replay_audit WHERE id = ?
+                """, Integer.class, success.auditId())).isEqualTo(8);
+        assertThat(jdbcTemplate.queryForMap("""
+                SELECT event_id, previous_version, new_version, previous_max_attempts,
+                       previous_last_error, operator_id, reason, result
+                FROM reliable_event_replay_audit WHERE id = ?
+                """, success.auditId())).containsEntry("event_id", id.value())
+                .containsEntry("previous_version", 7L)
+                .containsEntry("new_version", 8L)
+                .containsEntry("previous_max_attempts", 8)
+                .containsEntry("previous_last_error", "previous-failure")
+                .containsEntry("operator_id", "operator-1")
+                .containsEntry("reason", "fixed topic")
+                .containsEntry("result", "REQUEUED");
+        assertThat(repository.findDueEventCandidates(Instant.now().plusSeconds(1), 10))
+                .contains(new EventCandidate(id, 8));
+
+        JdbcEventPublicationWorker worker = new JdbcEventPublicationWorker(
+                jdbcTemplate, transactionManager,
+                event -> new SendReceipt("replayed-" + event.id().value()),
+                Clock.systemUTC(), 10, WORKER_ID, LEASE_DURATION);
+        assertThat(worker.publishDueEvents()).isOne();
+        assertThat(statusOf(id)).isEqualTo(EventStatus.PUBLISHED.code());
+        assertThat(attemptCountOf(id)).isOne();
+        assertThat(outboxRowCount()).isOne();
+    }
+
+    @Test
+    void replayRejectsMissingNonDeadAndStaleVersionWithoutAudit() {
+        EventId pending = inTransaction(() -> publisher.publish(event(419L, NOW)));
+        EventId dead = inTransaction(() -> publisher.publish(event(420L, NOW)));
+        jdbcTemplate.update("UPDATE reliable_event_outbox SET status = ?, version = 4 WHERE id = ?",
+                EventStatus.DEAD.code(), dead.value());
+        JdbcDeadEventReplay replay = new JdbcDeadEventReplay(jdbcTemplate, transactionManager);
+
+        assertThat(replay.replay(new DeadEventReplayRequest(
+                new EventId(dead.value() + 1000), 0, "operator", "reason")))
+                .isInstanceOf(DeadEventReplayResult.NotFound.class);
+        assertThat(replay.replay(new DeadEventReplayRequest(pending, 0, "operator", "reason")))
+                .isEqualTo(new DeadEventReplayResult.NotDead(pending));
+        assertThat(replay.replay(new DeadEventReplayRequest(dead, 3, "operator", "reason")))
+                .isEqualTo(new DeadEventReplayResult.VersionMismatch(dead, 4));
+        assertThat(statusOf(dead)).isEqualTo(EventStatus.DEAD.code());
+        assertThat(versionOf(dead)).isEqualTo(4);
+        assertThat(replayAuditCount()).isZero();
+    }
+
+    @Test
+    void duplicateReplayRequestCannotRequeueTheSameDeadVersionTwice() {
+        EventId dead = inTransaction(() -> publisher.publish(event(421L, NOW)));
+        jdbcTemplate.update("UPDATE reliable_event_outbox SET status = ? WHERE id = ?",
+                EventStatus.DEAD.code(), dead.value());
+        JdbcDeadEventReplay replay = new JdbcDeadEventReplay(jdbcTemplate, transactionManager);
+        DeadEventReplayRequest request = new DeadEventReplayRequest(dead, 0, "operator", "reason");
+
+        assertThat(replay.replay(request)).isInstanceOf(DeadEventReplayResult.Replayed.class);
+        assertThat(replay.replay(request)).isEqualTo(new DeadEventReplayResult.NotDead(dead));
+        assertThat(versionOf(dead)).isOne();
+        assertThat(replayAuditCount()).isOne();
+    }
+
+    @Test
+    void replayAndAuditBothRollbackWithTheCallerTransaction() {
+        EventId dead = inTransaction(() -> publisher.publish(event(422L, NOW)));
+        jdbcTemplate.update("UPDATE reliable_event_outbox SET status = ? WHERE id = ?",
+                EventStatus.DEAD.code(), dead.value());
+        JdbcDeadEventReplay replay = new JdbcDeadEventReplay(jdbcTemplate, transactionManager);
+
+        assertThatThrownBy(() -> inTransaction(() -> {
+            assertThat(replay.replay(new DeadEventReplayRequest(dead, 0, "operator", "reason")))
+                    .isInstanceOf(DeadEventReplayResult.Replayed.class);
+            throw new IntentionalRollbackException();
+        })).isInstanceOf(IntentionalRollbackException.class);
+
+        assertThat(statusOf(dead)).isEqualTo(EventStatus.DEAD.code());
+        assertThat(versionOf(dead)).isZero();
+        assertThat(replayAuditCount()).isZero();
+    }
+
+    @Test
+    void auditInsertFailureRollsBackTheReplayStateChange() {
+        EventId dead = inTransaction(() -> publisher.publish(event(424L, NOW)));
+        jdbcTemplate.update("UPDATE reliable_event_outbox SET status = ? WHERE id = ?",
+                EventStatus.DEAD.code(), dead.value());
+        jdbcTemplate.update("""
+                INSERT INTO reliable_event_replay_audit (
+                    event_id, previous_version, new_version, previous_attempt_count,
+                    previous_max_attempts, operator_id, reason, replayed_at, result
+                ) VALUES (?, 0, 1, 0, 8, 'prior-operator', 'prior-reason', UTC_TIMESTAMP(3), 'REQUEUED')
+                """, dead.value());
+        JdbcDeadEventReplay replay = new JdbcDeadEventReplay(jdbcTemplate, transactionManager);
+
+        assertThatThrownBy(() -> replay.replay(new DeadEventReplayRequest(
+                dead, 0, "operator", "reason")))
+                .isInstanceOf(DataIntegrityViolationException.class);
+        assertThat(statusOf(dead)).isEqualTo(EventStatus.DEAD.code());
+        assertThat(versionOf(dead)).isZero();
+        assertThat(replayAuditCount()).isOne();
+    }
+
+    @Test
+    void concurrentReplayRequestsProduceOneEffectiveReplay() throws Exception {
+        EventId dead = inTransaction(() -> publisher.publish(event(423L, NOW)));
+        jdbcTemplate.update("UPDATE reliable_event_outbox SET status = ? WHERE id = ?",
+                EventStatus.DEAD.code(), dead.value());
+        JdbcDeadEventReplay replay = new JdbcDeadEventReplay(jdbcTemplate, transactionManager);
+        DeadEventReplayRequest request = new DeadEventReplayRequest(dead, 0, "operator", "reason");
+        CyclicBarrier start = new CyclicBarrier(2);
+        ExecutorService executor = Executors.newFixedThreadPool(2);
+        try {
+            var attempts = List.of(
+                    executor.submit(() -> { start.await(); return replay.replay(request); }),
+                    executor.submit(() -> { start.await(); return replay.replay(request); })
+            );
+            List<DeadEventReplayResult> results = List.of(
+                    attempts.get(0).get(15, TimeUnit.SECONDS),
+                    attempts.get(1).get(15, TimeUnit.SECONDS));
+            assertThat(results.stream().filter(DeadEventReplayResult.Replayed.class::isInstance).count())
+                    .isOne();
+            assertThat(results.stream().filter(DeadEventReplayResult.NotDead.class::isInstance).count())
+                    .isOne();
+            assertThat(statusOf(dead)).isEqualTo(EventStatus.PENDING.code());
+            assertThat(versionOf(dead)).isOne();
+            assertThat(replayAuditCount()).isOne();
+        } finally {
+            executor.shutdownNow();
+        }
+    }
+
+    @Test
+    void replayRequestRejectsInvalidOperationInformation() {
+        EventId id = new EventId(1);
+        assertThatThrownBy(() -> new DeadEventReplayRequest(id, -1, "operator", "reason"))
+                .isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> new DeadEventReplayRequest(id, 0, " ", "reason"))
+                .isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> new DeadEventReplayRequest(id, 0, "operator", " "))
+                .isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> new DeadEventReplayRequest(id, 0, "x".repeat(129), "reason"))
+                .isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> new DeadEventReplayRequest(id, 0, "operator", "x".repeat(1025)))
+                .isInstanceOf(IllegalArgumentException.class);
+        assertThat(new DeadEventReplayRequest(id, 0, "private-operator", "private-reason").toString())
+                .doesNotContain("private-operator", "private-reason");
     }
 
     @Test
@@ -1592,6 +1768,10 @@ class ReliableEventIntegrationTest {
 
     private long outboxRowCount() {
         return requiredLong("SELECT COUNT(*) FROM reliable_event_outbox");
+    }
+
+    private long replayAuditCount() {
+        return requiredLong("SELECT COUNT(*) FROM reliable_event_replay_audit");
     }
 
     private int statusOf(EventId eventId) {

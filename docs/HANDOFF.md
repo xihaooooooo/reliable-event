@@ -6,6 +6,8 @@ M0、M1、完整 M2、M3、M4.1 至 M4.5、M5.1、M5.3 和 M6.1 至 M6.4 已完�
 
 M7.1 至 M7.3 已完成：身份表永久保存事件 ID 和业务键，登记在业务事务中先写身份、再写 Outbox；默认关闭的独立清理器分批删除到期的 `PUBLISHED` 行。真实 MySQL、RocketMQ 验证了清理后同键仍返回原 ID、不重新发送，以及新事件继续发布。迁移、测试和边界见 [M7 完成记录](progress/M7_COMPLETED.md)。
 
+M8.1–M8.5 已完成：登记上下文与每次发送尝试分别追踪；运行指标增加首次到期连续未完成口径和 afterCommit 进度计数；默认 Registry/Starter 运行时使用独立、单槽、总预算受限的快照采样器。原创订单示例记录消费事务结果、幂等跳过及 ACK 结果。真实平台验收通过了订单 Trace 四个 spans、Grafana datasource 与 16 个查询结果、Alertmanager firing/resolved receiver 往返，以及匿名 Viewer 的 14 面板看板；顶部 Trace ID 输入框可查询第 14 面板的 Tempo trace。全仓 Java 17 回归和 Prometheus 规则验证也已通过。详细证据见 [M8.5 完成记录](/D:/trae/scp/reliable-event/docs/progress/M8_5_COMPLETED.md) 与[本地运行指南](/D:/trae/scp/reliable-event/observability/README.md)。M8.6 尚未开始。
+
 ```text
 事务内 publish → PENDING → 查询候选版本 → 条件抢占为 PUBLISHING
                                                ↓
@@ -52,7 +54,7 @@ Context 关闭 → 停止新抢占 → 撤销未抢占队列 → 限时等待在
 mvn verify
 ```
 
-2026-09-29 使用 JDK 17.0.12 执行全仓 `mvn -o -q clean verify`（使用本机 Maven 缓存），28 份 Surefire 报告共 160 个测试，0 失败、0 错误、0 跳过，覆盖单元、Context、MySQL、独立 JVM、真实 RocketMQ、M7 清理与原创示例端到端场景。3 个 Python 报告契约测试亦通过；M5.3 的 26/26 轮有效基准矩阵为 2026-09-26 的历史结果，详细环境、指标、限制和证据见 [M5.3 完成记录](progress/M5_3_COMPLETED.md)。
+2026-10-02 使用 JDK 17.0.12 执行全仓 `mvn -o clean verify`（使用本机 Maven 缓存），34 份 Surefire XML 共 204 个测试，0 失败、0 错误、0 跳过；覆盖单元、Context、真实 MySQL 8.0、独立 JVM、真实 RocketMQ 5.5.0、M7 清理、M8.3 采样和 M8.4 原创示例端到端场景。日志和退出码见 `target/evidence/m8.4-full-verify.log` 与 `target/evidence/m8.4-full-verify.exit-code.txt`。M8.1–M8.3 的历史证据也已保留在同目录。M5.3 的 26/26 轮有效基准矩阵为 2026-09-26 的历史结果，详细环境、指标、限制和证据见 [M5.3 完成记录](progress/M5_3_COMPLETED.md)。
 
 ## 当前边界
 
@@ -68,6 +70,8 @@ mvn verify
 - 当前只验证单 Broker 测试环境；示例展示了按业务 Key 的消费幂等，但 Starter 本身不提供通用消费者框架。
 
 ## 下一步
+
+M8.5 已按[完成记录](progress/M8_5_COMPLETED.md)验收。后续计划阶段为 M8.6：真实 Broker/数据库故障演练、开销检查与交接；开始前先审阅计划中的阶段边界，不把本地 M8.5 告警演示阈值视为生产 SLA。
 
 M5.3 已按[实施协议](implementation/M5_3_REPRODUCIBLE_BENCHMARK.md)完成；如需复测或改变负载，使用[基准模块](../reliable-event-benchmark/README.md)的命令，并将新结果与现有[完成记录](progress/M5_3_COMPLETED.md)分开标记。
 

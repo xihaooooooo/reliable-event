@@ -1,0 +1,200 @@
+groups:
+  - name: reliable-event-recording
+    interval: 15s
+    rules:
+      - record: reliable_event:snapshot_fresh
+        expr: |
+          (up{job="reliable-event-example", expected_snapshot="true", snapshot_mode="automatic"} == 1)
+          and on (instance, outbox_store)
+            ((time() - reliable_event_snapshot_last_success_timestamp{job="reliable-event-example"} >= 0)
+             and
+             (time() - reliable_event_snapshot_last_success_timestamp{job="reliable-event-example"} < 60))
+          or
+          ((up{job="reliable-event-example", expected_snapshot="true", snapshot_mode="manual"} == 1)
+          and on (instance, outbox_store)
+            ((time() - reliable_event_snapshot_last_success_timestamp{job="reliable-event-example"} >= 0)
+             and
+             (time() - reliable_event_snapshot_last_success_timestamp{job="reliable-event-example"} < 120)))
+      - record: reliable_event:unfinished_overdue:fresh
+        expr: |
+          max by (outbox_store) (
+            reliable_event_unfinished_overdue{job="reliable-event-example"}
+            and on (instance, outbox_store) reliable_event:snapshot_fresh
+          )
+      - record: reliable_event:unfinished_oldest_age:fresh
+        expr: |
+          max by (outbox_store) (
+            reliable_event_unfinished_overdue_oldest_age{job="reliable-event-example"}
+            and on (instance, outbox_store) reliable_event:snapshot_fresh
+          )
+      - record: reliable_event:dead:fresh
+        expr: |
+          max by (outbox_store) (
+            reliable_event_dead{job="reliable-event-example"}
+            and on (instance, outbox_store) reliable_event:snapshot_fresh
+          )
+  - name: reliable-event-alerts
+    interval: 15s
+    rules:
+      - alert: ReliableEventNoTargets
+        expr: absent(up{job="reliable-event-example"})
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "No ReliableEvent metrics targets are configured or discovered"
+          impact: "The monitoring stack has no target from which to observe publication or Outbox state."
+          diagnosis: "Check Prometheus target configuration, expected target labels, host.docker.internal resolution, and the example process."
+          recovery: "At least one target for the reliable-event-example job is discovered and scrapeable."
+          runbook: "http://localhost:3000/d/reliable-event-ops/reliable-event-operations?viewPanel=11"
+
+      - alert: ReliableEventTargetDown
+        expr: up{job="reliable-event-example"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "ReliableEvent example metrics endpoint is unavailable"
+          impact: "Publication and snapshot health cannot be observed for this instance."
+          diagnosis: "Check the example process, port 8090, actuator exposure, and Docker Desktop host.docker.internal routing."
+          recovery: "Prometheus reports up=1 continuously for at least one scrape interval."
+          runbook: "http://localhost:3000/d/reliable-event-ops/reliable-event-operations?viewPanel=11"
+
+      - alert: ReliableEventMetricsMissing
+        expr: up{job="reliable-event-example"} == 1 unless on (instance) reliable_event_snapshot_last_success_timestamp{job="reliable-event-example"}
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "ReliableEvent snapshot metric is missing"
+          impact: "Prometheus can scrape the app but cannot establish Outbox freshness."
+          diagnosis: "Check MeterRegistry, metrics auto-configuration, and /actuator/prometheus output."
+          recovery: "The snapshot timestamp gauge is present and successful collection advances it."
+          runbook: "http://localhost:3000/d/reliable-event-ops/reliable-event-operations?viewPanel=11"
+
+      - alert: ReliableEventSnapshotUnavailable
+        expr: |
+          (max by (outbox_store) (up{job="reliable-event-example", expected_snapshot="true"} == 1))
+          unless on (outbox_store)
+          max by (outbox_store) (reliable_event:snapshot_fresh)
+        for: 3m
+        labels:
+          severity: critical
+        annotations:
+          summary: "No fresh snapshot is available for Outbox {{ $labels.outbox_store }}"
+          impact: "Backlog and oldest-age alerts are intentionally withheld because every configured snapshot is stale or missing."
+          diagnosis: "Check database connectivity, snapshot.failure, snapshot mode, the configured refresh path, and app/database clock skew. Automatic mode still requires a fresh snapshot within 60 seconds when periodic sampling is disabled but automatic-cycle sampling remains active; manual mode expects the caller to refresh at least every 120 seconds."
+          recovery: "At least one target for this outbox_store has a non-future snapshot newer than its configured freshness window."
+          runbook: "http://localhost:3000/d/reliable-event-ops/reliable-event-operations?viewPanel=11"
+
+      - alert: ReliableEventUnfinishedOverdue
+        expr: |
+          (reliable_event:unfinished_overdue:fresh > 0 and reliable_event:unfinished_oldest_age:fresh > 60)
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "An overdue Outbox event is older than the demo threshold"
+          impact: "At least one PENDING, PUBLISHING, or RETRY_WAIT event has remained unfinished after first availability; active progress elsewhere cannot hide it."
+          diagnosis: "Inspect Outbox status, first_available_at, attempt_count, next_attempt_at, scheduler heartbeat, sender failure counters, and state update failures."
+          recovery: "Fresh snapshot reports no overdue unfinished event older than 60 seconds. DEAD transitions are followed by ReliableEventNewDeadLetter."
+          runbook: "http://localhost:3000/d/reliable-event-ops/reliable-event-operations?viewPanel=11"
+
+      - alert: ReliableEventSchedulerNotRunning
+        expr: reliable_event_scheduler_enabled{job="reliable-event-example", expected_scheduler="true", scheduler_mode="automatic"} == 1 and reliable_event_scheduler_running{job="reliable-event-example", expected_scheduler="true", scheduler_mode="automatic"} == 0
+        for: 3m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Automatic publication scheduler is enabled but not running"
+          impact: "Automatic scans, lease recovery, and dispatch are not advancing."
+          diagnosis: "Check app startup, lifecycle logs, scheduler.failure, database availability, and scheduling-enabled."
+          recovery: "scheduler.running returns to 1 and successful automatic cycles resume."
+          runbook: "http://localhost:3000/d/reliable-event-ops/reliable-event-operations?viewPanel=11"
+
+      - alert: ReliableEventSchedulerHeartbeatExpired
+        expr: |
+          reliable_event_scheduler_enabled{job="reliable-event-example", expected_scheduler="true", scheduler_mode="automatic"} == 1
+          and
+          (time() - reliable_event_scheduler_last_success_timestamp{job="reliable-event-example", expected_scheduler="true", scheduler_mode="automatic"} > 60)
+        for: 3m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Automatic publication cycle heartbeat is stale"
+          impact: "The expected scheduler has not completed a successful cycle within the demo poll window."
+          diagnosis: "Check poll-interval, scheduler.failure mode/stage, database scan and lease recovery logs, and process load."
+          recovery: "scheduler.last_success_timestamp advances on a successful automatic cycle."
+          runbook: "http://localhost:3000/d/reliable-event-ops/reliable-event-operations?viewPanel=11"
+
+      - alert: ReliableEventPublicationStalled
+        expr: |
+          reliable_event:unfinished_overdue:fresh > 0
+          and on (outbox_store)
+          (sum by (outbox_store) (rate(reliable_event_publication_persisted_total{job="reliable-event-example"}[5m])) == 0)
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Outbox has unfinished events and no persisted publication progress"
+          impact: "No observed markPublished transaction committed during the progress window; inflight=0 is not required."
+          diagnosis: "Check retries, PUBLISHING leases, publisher/DB failures, and publication.state_update_failure."
+          recovery: "A persisted counter increase occurs or no fresh overdue unfinished events remain."
+          runbook: "http://localhost:3000/d/reliable-event-ops/reliable-event-operations?viewPanel=11"
+
+      - alert: ReliableEventNewDeadLetter
+        expr: sum by (outbox_store) (increase(reliable_event_dead_entered_total{job="reliable-event-example"}[10m])) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "A new event entered DEAD for Outbox {{ $labels.outbox_store }}"
+          impact: "This event will not be sent automatically; producer PUBLISHED does not represent consumer completion."
+          diagnosis: "Inspect the dead gauge and use the documented read-only DEAD query; compare broker and consumer facts before any replay."
+          recovery: "An operator records the cause and authorized disposition; the increase alert clears after its 10-minute window."
+          runbook: "http://localhost:3000/d/reliable-event-ops/reliable-event-operations?viewPanel=11"
+
+      - alert: ReliableEventSendFailureRateHigh
+        expr: |
+          (
+            sum by (outbox_store) (rate(reliable_event_publish_failure_total{job="reliable-event-example"}[5m]))
+            /
+            clamp_min(sum by (outbox_store) (rate(reliable_event_publish_success_total{job="reliable-event-example"}[5m]) + rate(reliable_event_publish_failure_total{job="reliable-event-example"}[5m])), 0.000001)
+          ) > 0.25
+          and on (outbox_store)
+          (sum by (outbox_store) (increase(reliable_event_publish_success_total{job="reliable-event-example"}[5m]) + increase(reliable_event_publish_failure_total{job="reliable-event-example"}[5m])) >= 5)
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "ReliableEvent send failure rate is above 25% with minimum traffic"
+          impact: "At least five recent sender attempts occurred and more than one quarter failed."
+          diagnosis: "Inspect retryable/non-retryable/unknown outcomes, RocketMQ proxy reachability, target mapping, and attempt limits."
+          recovery: "The five-minute failure ratio falls below 25% or traffic drops below the minimum sample count."
+          runbook: "http://localhost:3000/d/reliable-event-ops/reliable-event-operations?viewPanel=11"
+
+      - alert: ReliableEventStateUpdateFailure
+        expr: sum by (outbox_store) (increase(reliable_event_publication_state_update_failure_total{job="reliable-event-example"}[5m])) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "Publication status persistence failed"
+          impact: "The broker may have accepted a message while Outbox state remains unfinished, creating a duplicate-delivery window."
+          diagnosis: "Inspect state update logs, DB availability, lease ownership, and event status before concluding the broker did not receive it."
+          recovery: "The database and ownership path are healthy; the rolling failure counter returns to zero."
+          runbook: "http://localhost:3000/d/reliable-event-ops/reliable-event-operations?viewPanel=11"
+
+      - alert: ReliableEventMissingFirstAvailableTime
+        expr: |
+          max by (outbox_store) (
+            reliable_event_unfinished_timestamp_missing{job="reliable-event-example"}
+            and on (instance, outbox_store) reliable_event:snapshot_fresh
+          ) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Unfinished rows lack first_available_at"
+          impact: "These rows cannot be classified by first-availability age and may be absent from age-based alerts."
+          diagnosis: "Use the documented migration/backfill history and inspect the read-only Outbox query; do not infer age from created_at."
+          recovery: "All unfinished rows have a valid first_available_at and the fresh gauge returns to zero."
+          runbook: "http://localhost:3000/d/reliable-event-ops/reliable-event-operations?viewPanel=11"

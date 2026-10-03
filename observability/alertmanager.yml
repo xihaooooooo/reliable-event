@@ -1,0 +1,16 @@
+route:
+  receiver: local-evidence
+  group_by: [alertname, outbox_store]
+  group_wait: 1s
+  group_interval: 2s
+  repeat_interval: 1h
+  routes:
+    - receiver: local-evidence
+      matchers:
+        - severity=~"warning|critical"
+
+receivers:
+  - name: local-evidence
+    webhook_configs:
+      - url: http://host.docker.internal:19080/alerts
+        send_resolved: true

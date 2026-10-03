@@ -55,12 +55,19 @@ reliable-event:
 | `dead-operations-enabled` | `false` | 显式开启 `DeadEventOperations` Java Bean；不创建 HTTP 端点，也不代替应用鉴权。 |
 | `scheduling-enabled` | `true` | 关闭自动扫描，保留显式 `JdbcEventPublicationCycle.runOnce()` 路径。变更配置需重启应用。 |
 | `poll-interval` | `1s` | 固定延迟扫描间隔，至少 `1ms`。 |
+| `adaptive-polling-enabled` | `false` | 有提交或在途任务时使用活跃间隔；空闲或扫描失败时回到 `poll-interval`。 |
+| `active-poll-interval` | `100ms` | 自适应模式的活跃扫描最小间隔，至少 `1ms`；默认每实例最多约 10 次扫描轮次/秒，轮次内数据库查询和逐事件操作另计。 |
 | `claim-batch-size` / `recovery-batch-size` | `50` / `50` | 每轮到期候选提交上限 / 过期租约恢复上限，均须为正。 |
 | `worker-threads` / `worker-queue-capacity` | `8` / `200` | 同时执行数 / 等待候选数；队列容量可为 `0`。排队候选尚未持有数据库租约。 |
 | `lease-duration` | `30s` | 数据库租约，必须大于有效 RocketMQ 客户端 `request-timeout`；当前没有租约续期。 |
 | `max-attempts` | `8` | 新事件登记时写入行内的最大抢占尝试次数；修改配置不会回写已有行。耗尽后进入 `DEAD`。 |
 | `initial-retry-delay` / `max-retry-delay` | `1s` / `5m` | 指数退避基线与上限，前者不能大于后者；实际延迟在基线之上增加 `0` 至不足 `20%` 的随机抖动。 |
 | `shutdown-timeout` | `20s` | 等待自动运行时在途任务的上限；应小于 `spring.lifecycle.timeout-per-shutdown-phase` 并留出 Producer 关闭时间。 |
+| `metrics-snapshot-enabled` | `true` | 控制新增的 Outbox 后台聚合采样；只有存在 Registry、默认 Micrometer Observer、默认 Starter 管理的自动调度运行时且 `scheduling-enabled=true` 时才创建采样器。 |
+| `metrics-snapshot-interval` | `15s` | 周期采样间隔；关闭周期采样时也用于限制自动发布轮次触发的刷新频率。显式手动刷新不受此限频。 |
+| `metrics-snapshot-query-timeout` | `2s` | 只设置采样查询自己的 JDBC Statement timeout；JDBC 的整数秒 timeout 向上取整小于 1 秒的正值；不修改共享 `JdbcTemplate` 或连接池。 |
+| `metrics-snapshot-timeout` | `5s` | 自动采样从开始至取回结果的总等待预算，覆盖获取连接和查询，必须不小于 Statement timeout。超时后底层驱动若忽略取消，查询仍占用唯一采样槽直到真正退出。 |
+| `metrics-snapshot-shutdown-timeout` | `2s` | 采样器独立停止等待预算，须为正且不大于既有 `shutdown-timeout`。与发布 Scheduler 在同一关闭阶段并行启动，不叠加发布停机截止时间。 |
 | `rocketmq.endpoints` | 无 | 默认 Producer 的 gRPC Proxy 地址。 |
 | `rocketmq.mappings.<eventType>.destination` | 无 | `topic[:tag]`；每个待发事件类型都要能解析。 |
 | `rocketmq.request-timeout` | `5s` | 默认客户端单次请求超时。SDK Producer 设置单次尝试，Outbox 负责持久化重试。 |
@@ -70,7 +77,19 @@ reliable-event:
 
 核心时长和批次在启动时校验。实际发送、状态更新与数据库负载也会消耗租约时间；仅满足 `lease-duration > request-timeout` 不保证任何外部调用都在租约内完成。无 `MeterRegistry` 时发布功能仍运行，但不注册本项目 Micrometer 指标。
 
+M8.3 的数据库年龄和过期判断在聚合 SQL 内使用数据库 UTC 时间；快照成功时间和 Scheduler 心跳是应用 UTC Unix 时间。`ready` 只包含已到期且可领取的 `PENDING` / `RETRY_WAIT`；连续未完成量以首次 `first_available_at` 到期为准，即使处于 `PUBLISHING` 或退避中仍计时。首次时间缺失单独计数；全部可领取行都缺失该时间时 `ready.oldest_age` 为 `NaN`。快照字段作为整体更新；SQL 失败保留上一次数值和成功时间。
+
+快照是数据库 Outbox 的单行聚合结果，同一存储的多个实例会重复读取相同记录，不能将快照 Gauge 跨实例求和。`publication.persisted`、`dead.entered`、发送和 Scheduler 计数属于实例局部进度，应先计算各实例的 `rate` 或 `increase` 再聚合；inflight/queued 则按实例求和。采样超时只保证等待方在本地预算后返回，不代表数据库驱动已停止。停止回调独立于发布停机预算；整个 Spring Context 的关闭时间仍由 Spring 生命周期配置管理。
+
 M7 清理默认关闭。确认迁移与新写入一致后，设置 `published-retention-enabled=true`，并显式指定正数 `published-retention`（例如 `30d`）。`cleanup-batch-size` 默认 100、范围 1–1000；`cleanup-interval` 默认 `1h`，至少 `1ms`。JDBC 模块也提供 `JdbcPublishedEventRetention.runOnce(retention, batchSize)` 供受控单轮执行，返回扫描数、删除数和剩余最老到期行年龄。自动清理与发布扫描独立运行，只删除 `status=PUBLISHED` 且 `published_at` 早于数据库 UTC 截止时间的行。配置变更需重启应用；停机等待复用 `shutdown-timeout`，数据库调用不响应中断时可能在超时后结束。
+
+## 追踪与示例消费
+
+M8 的生产端追踪默认允许装配；`reliable-event.tracing-enabled=false` 会关闭 ReliableEvent 的登记/发布追踪，且原创订单示例消费者也会跳过 Tracer/Propagator。没有 Micrometer Tracer/Propagator 时仍运行原发布和消费路径。Starter 不创建第二套 OpenTelemetry SDK、不要求 exporter；应用负责选择 Bridge、SDK/exporter、采样率和后端。
+
+原创示例显式使用 Boot Actuator 和 Micrometer OTel Bridge、W3C 上下文和 100% 采样。基础配置关闭 OTLP export；可选 M8.5 observability profile 启用运行时 exporter 并将 trace 发送到本地 Tempo。Grafana 的 14 面板运维看板提供顶部 `Trace ID` 输入框和第 14 个 Trace 面板；订单响应不包含 trace ID。可从 `target/evidence/m8.5-platform-*/acceptance-summary.json` 取得验收 trace ID；调用方也可在请求 `traceparent` 中自行指定 trace ID（32 位十六进制值），再粘贴到看板查询。匿名 Viewer 使用此看板入口，不依赖无法访问的 Explore 页面。运行和验收步骤见[本地可观测性指南](../observability/README.md)，M8.5 的实际验收边界与证据见[完成记录](progress/M8_5_COMPLETED.md)。
+
+消费 trace 从 RocketMQ 消息 properties 中按大小写不敏感方式提取 W3C `traceparent` 和 `tracestate`，不提取 baggage。属性缺失或非法时创建显式 root span；上下文提取或 span 开始异常时降级为无追踪处理，不继承消费线程残留的 ambient span。Span 在 handler 事务代理返回后记 `processed` 或 `idempotent_skip`；处理抛错记失败且不 ACK。ACK 在业务事务提交后单独记录；ACK 失败意味着 Broker 可能重投，不意味着业务事务回滚，去重表仍约束重复业务效果。Span 可记录 Broker Message ID，不记录 event ID、Payload、业务键或完整 headers；也不把消费处理伪装为生产端 `PUBLISHED`。
 
 ## 状态与只读排查
 

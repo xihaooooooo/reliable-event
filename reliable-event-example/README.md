@@ -37,6 +37,12 @@ docker compose exec -T mysql mysql -uexample -pexample reliable_event_example -e
 
 Outbox 状态编码为 `0=PENDING`、`1=PUBLISHING`、`2=PUBLISHED`、`3=RETRY_WAIT`、`4=DEAD`。正常路径中对应事件最终为 `PUBLISHED`，`attempt_count` 至少为 1，消费者去重表和处理结果各有一行。`PUBLISHED` 只说明生产端收到 Broker 成功回执；消费者结果须以示例表为准。
 
+## 链路追踪
+
+示例包含 Spring Boot Actuator 与 Micrometer OpenTelemetry Bridge，使用 W3C Trace Context；`management.tracing.sampling.probability` 默认设为 `1.0` 以便本地演示，可用 `EXAMPLE_TRACE_SAMPLING_PROBABILITY` 覆盖。Starter 不附加或强制 exporter。M8.4 已用测试内存 SpanExporter 验证真实 HTTP、MySQL、RocketMQ 和消费者 spans 的 parent 关系；基础配置关闭 OTLP export，可选 M8.5 `observability` profile 启用 exporter 并将 trace 发送到本地 Tempo。订单响应仅含订单和事件 ID，不含 trace ID。Grafana 看板顶部的 `Trace ID` 输入框支持粘贴 `target/evidence/m8.5-platform-*/acceptance-summary.json` 中的 32 位十六进制 trace ID；也可由调用方在请求 `traceparent` 中指定 trace ID。第 14 面板显示对应 spans 和 parent 关系。匿名 Viewer 使用此看板入口；Explore 页面不属于匿名查看流程。完整启动说明见[本地可观测性指南](../observability/README.md)。
+
+消费 loop 在事务代理的 handler 返回后记录 `processed` 或 `idempotent_skip`，再独立记录 ACK 结果。处理异常不 ACK；ACK 失败不会把已提交的业务处理记成回滚，Broker 重投后由消费身份表保持一次业务效果。缺少 Tracer/Propagator、设置 `reliable-event.tracing-enabled=false` 或 trace API 出错时仍执行原 handler/ACK 路径。只有标准 W3C `traceparent` 与可选 `tracestate` 参与提取，不传播 baggage。
+
 ## 故障与重复消息
 
 在应用正常连接后，进入 `reliable-event-example` 目录，执行 `docker compose pause broker`，然后回到仓库根目录创建一个新订单。创建请求只写 MySQL，不等待 Broker。使用上面的 Outbox 查询观察该事件进入 `RETRY_WAIT` 且尝试次数增加。执行 `docker compose unpause broker`，随后运行 `wait-order.ps1`；退避到期后事件会自动发送，消费者最终处理一次。若故障演示中断，先执行 `docker compose unpause broker` 再关闭服务。
@@ -47,7 +53,7 @@ Outbox 状态编码为 `0=PENDING`、`1=PUBLISHING`、`2=PUBLISHED`、`3=RETRY_W
 mvn -pl reliable-event-example -am '-Dtest=OrderExampleMysqlIntegrationTest,ExampleApplicationEndToEndTest' '-Dsurefire.failIfNoSpecifiedTests=false' test
 ```
 
-MySQL 测试用同一事件身份的两次处理调用证明业务效果只提交一次，并验证业务更新失败时去重记录随事务回滚。端到端测试先通过 HTTP 创建订单，验证自动发送和消费；再在首次真实 Broker 发送成功后丢弃回执，触发重试，验证两条消息有不同的 Broker Message ID、相同的可靠事件身份，消费结果仍只有一次。M6.4 测试还会启动真实 MySQL 与 RocketMQ：制造 `DEAD`、让两个操作者竞争一次重放、以正确映射重启服务后核对 Starter 自动发送及审计；另在真实 Broker 收到消息但回执丢失后重放，核对稳定身份和消费者的一次业务效果。端到端测试使用固定的本机 8081 端口，运行前先停止示例 Compose 中的 Broker，避免端口冲突。
+MySQL 测试用同一事件身份的两次处理调用证明业务效果只提交一次，并验证业务更新失败时去重记录随事务回滚。M8.4 端到端测试通过真实 HTTP、MySQL 和 RocketMQ 自动发布消费链路，用 Spring Boot SDK 内存 SpanExporter 验证 HTTP 上游、登记、发送尝试与 broker 实际消息属性中的父子关系；另一个消费环用例验证处理异常不 ACK、重复处理只提交一次和 ACK 失败的分离语义。已有端到端测试还覆盖发送成功后丢弃回执触发重试，验证两条消息有不同的 Broker Message ID、相同的可靠事件身份，消费结果仍只有一次。M6.4 测试还会启动真实 MySQL 与 RocketMQ：制造 `DEAD`、让两个操作者竞争一次重放、以正确映射重启服务后核对 Starter 自动发送及审计；另在真实 Broker 收到消息但回执丢失后重放，核对稳定身份和消费者的一次业务效果。端到端测试使用固定的本机 8081 端口，运行前先停止示例 Compose 中的 Broker，避免端口冲突。
 
 ## 人工处理 DEAD 事件
 

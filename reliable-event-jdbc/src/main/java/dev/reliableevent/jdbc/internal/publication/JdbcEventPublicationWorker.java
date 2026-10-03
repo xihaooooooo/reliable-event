@@ -4,7 +4,10 @@ import dev.reliableevent.jdbc.internal.model.ClaimedEvent;
 import dev.reliableevent.jdbc.internal.model.EventCandidate;
 import dev.reliableevent.jdbc.internal.observation.PublicationObserver;
 import dev.reliableevent.jdbc.internal.persistence.JdbcOutboxRepository;
+import dev.reliableevent.jdbc.internal.persistence.StaleEventClaimException;
 import dev.reliableevent.jdbc.internal.retry.ExponentialBackoff;
+import dev.reliableevent.jdbc.internal.tracing.PublicationTracer;
+import dev.reliableevent.internal.model.StoredEvent;
 import dev.reliableevent.internal.publication.EventSender;
 import dev.reliableevent.internal.publication.EventSendFailureType;
 import dev.reliableevent.internal.publication.EventSendException;
@@ -15,6 +18,7 @@ import org.slf4j.spi.LoggingEventBuilder;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.support.TransactionTemplate;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 
 import java.time.Clock;
 import java.time.Duration;
@@ -37,6 +41,7 @@ public final class JdbcEventPublicationWorker {
     private final String workerId;
     private final Duration leaseDuration;
     private final PublicationObserver observer;
+    private final PublicationTracer publicationTracer;
 
     public JdbcEventPublicationWorker(
             JdbcTemplate jdbcTemplate,
@@ -70,7 +75,7 @@ public final class JdbcEventPublicationWorker {
             ExponentialBackoff backoff
     ) {
         this(jdbcTemplate, transactionManager, sender, clock, batchSize, workerId,
-                leaseDuration, backoff, PublicationObserver.NOOP);
+                leaseDuration, backoff, PublicationObserver.NOOP, PublicationTracer.NOOP);
     }
 
     public JdbcEventPublicationWorker(
@@ -83,6 +88,22 @@ public final class JdbcEventPublicationWorker {
             Duration leaseDuration,
             ExponentialBackoff backoff,
             PublicationObserver observer
+    ) {
+        this(jdbcTemplate, transactionManager, sender, clock, batchSize, workerId,
+                leaseDuration, backoff, observer, PublicationTracer.NOOP);
+    }
+
+    public JdbcEventPublicationWorker(
+            JdbcTemplate jdbcTemplate,
+            PlatformTransactionManager transactionManager,
+            EventSender sender,
+            Clock clock,
+            int batchSize,
+            String workerId,
+            Duration leaseDuration,
+            ExponentialBackoff backoff,
+            PublicationObserver observer,
+            PublicationTracer publicationTracer
     ) {
         if (batchSize <= 0) {
             throw new IllegalArgumentException("batchSize must be positive");
@@ -107,10 +128,23 @@ public final class JdbcEventPublicationWorker {
         this.leaseDuration = leaseDuration;
         this.backoff = Objects.requireNonNull(backoff);
         this.observer = Objects.requireNonNull(observer);
+        this.publicationTracer = Objects.requireNonNull(publicationTracer);
     }
 
     public int publishDueEvents() {
-        return publishCandidates(findDueEventCandidates(batchSize));
+        List<EventCandidate> candidates;
+        try {
+            candidates = findDueEventCandidates(batchSize);
+        } catch (RuntimeException failure) {
+            observe(() -> observer.schedulerCycleFailed(false, "candidate_scan"));
+            throw failure;
+        }
+        try {
+            return publishCandidates(candidates);
+        } catch (RuntimeException failure) {
+            observe(() -> observer.schedulerCycleFailed(false, "dispatch"));
+            throw failure;
+        }
     }
 
     public List<EventCandidate> findDueEventCandidates(int limit) {
@@ -153,16 +187,29 @@ public final class JdbcEventPublicationWorker {
     }
 
     private boolean publish(ClaimedEvent claimedEvent) {
+        observe(observer::workerStarted);
+        PublicationTracer.Attempt tracing = beginAttempt(claimedEvent);
+        try {
+            return publish(claimedEvent, tracing);
+        } finally {
+            safelyTrace(tracing::close);
+            observe(observer::workerFinished);
+        }
+    }
+
+    private boolean publish(ClaimedEvent claimedEvent, PublicationTracer.Attempt tracing) {
+        StoredEvent sendEvent = eventForSend(tracing, claimedEvent.event());
         long started = System.nanoTime();
         SendReceipt receipt;
         try {
-            receipt = sender.send(claimedEvent.event());
+            receipt = sender.send(sendEvent);
             if (receipt == null) {
                 throw EventSendException.resultUnknown("Event sender returned without a receipt");
             }
         } catch (RuntimeException sendFailure) {
-            EventSendFailureType type = EventSendFailureClassifier.classify(sendFailure);
             long elapsed = System.nanoTime() - started;
+            EventSendFailureType type = EventSendFailureClassifier.classify(sendFailure);
+            safelyTrace(() -> tracing.sendFailed(type, sendFailure));
             observe(() -> observer.sendFailed(claimedEvent, type, elapsed));
             boolean dead = type == EventSendFailureType.NON_RETRYABLE || !claimedEvent.canRetry();
             eventLog(LOG.atWarn(), claimedEvent)
@@ -176,7 +223,7 @@ public final class JdbcEventPublicationWorker {
                     claimedEvent.leaseOwner(), type, dead ? "DEAD" : "RETRY_WAIT",
                     sendFailure.getClass().getName());
             try {
-                markFailed(claimedEvent, sendFailure, type);
+                markFailed(claimedEvent, sendFailure, type, tracing);
             } catch (RuntimeException stateFailure) {
                 logStateFailure(claimedEvent, stateFailure);
                 throw stateFailure;
@@ -187,6 +234,7 @@ public final class JdbcEventPublicationWorker {
         long elapsed = System.nanoTime() - started;
         Instant acknowledgedAt = clock.instant();
         SendReceipt acknowledged = receipt;
+        safelyTrace(() -> tracing.sendSucceeded(acknowledged));
         observe(() -> observer.sendSucceeded(claimedEvent, acknowledged, elapsed, acknowledgedAt));
         eventLog(LOG.atInfo(), claimedEvent)
                 .addKeyValue("event", "reliable_event.send.succeeded")
@@ -195,10 +243,16 @@ public final class JdbcEventPublicationWorker {
                 claimedEvent.event().id().value(), claimedEvent.event().eventType(),
                 claimedEvent.event().eventKey(), claimedEvent.attemptCount(),
                 claimedEvent.leaseOwner(), receipt.messageId());
+        boolean outerTransaction = TransactionSynchronizationManager.isActualTransactionActive();
         try {
             transaction.executeWithoutResult(
-                    status -> repository.markPublished(claimedEvent, clock.instant())
+                    status -> {
+                        repository.markPublished(claimedEvent, clock.instant());
+                        afterCommit("PUBLISHED");
+                    }
             );
+            observe(() -> observer.stateUpdated("PUBLISHED", outerTransaction));
+            safelyTrace(() -> tracing.stateUpdated("PUBLISHED", outerTransaction));
             eventLog(LOG.atInfo(), claimedEvent)
                     .addKeyValue("event", "reliable_event.publish.persisted")
                     .addKeyValue("messageId", receipt.messageId())
@@ -208,6 +262,10 @@ public final class JdbcEventPublicationWorker {
                     claimedEvent.event().eventKey(), claimedEvent.attemptCount(),
                     claimedEvent.leaseOwner(), receipt.messageId());
         } catch (RuntimeException stateFailure) {
+            observe(() -> observer.stateUpdateFailed("PUBLISHED",
+                    stateFailure instanceof StaleEventClaimException));
+            safelyTrace(() -> tracing.stateUpdateFailed("PUBLISHED", stateFailure,
+                    stateFailure instanceof StaleEventClaimException));
             logStateFailure(claimedEvent, stateFailure);
             throw stateFailure;
         }
@@ -215,24 +273,68 @@ public final class JdbcEventPublicationWorker {
     }
 
     private void markFailed(ClaimedEvent claimedEvent, RuntimeException sendFailure,
-                            EventSendFailureType failureType) {
+                            EventSendFailureType failureType, PublicationTracer.Attempt tracing) {
         Instant failedAt = clock.instant();
         String lastError = EventFailureSummary.from(sendFailure);
+        boolean outerTransaction = TransactionSynchronizationManager.isActualTransactionActive();
 
         if (failureType == EventSendFailureType.NON_RETRYABLE || !claimedEvent.canRetry()) {
-            transaction.executeWithoutResult(
-                    status -> repository.markDead(claimedEvent, failedAt, lastError)
-            );
+            try {
+                transaction.executeWithoutResult(status -> {
+                    repository.markDead(claimedEvent, failedAt, lastError);
+                    afterCommit("DEAD");
+                });
+                observe(() -> observer.stateUpdated("DEAD", outerTransaction));
+                safelyTrace(() -> tracing.stateUpdated("DEAD", outerTransaction));
+            } catch (RuntimeException stateFailure) {
+                observe(() -> observer.stateUpdateFailed("DEAD",
+                        stateFailure instanceof StaleEventClaimException));
+                safelyTrace(() -> tracing.stateUpdateFailed("DEAD", stateFailure,
+                        stateFailure instanceof StaleEventClaimException));
+                throw stateFailure;
+            }
             return;
         }
 
         Instant nextAttemptAt = failedAt.plus(backoff.nextDelay(claimedEvent.attemptCount()));
-        transaction.executeWithoutResult(status -> repository.markRetryWait(
-                claimedEvent,
-                failedAt,
-                nextAttemptAt,
-                lastError
-        ));
+        try {
+            transaction.executeWithoutResult(status -> repository.markRetryWait(
+                    claimedEvent, failedAt, nextAttemptAt, lastError));
+            observe(() -> observer.stateUpdated("RETRY_WAIT", outerTransaction));
+            safelyTrace(() -> tracing.stateUpdated("RETRY_WAIT", outerTransaction));
+        } catch (RuntimeException stateFailure) {
+            observe(() -> observer.stateUpdateFailed("RETRY_WAIT",
+                    stateFailure instanceof StaleEventClaimException));
+            safelyTrace(() -> tracing.stateUpdateFailed("RETRY_WAIT", stateFailure,
+                    stateFailure instanceof StaleEventClaimException));
+            throw stateFailure;
+        }
+    }
+
+    private PublicationTracer.Attempt beginAttempt(ClaimedEvent claimedEvent) {
+        try {
+            PublicationTracer.Attempt attempt = publicationTracer.begin(claimedEvent);
+            return attempt == null ? PublicationTracer.NOOP.begin(claimedEvent) : attempt;
+        } catch (RuntimeException tracingFailure) {
+            return PublicationTracer.NOOP.begin(claimedEvent);
+        }
+    }
+
+    private StoredEvent eventForSend(PublicationTracer.Attempt tracing, StoredEvent original) {
+        try {
+            StoredEvent event = tracing.eventForSend();
+            return event == null ? original : event;
+        } catch (RuntimeException tracingFailure) {
+            return original;
+        }
+    }
+
+    private void safelyTrace(Runnable action) {
+        try {
+            action.run();
+        } catch (RuntimeException ignored) {
+            // Tracing is best-effort and must not alter publication behavior.
+        }
     }
 
     private void logStateFailure(ClaimedEvent event, RuntimeException failure) {
@@ -258,6 +360,17 @@ public final class JdbcEventPublicationWorker {
         } catch (RuntimeException failure) {
             LOG.warn("event=reliable_event.observation.failed exceptionType={}",
                     failure.getClass().getName());
+        }
+    }
+
+    private void afterCommit(String status) {
+        if (TransactionSynchronizationManager.isSynchronizationActive()) {
+            TransactionSynchronizationManager.registerSynchronization(
+                    new org.springframework.transaction.support.TransactionSynchronization() {
+                        @Override public void afterCommit() {
+                            observe(() -> observer.stateTransitionCommitted(status));
+                        }
+                    });
         }
     }
 }

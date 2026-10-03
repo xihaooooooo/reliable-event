@@ -9,6 +9,8 @@ import org.slf4j.LoggerFactory;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.support.TransactionTemplate;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
+import org.springframework.transaction.support.TransactionSynchronization;
 
 import java.time.Duration;
 import java.util.List;
@@ -90,10 +92,12 @@ public final class JdbcExpiredLeaseRecovery {
         boolean recovered;
         if (!candidate.canRetry()) {
             recovered = Boolean.TRUE.equals(transaction.execute(status ->
-                    repository.recoverExpiredLeaseToDead(
-                            candidate,
-                            LEASE_EXPIRED_ERROR
-                    )
+                    {
+                        boolean changed = repository.recoverExpiredLeaseToDead(
+                                candidate, LEASE_EXPIRED_ERROR);
+                        if (changed) afterCommit("DEAD");
+                        return changed;
+                    }
             ));
         } else {
             Duration delay = backoff.nextDelay(candidate.attemptCount());
@@ -130,6 +134,39 @@ public final class JdbcExpiredLeaseRecovery {
         } catch (RuntimeException failure) {
             LOG.warn("event=reliable_event.observation.failed exceptionType={}",
                     failure.getClass().getName());
+        }
+    }
+
+    /** Automatic scheduler seam; keeps legacy observer behavior through its default method. */
+    public void refreshSnapshotAutomatically() {
+        try {
+            observer.refreshSnapshotAutomatically();
+        } catch (RuntimeException failure) {
+            LOG.warn("event=reliable_event.observation.failed exceptionType={}",
+                    failure.getClass().getName());
+        }
+    }
+
+    public void recordCycleFailure(boolean automatic, String stage) {
+        try { observer.schedulerCycleFailed(automatic, stage); }
+        catch (RuntimeException failure) {
+            LOG.warn("event=reliable_event.observation.failed exceptionType={}",
+                    failure.getClass().getName());
+        }
+    }
+
+    private void afterCommit(String status) {
+        Runnable increment = () -> {
+            try { observer.stateTransitionCommitted(status); }
+            catch (RuntimeException failure) {
+                LOG.warn("event=reliable_event.observation.failed exceptionType={}",
+                        failure.getClass().getName());
+            }
+        };
+        if (TransactionSynchronizationManager.isSynchronizationActive()) {
+            TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+                @Override public void afterCommit() { increment.run(); }
+            });
         }
     }
 }

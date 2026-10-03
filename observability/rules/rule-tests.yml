@@ -1,0 +1,429 @@
+rule_files:
+  - reliable-event.yml
+evaluation_interval: 15s
+group_eval_order:
+  - reliable-event-recording
+  - reliable-event-alerts
+tests:
+  - name: overdue-persists-across-retry-and-publishing-while-other-events-progress
+    interval: 15s
+    input_series:
+      - series: 'up{job="reliable-event-example",instance="a",outbox_store="db",expected_snapshot="true",snapshot_mode="automatic"}'
+        values: '1+0x40'
+      - series: 'reliable_event_snapshot_last_success_timestamp{job="reliable-event-example",instance="a",outbox_store="db"}'
+        values: '0+15x40'
+      - series: 'reliable_event_unfinished_overdue{job="reliable-event-example",instance="a",outbox_store="db"}'
+        values: '1+0x20 0+0x20'
+      - series: 'reliable_event_unfinished_overdue_oldest_age{job="reliable-event-example",instance="a",outbox_store="db"}'
+        values: '120+0x20 0+0x20'
+      - series: 'reliable_event_ready{job="reliable-event-example",instance="a",outbox_store="db"}'
+        values: '0+0x40'
+      - series: 'reliable_event_worker_inflight{job="reliable-event-example",instance="a"}'
+        values: '1+0x8 0+0x4 1+0x7 0+0x21'
+      - series: 'reliable_event_publication_persisted_total{job="reliable-event-example",instance="a",outbox_store="db"}'
+        values: '0+1x40'
+      - series: 'reliable_event_publish_failure_total{job="reliable-event-example",instance="a",outbox_store="db"}'
+        values: '0+1x40'
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: ReliableEventUnfinishedOverdue
+        exp_alerts: []
+    promql_expr_test:
+      - expr: ALERTS{alertname="ReliableEventUnfinishedOverdue",alertstate="firing"}
+        eval_time: 5m
+        exp_samples:
+          - labels: '{__name__="ALERTS",alertname="ReliableEventUnfinishedOverdue",alertstate="firing",outbox_store="db",severity="critical"}'
+            value: 1
+
+  - name: dead-transition-follows-overdue-and-rolling-dead-window-recovers
+    interval: 15s
+    input_series:
+      - series: 'up{job="reliable-event-example",instance="a",outbox_store="db",expected_snapshot="true",snapshot_mode="automatic"}'
+        values: '1+0x68'
+      - series: 'reliable_event_snapshot_last_success_timestamp{job="reliable-event-example",instance="a",outbox_store="db"}'
+        values: '0+15x68'
+      - series: 'reliable_event_unfinished_overdue{job="reliable-event-example",instance="a",outbox_store="db"}'
+        values: '1+0x23 0+0x44'
+      - series: 'reliable_event_unfinished_overdue_oldest_age{job="reliable-event-example",instance="a",outbox_store="db"}'
+        values: '120+0x23 0+0x44'
+      - series: 'reliable_event_dead_entered_total{job="reliable-event-example",instance="a",outbox_store="db"}'
+        values: '0+0x23 1+0x44'
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: ReliableEventUnfinishedOverdue
+        exp_alerts: []
+      - eval_time: 17m
+        alertname: ReliableEventNewDeadLetter
+        exp_alerts: []
+    promql_expr_test:
+      - expr: ALERTS{alertname="ReliableEventUnfinishedOverdue",alertstate="firing"}
+        eval_time: 5m
+        exp_samples:
+          - labels: '{__name__="ALERTS",alertname="ReliableEventUnfinishedOverdue",alertstate="firing",outbox_store="db",severity="critical"}'
+            value: 1
+      - expr: ALERTS{alertname="ReliableEventNewDeadLetter",alertstate="firing"}
+        eval_time: 6m
+        exp_samples:
+          - labels: '{__name__="ALERTS",alertname="ReliableEventNewDeadLetter",alertstate="firing",outbox_store="db",severity="warning"}'
+            value: 1
+
+  - name: future-planned-event-is-not-an-overdue-unfinished-event
+    interval: 15s
+    input_series:
+      - series: 'up{job="reliable-event-example",instance="a",outbox_store="db",expected_snapshot="true",snapshot_mode="automatic"}'
+        values: '1+0x40'
+      - series: 'reliable_event_snapshot_last_success_timestamp{job="reliable-event-example",instance="a",outbox_store="db"}'
+        values: '0+15x40'
+      - series: 'reliable_event_ready{job="reliable-event-example",instance="a",outbox_store="db"}'
+        values: '1+0x40'
+      - series: 'reliable_event_unfinished_overdue{job="reliable-event-example",instance="a",outbox_store="db"}'
+        values: '0+0x40'
+      - series: 'reliable_event_unfinished_overdue_oldest_age{job="reliable-event-example",instance="a",outbox_store="db"}'
+        values: '0+0x40'
+      - series: 'reliable_event_publication_persisted_total{job="reliable-event-example",instance="a",outbox_store="db"}'
+        values: '0+0x40'
+    alert_rule_test:
+      - eval_time: 8m
+        alertname: ReliableEventUnfinishedOverdue
+        exp_alerts: []
+      - eval_time: 8m
+        alertname: ReliableEventPublicationStalled
+        exp_alerts: []
+
+  - name: future-dated-snapshot-remains-unavailable-at-three-minute-evaluation
+    interval: 15s
+    input_series:
+      - series: 'up{job="reliable-event-example",instance="a",outbox_store="db",expected_snapshot="true",snapshot_mode="automatic"}'
+        values: '1+0x20'
+      - series: 'reliable_event_snapshot_last_success_timestamp{job="reliable-event-example",instance="a",outbox_store="db"}'
+        values: '360+0x20'
+    promql_expr_test:
+      - expr: ALERTS{alertname="ReliableEventSnapshotUnavailable",alertstate="firing"}
+        eval_time: 3m
+        exp_samples:
+          - labels: '{__name__="ALERTS",alertname="ReliableEventSnapshotUnavailable",alertstate="firing",outbox_store="db",severity="critical"}'
+            value: 1
+
+  - name: snapshot-unavailable-recovers-when-fresh-sample-returns-with-periodic-sampler-off
+    interval: 15s
+    input_series:
+      - series: 'up{job="reliable-event-example",instance="a",outbox_store="db",expected_snapshot="true",snapshot_mode="automatic"}'
+        values: '1+0x32'
+      - series: 'up{job="reliable-event-example",instance="b",outbox_store="db",expected_snapshot="true",snapshot_mode="automatic"}'
+        values: '1+0x32'
+      - series: 'reliable_event_snapshot_periodic_enabled{job="reliable-event-example",instance="a"}'
+        values: '0+0x32'
+      - series: 'reliable_event_snapshot_last_success_timestamp{job="reliable-event-example",instance="a",outbox_store="db"}'
+        values: '-120+0x15 240+0x16'
+      - series: 'reliable_event_snapshot_last_success_timestamp{job="reliable-event-example",instance="b",outbox_store="db"}'
+        values: '-120+0x15 240+0x16'
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: ReliableEventSnapshotUnavailable
+        exp_alerts: []
+    promql_expr_test:
+      - expr: ALERTS{alertname="ReliableEventSnapshotUnavailable",alertstate="firing"}
+        eval_time: 3m
+        exp_samples:
+          - labels: '{__name__="ALERTS",alertname="ReliableEventSnapshotUnavailable",alertstate="firing",outbox_store="db",severity="critical"}'
+            value: 1
+
+  - name: scrapeable-target-without-snapshot-metric-alerts-after-startup-grace
+    interval: 15s
+    input_series:
+      - series: 'up{job="reliable-event-example",instance="a",outbox_store="db",expected_snapshot="true",snapshot_mode="automatic"}'
+        values: '1+0x24'
+    promql_expr_test:
+      - expr: ALERTS{alertname="ReliableEventMetricsMissing",alertstate="firing"}
+        eval_time: 3m
+        exp_samples:
+          - labels: '{__name__="ALERTS",alertname="ReliableEventMetricsMissing",alertstate="firing",expected_snapshot="true",instance="a",job="reliable-event-example",outbox_store="db",severity="critical",snapshot_mode="automatic"}'
+            value: 1
+
+  - name: no-discovered-target-alert-resolves-when-target-appears
+    interval: 15s
+    input_series:
+      - series: 'up{job="reliable-event-example",instance="a",outbox_store="db"}'
+        values: '_x8 1+0x8'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: ReliableEventNoTargets
+        exp_alerts: []
+    promql_expr_test:
+      - expr: ALERTS{alertname="ReliableEventNoTargets",alertstate="firing"}
+        eval_time: 1m
+        exp_samples:
+          - labels: '{__name__="ALERTS",alertname="ReliableEventNoTargets",alertstate="firing",job="reliable-event-example",severity="critical"}'
+            value: 1
+
+  - name: target-down-alert-resolves-after-scrape-recovers
+    interval: 15s
+    input_series:
+      - series: 'up{job="reliable-event-example",instance="a",outbox_store="db"}'
+        values: '0+0x4 1+0x16'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: ReliableEventTargetDown
+        exp_alerts: []
+    promql_expr_test:
+      - expr: ALERTS{alertname="ReliableEventTargetDown",alertstate="firing"}
+        eval_time: 1m
+        exp_samples:
+          - labels: '{__name__="ALERTS",alertname="ReliableEventTargetDown",alertstate="firing",instance="a",job="reliable-event-example",outbox_store="db",severity="critical"}'
+            value: 1
+
+  - name: startup-heartbeat-is-covered-by-grace-window
+    interval: 15s
+    input_series:
+      - series: 'up{job="reliable-event-example",instance="a",outbox_store="db",expected_snapshot="true",snapshot_mode="automatic",expected_scheduler="true",scheduler_mode="automatic"}'
+        values: '1+0x12'
+      - series: 'reliable_event_scheduler_enabled{job="reliable-event-example",instance="a",expected_scheduler="true",scheduler_mode="automatic"}'
+        values: '1+0x12'
+      - series: 'reliable_event_scheduler_running{job="reliable-event-example",instance="a",expected_scheduler="true",scheduler_mode="automatic"}'
+        values: '1+0x12'
+      - series: 'reliable_event_scheduler_last_success_timestamp{job="reliable-event-example",instance="a",expected_scheduler="true",scheduler_mode="automatic"}'
+        values: '0+0x12'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: ReliableEventSchedulerHeartbeatExpired
+        exp_alerts: []
+
+  - name: scheduler-not-running-fires-and-recovers
+    interval: 15s
+    input_series:
+      - series: 'reliable_event_scheduler_enabled{job="reliable-event-example",instance="a",outbox_store="db",expected_scheduler="true",scheduler_mode="automatic"}'
+        values: '1+0x24'
+      - series: 'reliable_event_scheduler_running{job="reliable-event-example",instance="a",outbox_store="db",expected_scheduler="true",scheduler_mode="automatic"}'
+        values: '0+0x12 1+0x12'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: ReliableEventSchedulerNotRunning
+        exp_alerts: []
+    promql_expr_test:
+      - expr: ALERTS{alertname="ReliableEventSchedulerNotRunning",alertstate="firing"}
+        eval_time: 3m
+        exp_samples:
+          - labels: '{__name__="ALERTS",alertname="ReliableEventSchedulerNotRunning",alertstate="firing",expected_scheduler="true",instance="a",job="reliable-event-example",outbox_store="db",scheduler_mode="automatic",severity="critical"}'
+            value: 1
+
+  - name: scheduler-heartbeat-fires-and-recovers
+    interval: 15s
+    input_series:
+      - series: 'reliable_event_scheduler_enabled{job="reliable-event-example",instance="a",outbox_store="db",expected_scheduler="true",scheduler_mode="automatic"}'
+        values: '1+0x32'
+      - series: 'reliable_event_scheduler_last_success_timestamp{job="reliable-event-example",instance="a",outbox_store="db",expected_scheduler="true",scheduler_mode="automatic"}'
+        values: '0+0x23 360+15x8'
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: ReliableEventSchedulerHeartbeatExpired
+        exp_alerts: []
+    promql_expr_test:
+      - expr: ALERTS{alertname="ReliableEventSchedulerHeartbeatExpired",alertstate="firing"}
+        eval_time: 5m
+        exp_samples:
+          - labels: '{__name__="ALERTS",alertname="ReliableEventSchedulerHeartbeatExpired",alertstate="firing",expected_scheduler="true",instance="a",job="reliable-event-example",outbox_store="db",scheduler_mode="automatic",severity="critical"}'
+            value: 1
+
+  - name: deliberately-disabled-scheduler-remains-healthy
+    interval: 15s
+    input_series:
+      - series: 'up{job="reliable-event-example",instance="a",outbox_store="db",expected_snapshot="true",snapshot_mode="automatic",expected_scheduler="false",scheduler_mode="manual"}'
+        values: '1+0x24'
+      - series: 'reliable_event_snapshot_last_success_timestamp{job="reliable-event-example",instance="a",outbox_store="db"}'
+        values: '0+15x24'
+      - series: 'reliable_event_scheduler_enabled{job="reliable-event-example",instance="a",expected_scheduler="false",scheduler_mode="manual"}'
+        values: '0+0x24'
+      - series: 'reliable_event_scheduler_running{job="reliable-event-example",instance="a",expected_scheduler="false",scheduler_mode="manual"}'
+        values: '0+0x24'
+      - series: 'reliable_event_unfinished_overdue{job="reliable-event-example",instance="a",outbox_store="db"}'
+        values: '0+0x24'
+      - series: 'reliable_event_unfinished_overdue_oldest_age{job="reliable-event-example",instance="a",outbox_store="db"}'
+        values: '0+0x24'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: ReliableEventSnapshotUnavailable
+        exp_alerts: []
+      - eval_time: 5m
+        alertname: ReliableEventSchedulerNotRunning
+        exp_alerts: []
+      - eval_time: 5m
+        alertname: ReliableEventSchedulerHeartbeatExpired
+        exp_alerts: []
+      - eval_time: 5m
+        alertname: ReliableEventUnfinishedOverdue
+        exp_alerts: []
+      - eval_time: 5m
+        alertname: ReliableEventPublicationStalled
+        exp_alerts: []
+
+  - name: manual-refresh-120-second-budget-expires-and-recovers
+    interval: 15s
+    input_series:
+      - series: 'up{job="reliable-event-example",instance="a",outbox_store="db",expected_snapshot="true",snapshot_mode="manual"}'
+        values: '1+0x40'
+      - series: 'reliable_event_snapshot_last_success_timestamp{job="reliable-event-example",instance="a",outbox_store="db"}'
+        values: '0+15x12 180+0x23 540+15x4'
+    alert_rule_test:
+      - eval_time: 9m15s
+        alertname: ReliableEventSnapshotUnavailable
+        exp_alerts: []
+    promql_expr_test:
+      - expr: ALERTS{alertname="ReliableEventSnapshotUnavailable",alertstate="firing"}
+        eval_time: 9m
+        exp_samples:
+          - labels: '{__name__="ALERTS",alertname="ReliableEventSnapshotUnavailable",alertstate="firing",outbox_store="db",severity="critical"}'
+            value: 1
+
+  - name: duplicate-database-snapshots-use-max-and-ignore-stale-replica
+    interval: 15s
+    input_series:
+      - series: 'up{job="reliable-event-example",instance="a",outbox_store="db",expected_snapshot="true",snapshot_mode="automatic"}'
+        values: '1+0x12'
+      - series: 'up{job="reliable-event-example",instance="b",outbox_store="db",expected_snapshot="true",snapshot_mode="automatic"}'
+        values: '1+0x12'
+      - series: 'up{job="reliable-event-example",instance="stale",outbox_store="db",expected_snapshot="true",snapshot_mode="automatic"}'
+        values: '1+0x12'
+      - series: 'reliable_event_snapshot_last_success_timestamp{job="reliable-event-example",instance="a",outbox_store="db"}'
+        values: '0+15x12'
+      - series: 'reliable_event_snapshot_last_success_timestamp{job="reliable-event-example",instance="b",outbox_store="db"}'
+        values: '0+15x12'
+      - series: 'reliable_event_snapshot_last_success_timestamp{job="reliable-event-example",instance="stale",outbox_store="db"}'
+        values: '-120+0x12'
+      - series: 'reliable_event_unfinished_overdue{job="reliable-event-example",instance="a",outbox_store="db"}'
+        values: '3+0x6 0+0x6'
+      - series: 'reliable_event_unfinished_overdue{job="reliable-event-example",instance="b",outbox_store="db"}'
+        values: '3+0x6 0+0x6'
+      - series: 'reliable_event_unfinished_overdue{job="reliable-event-example",instance="stale",outbox_store="db"}'
+        values: '99+0x12'
+      - series: 'reliable_event_unfinished_overdue_oldest_age{job="reliable-event-example",instance="a",outbox_store="db"}'
+        values: '90+0x6 0+0x6'
+      - series: 'reliable_event_unfinished_overdue_oldest_age{job="reliable-event-example",instance="b",outbox_store="db"}'
+        values: '90+0x6 0+0x6'
+      - series: 'reliable_event_unfinished_overdue_oldest_age{job="reliable-event-example",instance="stale",outbox_store="db"}'
+        values: '999+0x12'
+    promql_expr_test:
+      - expr: reliable_event:unfinished_overdue:fresh
+        eval_time: 1m
+        exp_samples:
+          - labels: '{__name__="reliable_event:unfinished_overdue:fresh",outbox_store="db"}'
+            value: 3
+      - expr: reliable_event:unfinished_overdue:fresh
+        eval_time: 2m
+        exp_samples:
+          - labels: '{__name__="reliable_event:unfinished_overdue:fresh",outbox_store="db"}'
+            value: 0
+      - expr: reliable_event:unfinished_oldest_age:fresh
+        eval_time: 1m
+        exp_samples:
+          - labels: '{__name__="reliable_event:unfinished_oldest_age:fresh",outbox_store="db"}'
+            value: 90
+
+  - name: publication-stall-fires-with-inflight-and-resolves-on-progress
+    interval: 15s
+    input_series:
+      - series: 'up{job="reliable-event-example",instance="a",outbox_store="db",expected_snapshot="true",snapshot_mode="automatic"}'
+        values: '1+0x52'
+      - series: 'reliable_event_snapshot_last_success_timestamp{job="reliable-event-example",instance="a",outbox_store="db"}'
+        values: '0+15x52'
+      - series: 'reliable_event_unfinished_overdue{job="reliable-event-example",instance="a",outbox_store="db"}'
+        values: '1+0x43 0+0x8'
+      - series: 'reliable_event_unfinished_overdue_oldest_age{job="reliable-event-example",instance="a",outbox_store="db"}'
+        values: '120+0x52'
+      - series: 'reliable_event_worker_inflight{job="reliable-event-example",instance="a"}'
+        values: '1+0x52'
+      - series: 'reliable_event_publication_persisted_total{job="reliable-event-example",instance="a",outbox_store="db"}'
+        values: '0+0x43 1+1x8'
+    alert_rule_test:
+      - eval_time: 11m
+        alertname: ReliableEventPublicationStalled
+        exp_alerts: []
+    promql_expr_test:
+      - expr: ALERTS{alertname="ReliableEventPublicationStalled",alertstate="firing"}
+        eval_time: 10m
+        exp_samples:
+          - labels: '{__name__="ALERTS",alertname="ReliableEventPublicationStalled",alertstate="firing",outbox_store="db",severity="warning"}'
+            value: 1
+
+  - name: send-failure-rate-needs-five-attempts-and-recovers
+    interval: 15s
+    input_series:
+      - series: 'reliable_event_publish_success_total{job="reliable-event-example",instance="a",outbox_store="db"}'
+        values: '0+1x64'
+      - series: 'reliable_event_publish_failure_total{job="reliable-event-example",instance="a",outbox_store="db"}'
+        values: '0+1x32 32+0x32'
+    alert_rule_test:
+      - eval_time: 16m
+        alertname: ReliableEventSendFailureRateHigh
+        exp_alerts: []
+    promql_expr_test:
+      - expr: ALERTS{alertname="ReliableEventSendFailureRateHigh",alertstate="firing"}
+        eval_time: 5m
+        exp_samples:
+          - labels: '{__name__="ALERTS",alertname="ReliableEventSendFailureRateHigh",alertstate="firing",outbox_store="db",severity="warning"}'
+            value: 1
+
+  - name: low-send-traffic-does-not-trigger-failure-ratio-alert
+    interval: 15s
+    input_series:
+      - series: 'reliable_event_publish_success_total{job="reliable-event-example",instance="a",outbox_store="db"}'
+        values: '0+0x24'
+      - series: 'reliable_event_publish_failure_total{job="reliable-event-example",instance="a",outbox_store="db"}'
+        values: '0+1x2 2+0x22'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: ReliableEventSendFailureRateHigh
+        exp_alerts: []
+
+  - name: state-update-failure-alert-expires-after-failure-window
+    interval: 15s
+    input_series:
+      - series: 'reliable_event_publication_state_update_failure_total{job="reliable-event-example",instance="a",outbox_store="db"}'
+        values: '0+1x4 4+0x28'
+    alert_rule_test:
+      - eval_time: 7m
+        alertname: ReliableEventStateUpdateFailure
+        exp_alerts: []
+    promql_expr_test:
+      - expr: ALERTS{alertname="ReliableEventStateUpdateFailure",alertstate="firing"}
+        eval_time: 1m
+        exp_samples:
+          - labels: '{__name__="ALERTS",alertname="ReliableEventStateUpdateFailure",alertstate="firing",outbox_store="db",severity="critical"}'
+            value: 1
+
+  - name: missing-first-available-time-fires-and-recovers
+    interval: 15s
+    input_series:
+      - series: 'reliable_event_unfinished_timestamp_missing{job="reliable-event-example",instance="a",outbox_store="db"}'
+        values: '1+0x23 0+0x8'
+      - series: 'up{job="reliable-event-example",instance="a",outbox_store="db",expected_snapshot="true",snapshot_mode="automatic"}'
+        values: '1+0x32'
+      - series: 'reliable_event_snapshot_last_success_timestamp{job="reliable-event-example",instance="a",outbox_store="db"}'
+        values: '0+15x32'
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: ReliableEventMissingFirstAvailableTime
+        exp_alerts: []
+    promql_expr_test:
+      - expr: ALERTS{alertname="ReliableEventMissingFirstAvailableTime",alertstate="firing"}
+        eval_time: 5m
+        exp_samples:
+          - labels: '{__name__="ALERTS",alertname="ReliableEventMissingFirstAvailableTime",alertstate="firing",outbox_store="db",severity="warning"}'
+            value: 1
+
+  - name: missing-snapshot-metric-fires-and-recovers
+    interval: 15s
+    input_series:
+      - series: 'up{job="reliable-event-example",instance="a",outbox_store="db",expected_snapshot="true",snapshot_mode="automatic"}'
+        values: '1+0x24'
+      - series: 'reliable_event_snapshot_last_success_timestamp{job="reliable-event-example",instance="a",outbox_store="db"}'
+        values: '_x16 255+15x16'
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: ReliableEventMetricsMissing
+        exp_alerts: []
+    promql_expr_test:
+      - expr: ALERTS{alertname="ReliableEventMetricsMissing",alertstate="firing"}
+        eval_time: 3m
+        exp_samples:
+          - labels: '{__name__="ALERTS",alertname="ReliableEventMetricsMissing",alertstate="firing",expected_snapshot="true",instance="a",job="reliable-event-example",outbox_store="db",severity="critical",snapshot_mode="automatic"}'
+            value: 1

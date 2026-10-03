@@ -37,10 +37,15 @@
 - [M6.3：Starter 接入与人工操作流程（已完成）](implementation/M6_3_STARTER_OPERATIONS.md)：对外 Java 接口、授权责任和操作示例。
 - [M6.4：端到端验收与交接（已完成）](implementation/M6_4_ACCEPTANCE.md)：真实服务验证、运维文档与最终回归。
 - [M7：已发布事件保留与清理计划（已完成）](implementation/M7_PUBLISHED_EVENT_RETENTION.md)：以独立身份表保留登记去重，分批清理到期的已发布记录，并定义迁移与验收门槛。
+- [M8：自动链路追踪与可直接使用的告警计划（M8.1–M8.5 已完成；M8.6 待实施）](implementation/M8_TRACING_AND_ALERTING.md)：记录上下文持久化、逐次发布追踪、运行指标、示例消费追踪、看板与告警，以及验收边界。
+- [M8.5 本地可观测性运行指南](../observability/README.md)：独立 Prometheus、Alertmanager、Tempo、Grafana 与示例应用配置。
 
 ## 进度记录
 
 - [M7 完成记录](progress/M7_COMPLETED.md)：身份表迁移、分批清理、真实服务验收、全仓回归与上线边界。
+- [M8.3 完成记录](/D:/trae/scp/reliable-event/docs/progress/M8_3_COMPLETED.md)：连续未完成快照、事务后计数、周期采样资源边界、Prometheus 输出与 MySQL 执行计划。
+- [M8.4 完成记录](/D:/trae/scp/reliable-event/docs/progress/M8_4_COMPLETED.md)：原创订单示例的事务处理/ACK 分离、消费者幂等 Span 和真实 HTTP/MySQL/RocketMQ 链路验收。
+- [M8.5 完成记录](progress/M8_5_COMPLETED.md)：记录真实平台连接、Trace 看板、告警往返、规则测试及 Java 回归验收；[历史进度与失败记录](progress/M8_5_PROGRESS.md)继续保留。
 - [M6 完成记录](progress/M6_COMPLETED.md)：真实服务重放、双操作者竞争、未知结果重复消息、回归结果与剩余边界。
 - [MySQL 8.0 基线更正记录](progress/MYSQL_8_BASELINE.md)：记录服务端版本调整、并发策略取舍和完整回归结果。
 - [M0 阶段完成记录](progress/M0_COMPLETED.md)：简要说明已经完成和验证的内容，以及下一步工作。

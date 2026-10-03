@@ -19,7 +19,13 @@ public final class JdbcEventPublicationCycle {
 
     public PublicationCycleResult runOnce() {
         try {
-            int recoveredCount = recovery.recoverExpiredLeases();
+            int recoveredCount;
+            try {
+                recoveredCount = recovery.recoverExpiredLeases();
+            } catch (RuntimeException failure) {
+                recovery.recordCycleFailure(false, "lease_recovery");
+                throw failure;
+            }
             int publishedCount = worker.publishDueEvents();
             return new PublicationCycleResult(recoveredCount, publishedCount);
         } finally {

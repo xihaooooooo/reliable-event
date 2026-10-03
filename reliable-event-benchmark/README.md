@@ -45,7 +45,10 @@ python ./reliable-event-benchmark/scripts/package-results.py ./reliable-event-be
 ./reliable-event-benchmark/scripts/run-once.ps1 -RunId two-workers-1 -Group multi -Count 10000 -PublisherInstances 2
 ./reliable-event-benchmark/scripts/run-once.ps1 -RunId outage-1 -Group outage -Count 10000 -PauseBrokerSeconds 15
 ./reliable-event-benchmark/scripts/run-once.ps1 -RunId unknown-1 -Group unknown -Count 10000 -DropFirstReceipt
+./reliable-event-benchmark/scripts/run-once.ps1 -RunId adaptive-1 -Group adaptive -Count 10000 -AdaptivePollingEnabled -ActivePollInterval 100ms
 ```
+
+自适应轮次可与相同 `Count`、`ClaimBatchSize`、`WorkerThreads`、`WorkerQueueCapacity` 的固定延迟轮次比较。`ActivePollInterval` 是每实例活跃轮次的最小间隔，默认 `100ms`；它限制扫描轮次速率，不限制轮次内逐事件 SQL 的总 QPS。空闲和扫描失败仍使用 `PollInterval`。
 
 `-DropFirstReceipt` 的装饰器先通过真实 Broker 成功发送，再将**该进程**的第一份成功回执改为 `RESULT_UNKNOWN`，以确定性方式验证预期重复消息；它不模拟 Broker 完全未接收。`-PauseBrokerSeconds` 在负载开始前暂停 Broker，按指定秒数恢复，验证 `RETRY_WAIT` 与排空。两个故障场景均由独立接收探针核对稳定 `reliable_event_id` 与 Broker Message ID。`run-once.ps1` 在 `finally` 中恢复暂停的 Broker 并停止自己启动的 Java 进程；超时或失败时保留现场文件。
 

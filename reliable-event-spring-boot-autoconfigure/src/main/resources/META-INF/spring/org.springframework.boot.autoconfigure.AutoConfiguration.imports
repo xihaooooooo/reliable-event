@@ -1,2 +1,4 @@
 dev.reliableevent.autoconfigure.ReliableEventAutoConfiguration
 dev.reliableevent.autoconfigure.ReliableEventPublicationAutoConfiguration
+dev.reliableevent.autoconfigure.ReliableEventMetricsSnapshotAutoConfiguration
+dev.reliableevent.autoconfigure.ReliableEventTracingAutoConfiguration

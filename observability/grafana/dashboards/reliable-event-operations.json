@@ -1,0 +1,618 @@
+{
+  "id": null,
+  "uid": "reliable-event-ops",
+  "title": "ReliableEvent Operations",
+  "tags": [
+    "reliable-event",
+    "outbox"
+  ],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 2,
+  "refresh": "15s",
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
+  "annotations": {
+    "list": []
+  },
+  "templating": {
+    "list": [
+      {
+        "current": {
+          "selected": true,
+          "value": "",
+          "text": ""
+        },
+        "query": "",
+        "type": "textbox",
+        "name": "traceId",
+        "hide": 0,
+        "options": [],
+        "label": "Trace ID"
+      }
+    ]
+  },
+  "links": [
+    {
+      "title": "Runbook and read-only diagnosis",
+      "url": "/d/reliable-event-ops/reliable-event-operations?viewPanel=11",
+      "targetBlank": false
+    }
+  ],
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Overdue unfinished events (fresh snapshot, deduped by Outbox)",
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 8,
+        "h": 5
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "reliable-event-prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "reliable_event:unfinished_overdue:fresh",
+          "legendFormat": "{{outbox_store}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "values": false
+        },
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto"
+      }
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "Oldest unfinished event age (seconds)",
+      "gridPos": {
+        "x": 8,
+        "y": 0,
+        "w": 8,
+        "h": 5
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "reliable-event-prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "reliable_event:unfinished_oldest_age:fresh",
+          "legendFormat": "{{outbox_store}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "showLegend": true,
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Sender attempts and failures / second",
+      "gridPos": {
+        "x": 16,
+        "y": 0,
+        "w": 8,
+        "h": 5
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "reliable-event-prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (outbox_store) (rate(reliable_event_publish_success_total{job=\"reliable-event-example\"}[5m]))",
+          "legendFormat": "success {{outbox_store}}"
+        },
+        {
+          "refId": "B",
+          "expr": "sum by (outbox_store) (rate(reliable_event_publish_failure_total{job=\"reliable-event-example\"}[5m]))",
+          "legendFormat": "failure {{outbox_store}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "showLegend": true,
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "Committed publication progress / second",
+      "gridPos": {
+        "x": 0,
+        "y": 5,
+        "w": 8,
+        "h": 5
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "reliable-event-prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (outbox_store) (rate(reliable_event_publication_persisted_total{job=\"reliable-event-example\"}[5m]))",
+          "legendFormat": "{{outbox_store}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "showLegend": true,
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Worker capacity by instance",
+      "gridPos": {
+        "x": 8,
+        "y": 5,
+        "w": 8,
+        "h": 5
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "reliable-event-prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "reliable_event_worker_inflight{job=\"reliable-event-example\"}",
+          "legendFormat": "inflight {{instance}}"
+        },
+        {
+          "refId": "B",
+          "expr": "reliable_event_worker_queued{job=\"reliable-event-example\"}",
+          "legendFormat": "queued {{instance}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "showLegend": true,
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Scheduler last successful cycle age (seconds)",
+      "gridPos": {
+        "x": 16,
+        "y": 5,
+        "w": 8,
+        "h": 5
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "reliable-event-prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "time() - reliable_event_scheduler_last_success_timestamp{job=\"reliable-event-example\"}",
+          "legendFormat": "{{instance}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "showLegend": true,
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 7,
+      "type": "stat",
+      "title": "DEAD rows (fresh snapshot)",
+      "gridPos": {
+        "x": 0,
+        "y": 10,
+        "w": 6,
+        "h": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "reliable-event-prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "reliable_event:dead:fresh",
+          "legendFormat": "{{outbox_store}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "values": false
+        },
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      }
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "Status update failures / second",
+      "gridPos": {
+        "x": 6,
+        "y": 10,
+        "w": 6,
+        "h": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "reliable-event-prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (outbox_store) (rate(reliable_event_publication_state_update_failure_total{job=\"reliable-event-example\"}[5m]))",
+          "legendFormat": "{{outbox_store}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "showLegend": true,
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "Snapshot age by instance (seconds; one fresh instance is sufficient)",
+      "gridPos": {
+        "x": 12,
+        "y": 10,
+        "w": 6,
+        "h": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "reliable-event-prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "time() - reliable_event_snapshot_last_success_timestamp{job=\"reliable-event-example\"}",
+          "legendFormat": "{{outbox_store}} / {{instance}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "showLegend": true,
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 10,
+      "type": "table",
+      "title": "Current alerts",
+      "gridPos": {
+        "x": 18,
+        "y": 10,
+        "w": 6,
+        "h": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "reliable-event-prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "ALERTS{alertstate=\"firing\", alertname=~\"ReliableEvent.*\"}",
+          "format": "table",
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "footer": {
+          "show": false
+        }
+      }
+    },
+    {
+      "id": 11,
+      "type": "text",
+      "title": "Runbook: diagnosis, impact, recovery",
+      "gridPos": {
+        "x": 0,
+        "y": 14,
+        "w": 24,
+        "h": 10
+      },
+      "options": {
+        "mode": "markdown",
+        "content": "## Triage and recovery\n\n**Overdue / stalled:** The age rule uses the first-available timestamp over PENDING, PUBLISHING, and RETRY_WAIT. Backoff and scheduler mode changes do not reset it, and unrelated successful publishes do not suppress it. Inspect status, `first_available_at`, `next_attempt_at`, attempts, leases, and `DEAD` transitions using the repository Operations guide. A `DEAD` event needs authorized review after checking Broker and consumer facts.\n\n**Scheduler:** Compare enabled, running, and last successful cycle age. Use `expected_scheduler=true` only when automatic scheduling is expected; set it false for intentionally disabled or manual-only runs. The rule includes a three-minute startup grace plus the 60-second demo poll window.\n\n**Snapshot:** Check `snapshot.failure`, database reachability, and application/database clock skew. Each target snapshot is filtered for freshness before replicas are grouped by logical `outbox_store`, so one fresh snapshot suffices and a stale large gauge cannot mask it. Automatic mode uses 60 seconds. Manual mode uses a fixed 120-second PromQL window; it must be edited explicitly if the planned manual refresh cadence changes. `periodic_enabled=0` does not suppress this monitor because automatic publication rounds may still refresh. Set `expected_snapshot=false` only where no refresh path is expected.\n\n**Status update failure:** A Broker receipt may exist while the Outbox remains unfinished, so duplicate delivery is possible. Check database write results and lease ownership; `PUBLISHED` does not prove consumer completion.\n\n**Missing first_available_at:** Do not infer age from `created_at`; review the M4.5 schema migration and inspect affected rows.\n\n**Send failure rate:** Check RocketMQ Proxy reachability, mappings, retry outcome and attempt limits. This warning requires at least five attempts in five minutes.\n\n**Recovery:** A timed alert enters firing only after its condition remains true for the configured `for` interval. Once the condition is false at a rule evaluation, the alert resolves at the next evaluation because these rules do not set `keep_firing_for`. New DEAD and failure-counter alerts also resolve when their increase window expires. Preserve the Prometheus/receiver evidence with the incident record.\n\nUse the Trace ID field at the top of this dashboard: paste a 32-character hexadecimal trace ID from an order request, then inspect the matching `POST /orders` → `reliable-event.register` → `reliable-event.publish` → `example.order.consume` spans and their parent IDs in the Trace panel below. Demo thresholds are not an SLA; tune against production backoff, poll, scrape, and business deadlines."
+      }
+    },
+    {
+      "id": 12,
+      "type": "timeseries",
+      "title": "Failure types (duration timer counts by outcome)",
+      "gridPos": {
+        "x": 0,
+        "y": 24,
+        "w": 12,
+        "h": 5
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "reliable-event-prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (outcome) (rate(reliable_event_publish_duration_seconds_count{job=\"reliable-event-example\", outcome=~\"retryable|non_retryable|unknown\"}[5m]))",
+          "legendFormat": "{{outcome}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "showLegend": true,
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 13,
+      "type": "timeseries",
+      "title": "Retention cleanup and oldest eligible age",
+      "gridPos": {
+        "x": 12,
+        "y": 24,
+        "w": 12,
+        "h": 5
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "reliable-event-prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (outbox_store) (rate(reliable_event_retention_deleted_total{job=\"reliable-event-example\"}[5m]))",
+          "legendFormat": "deleted rows/s {{outbox_store}}"
+        },
+        {
+          "refId": "B",
+          "expr": "sum by (outbox_store) (rate(reliable_event_retention_failed_total{job=\"reliable-event-example\"}[5m]))",
+          "legendFormat": "failed rounds/s {{outbox_store}}"
+        },
+        {
+          "refId": "C",
+          "expr": "reliable_event_retention_oldest_eligible_age{job=\"reliable-event-example\"}",
+          "legendFormat": "oldest eligible age {{instance}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "showLegend": true,
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "description": "Enter a 32-character hexadecimal Trace ID in the dashboard textbox above.",
+      "type": "traces",
+      "targets": [
+        {
+          "query": "${traceId}",
+          "limit": 20,
+          "filters": [],
+          "refId": "A",
+          "datasource": {
+            "uid": "reliable-event-tempo",
+            "type": "tempo"
+          },
+          "queryType": "traceql",
+          "tableType": "traces"
+        }
+      ],
+      "fieldConfig": {
+        "overrides": [],
+        "defaults": {}
+      },
+      "gridPos": {
+        "h": 12,
+        "x": 0,
+        "w": 24,
+        "y": 29
+      },
+      "datasource": {
+        "uid": "reliable-event-tempo",
+        "type": "tempo"
+      },
+      "title": "Trace (Trace ID input above)",
+      "id": 14,
+      "options": {}
+    }
+  ]
+}

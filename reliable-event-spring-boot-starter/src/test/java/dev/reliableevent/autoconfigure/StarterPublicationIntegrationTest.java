@@ -239,6 +239,8 @@ class StarterPublicationIntegrationTest {
                         "spring.datasource.username=" + MYSQL.getUsername(),
                         "spring.datasource.password=" + MYSQL.getPassword(),
                         "reliable-event.poll-interval=100ms",
+                        "reliable-event.adaptive-polling-enabled=true",
+                        "reliable-event.active-poll-interval=50ms",
                         "reliable-event.worker-threads=2",
                         "reliable-event.worker-queue-capacity=1",
                         "reliable-event.rocketmq.endpoints=localhost:8081",

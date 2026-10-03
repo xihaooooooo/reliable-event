@@ -7,6 +7,16 @@ spring:
     username: ${EXAMPLE_DB_USER:example}
     password: ${EXAMPLE_DB_PASSWORD:example}
 
+management:
+  otlp:
+    tracing:
+      export:
+        enabled: false
+  tracing:
+    sampling:
+      probability: ${EXAMPLE_TRACE_SAMPLING_PROBABILITY:1.0}
+    propagation:
+      type: w3c
 example:
   rocketmq:
     topic: ${EXAMPLE_ROCKETMQ_TOPIC:reliable-event-example}

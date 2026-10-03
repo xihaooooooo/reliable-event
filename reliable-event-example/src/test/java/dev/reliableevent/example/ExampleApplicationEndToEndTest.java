@@ -22,6 +22,14 @@ import org.apache.rocketmq.client.apis.consumer.FilterExpression;
 import org.apache.rocketmq.client.apis.consumer.SimpleConsumer;
 import org.apache.rocketmq.client.apis.message.MessageView;
 import org.apache.rocketmq.client.apis.producer.Producer;
+import io.opentelemetry.api.common.AttributeKey;
+import io.opentelemetry.api.trace.SpanKind;
+import io.opentelemetry.sdk.common.CompletableResultCode;
+import io.opentelemetry.sdk.trace.SdkTracerProviderBuilder;
+import io.opentelemetry.sdk.trace.data.SpanData;
+import io.opentelemetry.sdk.trace.export.SimpleSpanProcessor;
+import io.opentelemetry.sdk.trace.export.SpanExporter;
+import org.springframework.boot.actuate.autoconfigure.tracing.SdkTracerProviderBuilderCustomizer;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeAll;
@@ -31,6 +39,8 @@ import org.junit.jupiter.api.Timeout;
 import org.springframework.boot.builder.SpringApplicationBuilder;
 import org.springframework.boot.web.servlet.context.ServletWebServerApplicationContext;
 import org.springframework.context.ConfigurableApplicationContext;
+import org.springframework.boot.test.context.TestConfiguration;
+import org.springframework.context.annotation.Bean;
 import org.springframework.core.io.ClassPathResource;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.datasource.DriverManagerDataSource;
@@ -65,9 +75,17 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.Collection;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.awaitility.Awaitility.await;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyInt;
+import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
 @Testcontainers(disabledWithoutDocker = true)
 @Timeout(180)
@@ -173,6 +191,122 @@ class ExampleApplicationEndToEndTest {
                 });
         assertThat(consumedCount(created.orderId())).isOne();
         assertThat(getOrder(created.orderId()).path("handledCount").asInt()).isOne();
+    }
+
+    @Test
+    void realHttpRegistrationPublicationAndBrokerConsumptionShareOneTrace() throws Exception {
+        startApplication(true);
+        MemorySpanExporter.reset();
+        ClientConfiguration configuration = ClientConfiguration.newBuilder()
+                .setEndpoints("localhost:8081")
+                .setRequestTimeout(Duration.ofSeconds(10))
+                .enableSsl(false)
+                .build();
+        try (SimpleConsumer probe = PROVIDER.newSimpleConsumerBuilder()
+                .setClientConfiguration(configuration)
+                .setConsumerGroup(PROBE_GROUP)
+                .setAwaitDuration(Duration.ofSeconds(3))
+                .setSubscriptionExpressions(Map.of(TOPIC, FilterExpression.SUB_ALL))
+                .build()) {
+            String upstream = "00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb-01";
+            Created created = postOrder("trace-order", 7, upstream);
+            await().atMost(Duration.ofSeconds(30)).pollInterval(Duration.ofMillis(100))
+                    .untilAsserted(() -> {
+                        assertThat(status(created.eventId())).isEqualTo(2);
+                        assertThat(effectCount(created.orderId())).isOne();
+                    });
+            MessageView brokerMessage = receiveFor(probe, Long.toString(created.orderId()), 1).get(0);
+            String deliveredParent = brokerMessage.getProperties().get("traceparent");
+            assertThat(deliveredParent).matches("00-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}");
+
+            await().atMost(Duration.ofSeconds(10)).pollInterval(Duration.ofMillis(20))
+                    .untilAsserted(() -> {
+                        List<SpanData> spans = MemorySpanExporter.finishedSpans();
+                        SpanData server = spans.stream()
+                                .filter(span -> span.getKind() == SpanKind.SERVER)
+                                .filter(span -> span.getTraceId().equals("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"))
+                                .findFirst().orElseThrow();
+                        SpanData registration = named(spans, "reliable-event.register",
+                                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+                        SpanData publication = named(spans, "reliable-event.publish",
+                                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+                        SpanData consumption = named(spans, "example.order.consume",
+                                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+                        assertThat(server.getParentSpanId()).isEqualTo("bbbbbbbbbbbbbbbb");
+                        assertThat(registration.getTraceId()).isEqualTo(server.getTraceId());
+                        assertThat(registration.getParentSpanId()).isEqualTo(server.getSpanId());
+                        assertThat(publication.getTraceId()).isEqualTo(registration.getTraceId());
+                        assertThat(publication.getParentSpanId()).isEqualTo(registration.getSpanId());
+                        assertThat(deliveredParent.split("-")[2]).isEqualTo(publication.getSpanId());
+                        assertThat(consumption.getTraceId()).isEqualTo(publication.getTraceId());
+                        assertThat(consumption.getParentSpanId()).isEqualTo(publication.getSpanId());
+                        assertThat(consumption.getAttributes().get(
+                                AttributeKey.stringKey("reliable_event.consume.result"))).isEqualTo("processed");
+                        assertThat(consumption.getAttributes().get(
+                                AttributeKey.stringKey("reliable_event.ack.result"))).isEqualTo("success");
+                    });
+            assertThat(consumedCount(created.orderId())).isOne();
+        }
+    }
+
+    @Test
+    void consumerSeparatesBusinessFailureDuplicateSkipAndAckFailure() throws Exception {
+        startApplication(false, false, 8, "--example.consumer.enabled=false");
+        MemorySpanExporter.reset();
+        Created created = postOrder("consumer-results", 2);
+        ObjectMapper appMapper = context.getBean(ObjectMapper.class);
+        MessageView invalid = exampleMessage(created,
+                new OrderCreatedPayload(created.orderId(), "wrong-item", 2), appMapper);
+        MessageView valid = exampleMessage(created,
+                new OrderCreatedPayload(created.orderId(), "consumer-results", 2), appMapper);
+        SimpleConsumer fakeConsumer = mock(SimpleConsumer.class);
+        AtomicInteger receiveCalls = new AtomicInteger();
+        AtomicInteger acknowledgements = new AtomicInteger();
+        CountDownLatch attemptedAcks = new CountDownLatch(2);
+        when(fakeConsumer.receive(anyInt(), any(Duration.class))).thenAnswer(invocation -> {
+            if (receiveCalls.getAndIncrement() == 0) return List.of(invalid, valid, valid);
+            new CountDownLatch(1).await();
+            return List.of();
+        });
+        doAnswer(invocation -> {
+            attemptedAcks.countDown();
+            if (acknowledgements.incrementAndGet() == 1) {
+                throw new IllegalStateException("simulated acknowledgement failure");
+            }
+            return null;
+        }).when(fakeConsumer).ack(any(MessageView.class));
+
+        ExampleConsumerLoop loop = new ExampleConsumerLoop(fakeConsumer,
+                context.getBean(OrderMessageHandler.class), context.getBean(io.micrometer.tracing.Tracer.class),
+                context.getBean(io.micrometer.tracing.propagation.Propagator.class));
+        loop.start();
+        assertThat(attemptedAcks.await(10, TimeUnit.SECONDS)).isTrue();
+        loop.stop();
+
+        assertThat(acknowledgements).hasValue(2);
+        assertThat(consumedCount(created.orderId())).isOne();
+        assertThat(effectCount(created.orderId())).isOne();
+        await().atMost(Duration.ofSeconds(5)).untilAsserted(() -> {
+            List<SpanData> spans = MemorySpanExporter.finishedSpans().stream()
+                    .filter(span -> span.getName().equals("example.order.consume")).toList();
+            assertThat(spans).hasSize(3);
+            assertThat(spans).anySatisfy(span -> assertThat(span.getAttributes().get(
+                    AttributeKey.stringKey("reliable_event.consume.result"))).isEqualTo("failed"));
+            assertThat(spans).anySatisfy(span -> {
+                assertThat(span.getAttributes().get(AttributeKey.stringKey(
+                        "reliable_event.consume.result"))).isEqualTo("processed");
+                assertThat(span.getAttributes().get(AttributeKey.stringKey(
+                        "reliable_event.ack.result"))).isEqualTo("failed");
+            });
+            assertThat(spans).anySatisfy(span -> {
+                assertThat(span.getAttributes().get(AttributeKey.stringKey(
+                        "reliable_event.consume.result"))).isEqualTo("idempotent_skip");
+                assertThat(span.getAttributes().get(AttributeKey.stringKey(
+                        "reliable_event.ack.result"))).isEqualTo("success");
+            });
+            assertThat(spans).allSatisfy(span -> assertThat(span.getParentSpanId())
+                    .isEqualTo("0000000000000000"));
+        });
     }
 
     @Test
@@ -469,7 +603,7 @@ class ExampleApplicationEndToEndTest {
                 };
         String[] all = java.util.Arrays.copyOf(properties, properties.length + extraProperties.length);
         System.arraycopy(extraProperties, 0, all, properties.length, extraProperties.length);
-        context = new SpringApplicationBuilder(ExampleApplication.class)
+        context = new SpringApplicationBuilder(ExampleApplication.class, TracingTestConfiguration.class)
                 .run(all);
     }
 
@@ -481,17 +615,35 @@ class ExampleApplicationEndToEndTest {
     }
 
     private Created postOrder(String itemCode, int quantity) throws Exception {
+        return postOrder(itemCode, quantity, null);
+    }
+
+    private Created postOrder(String itemCode, int quantity, String traceparent) throws Exception {
         int port = ((ServletWebServerApplicationContext) context).getWebServer().getPort();
-        HttpRequest request = HttpRequest.newBuilder(URI.create("http://localhost:" + port + "/orders"))
-                .header("Content-Type", "application/json")
-                .POST(HttpRequest.BodyPublishers.ofString("{\"itemCode\":\"" + itemCode
-                        + "\",\"quantity\":" + quantity + "}"))
+        HttpRequest.Builder builder = HttpRequest.newBuilder(
+                        URI.create("http://localhost:" + port + "/orders"))
+                .header("Content-Type", "application/json");
+        if (traceparent != null) builder.header("traceparent", traceparent);
+        HttpRequest request = builder.POST(HttpRequest.BodyPublishers.ofString(
+                "{\"itemCode\":\"" + itemCode + "\",\"quantity\":" + quantity + "}"))
                 .build();
         HttpResponse<String> response = HttpClient.newHttpClient().send(request,
                 HttpResponse.BodyHandlers.ofString());
         assertThat(response.statusCode()).isEqualTo(201);
         JsonNode body = mapper.readTree(response.body());
         return new Created(body.path("orderId").asLong(), body.path("eventId").asLong());
+    }
+
+    private MessageView exampleMessage(Created created, OrderCreatedPayload payload,
+                                       ObjectMapper appMapper) throws Exception {
+        MessageView message = mock(MessageView.class);
+        when(message.getProperties()).thenReturn(Map.of(
+                "reliable_event_type", OrderService.EVENT_TYPE,
+                "reliable_event_key", Long.toString(created.orderId()),
+                "reliable_event_id", Long.toString(created.eventId())));
+        when(message.getKeys()).thenReturn(List.of(Long.toString(created.orderId())));
+        when(message.getBody()).thenReturn(ByteBuffer.wrap(appMapper.writeValueAsBytes(payload)));
+        return message;
     }
 
     private JsonNode getOrder(long id) throws Exception {
@@ -547,6 +699,40 @@ class ExampleApplicationEndToEndTest {
                 SELECT COUNT(*) FROM example_consumed_event
                 WHERE event_type = ? AND event_key = ?
                 """, Long.class, OrderService.EVENT_TYPE, Long.toString(orderId));
+    }
+
+    private static SpanData named(List<SpanData> spans, String name, String traceId) {
+        return spans.stream().filter(span -> span.getName().equals(name))
+                .filter(span -> span.getTraceId().equals(traceId)).findFirst().orElseThrow();
+    }
+
+    @TestConfiguration(proxyBeanMethods = false)
+    static class TracingTestConfiguration {
+        @Bean
+        MemorySpanExporter exampleMemorySpanExporter() {
+            return new MemorySpanExporter();
+        }
+
+        @Bean
+        SdkTracerProviderBuilderCustomizer memorySpanExporterCustomizer(MemorySpanExporter exporter) {
+            return builder -> builder.addSpanProcessor(SimpleSpanProcessor.create(exporter));
+        }
+    }
+
+    static final class MemorySpanExporter implements SpanExporter {
+        private static final CopyOnWriteArrayList<SpanData> FINISHED = new CopyOnWriteArrayList<>();
+
+        static void reset() { FINISHED.clear(); }
+        static List<SpanData> finishedSpans() { return List.copyOf(FINISHED); }
+
+        @Override
+        public CompletableResultCode export(Collection<SpanData> spans) {
+            FINISHED.addAll(spans);
+            return CompletableResultCode.ofSuccess();
+        }
+
+        @Override public CompletableResultCode flush() { return CompletableResultCode.ofSuccess(); }
+        @Override public CompletableResultCode shutdown() { return CompletableResultCode.ofSuccess(); }
     }
 
     private static org.testcontainers.containers.Container.ExecResult command(String arguments)

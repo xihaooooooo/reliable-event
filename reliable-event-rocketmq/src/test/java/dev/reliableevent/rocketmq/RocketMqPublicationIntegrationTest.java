@@ -11,6 +11,8 @@ import dev.reliableevent.jdbc.JdbcReliableEventPublisher;
 import dev.reliableevent.jdbc.internal.model.EventStatus;
 import dev.reliableevent.jdbc.internal.publication.JdbcEventPublicationWorker;
 import dev.reliableevent.jdbc.internal.retry.ExponentialBackoff;
+import dev.reliableevent.jdbc.internal.tracing.PublicationTracer;
+import dev.reliableevent.internal.publication.EventSendFailureType;
 import org.apache.rocketmq.client.apis.ClientConfiguration;
 import org.apache.rocketmq.client.apis.ClientServiceProvider;
 import org.apache.rocketmq.client.apis.consumer.FilterExpression;
@@ -154,6 +156,54 @@ class RocketMqPublicationIntegrationTest {
                 .containsEntry(RocketMqMessageFactory.EVENT_TYPE_PROPERTY, "coupon-task-execute")
                 .containsEntry(RocketMqMessageFactory.EVENT_KEY_PROPERTY, eventKey);
         assertThat(message.getMessageId().toString()).isNotBlank();
+        consumer.ack(message);
+    }
+
+    @Test
+    void publishesAttemptTraceHeadersToRocketMqAndKeepsOutboxRegistrationHeaders() throws Exception {
+        String eventKey = "trace-attempt-" + System.nanoTime();
+        String registrationTraceparent = "00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb-01";
+        EventId eventId = new TransactionTemplate(transactionManager).execute(status ->
+                new JdbcReliableEventPublisher(jdbcTemplate, OBJECT_MAPPER).publish(new ReliableEvent<>(
+                        "coupon-task-execute", eventKey, new TaskPayload(111), Instant.now().minusSeconds(1),
+                        Map.of("source", "publication-integration-test", "traceparent", registrationTraceparent))));
+        String attemptTraceparent = "00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-cccccccccccccccc-01";
+        PublicationTracer tracer = claimed -> {
+            try {
+                Map<String, String> headers = new java.util.LinkedHashMap<>(OBJECT_MAPPER.readValue(
+                        claimed.event().headersJson(), OBJECT_MAPPER.getTypeFactory()
+                                .constructMapType(Map.class, String.class, String.class)));
+                headers.put("traceparent", attemptTraceparent);
+                StoredEvent copy = new StoredEvent(claimed.event().id(), claimed.event().eventType(),
+                        claimed.event().eventKey(), claimed.event().payloadJson(),
+                        OBJECT_MAPPER.writeValueAsString(headers));
+                return new PublicationTracer.Attempt() {
+                    @Override public StoredEvent eventForSend() { return copy; }
+                    @Override public void sendSucceeded(SendReceipt receipt) { }
+                    @Override public void sendFailed(EventSendFailureType type, Throwable failure) { }
+                    @Override public void stateUpdated(String status, boolean pending) { }
+                    @Override public void stateUpdateFailed(String status, Throwable failure, boolean rejected) { }
+                    @Override public void close() { }
+                };
+            } catch (Exception failure) {
+                throw new AssertionError(failure);
+            }
+        };
+        JdbcEventPublicationWorker tracedWorker = new JdbcEventPublicationWorker(jdbcTemplate,
+                transactionManager, sender, Clock.systemUTC(), 10, "rocketmq-trace-worker", LEASE_DURATION,
+                new ExponentialBackoff(Duration.ofSeconds(1), Duration.ofSeconds(30), 0.0, () -> 0.0),
+                dev.reliableevent.jdbc.internal.observation.PublicationObserver.NOOP, tracer);
+
+        assertThat(tracedWorker.publishDueEvents()).isOne();
+        MessageView message = receiveMessages(eventKey, 1).get(0);
+        assertThat(message.getProperties())
+                .containsEntry("traceparent", attemptTraceparent)
+                .containsEntry("source", "publication-integration-test");
+        String persistedHeaders = jdbcTemplate.queryForObject(
+                "SELECT headers FROM reliable_event_outbox WHERE id = ?", String.class, eventId.value());
+        assertThat(OBJECT_MAPPER.readTree(persistedHeaders).path("traceparent").asText())
+                .isEqualTo(registrationTraceparent);
+        assertThat(statusOf(eventId)).isEqualTo(EventStatus.PUBLISHED.code());
         consumer.ack(message);
     }
 

@@ -6,6 +6,7 @@ import dev.reliableevent.jdbc.internal.publication.JdbcEventPublicationWorker;
 import dev.reliableevent.jdbc.internal.observation.PublicationObserver;
 import dev.reliableevent.jdbc.internal.recovery.JdbcExpiredLeaseRecovery;
 import dev.reliableevent.jdbc.internal.retry.ExponentialBackoff;
+import dev.reliableevent.jdbc.internal.tracing.PublicationTracer;
 import org.springframework.boot.autoconfigure.AutoConfiguration;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnBean;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnClass;
@@ -43,7 +44,8 @@ public class ReliableEventPublicationAutoConfiguration {
             EventSender sender,
             ExponentialBackoff backoff,
             ReliableEventProperties properties,
-            ObjectProvider<PublicationObserver> observers
+            ObjectProvider<PublicationObserver> observers,
+            ObjectProvider<PublicationTracer> tracers
     ) {
         properties.validateCore();
         return new JdbcEventPublicationWorker(
@@ -55,7 +57,10 @@ public class ReliableEventPublicationAutoConfiguration {
                 "reliable-event-" + UUID.randomUUID(),
                 properties.getLeaseDuration(),
                 backoff,
-                observers.getIfAvailable(() -> PublicationObserver.NOOP)
+                observers.getIfAvailable(() -> PublicationObserver.NOOP),
+                properties.isTracingEnabled()
+                        ? tracers.getIfAvailable(() -> PublicationTracer.NOOP)
+                        : PublicationTracer.NOOP
         );
     }
 
@@ -75,13 +80,16 @@ public class ReliableEventPublicationAutoConfiguration {
     ReliableEventScheduler reliableEventScheduler(
             JdbcExpiredLeaseRecovery recovery,
             JdbcEventPublicationWorker worker,
-            ReliableEventProperties properties
+            ReliableEventProperties properties,
+            ObjectProvider<PublicationObserver> observers
     ) {
         properties.validateCore();
         return new ReliableEventScheduler(
                 recovery, worker, properties.getClaimBatchSize(),
                 properties.getWorkerThreads(), properties.getWorkerQueueCapacity(),
-                properties.getPollInterval(), properties.getShutdownTimeout()
+                properties.getPollInterval(), properties.getShutdownTimeout(),
+                properties.isAdaptivePollingEnabled(), properties.getActivePollInterval(),
+                observers.getIfAvailable(() -> PublicationObserver.NOOP)
         );
     }
 
@@ -92,8 +100,15 @@ public class ReliableEventPublicationAutoConfiguration {
 
         @Bean(destroyMethod = "close")
         @ConditionalOnMissingBean(PublicationObserver.class)
-        PublicationObserver reliableEventMetrics(MeterRegistry registry, JdbcTemplate jdbcTemplate) {
-            return new MicrometerPublicationObserver(registry, jdbcTemplate);
+        MicrometerPublicationObserver reliableEventMetrics(MeterRegistry registry, JdbcTemplate jdbcTemplate,
+                                                            ReliableEventProperties properties) {
+            properties.validateMetricsSnapshot();
+            MicrometerPublicationObserver observer = new MicrometerPublicationObserver(
+                    registry, new dev.reliableevent.jdbc.internal.persistence.JdbcOutboxRepository(jdbcTemplate),
+                    properties.getMetricsSnapshotQueryTimeout());
+            observer.automaticSnapshotInterval(properties.getMetricsSnapshotInterval());
+            return observer;
         }
+
     }
 }

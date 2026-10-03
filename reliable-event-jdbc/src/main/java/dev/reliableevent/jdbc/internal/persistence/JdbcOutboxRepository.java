@@ -6,6 +6,7 @@ import dev.reliableevent.jdbc.internal.model.EventCandidate;
 import dev.reliableevent.jdbc.internal.model.EventStatus;
 import dev.reliableevent.jdbc.internal.model.ExpiredLeaseCandidate;
 import dev.reliableevent.jdbc.internal.model.OutboxCounts;
+import dev.reliableevent.jdbc.internal.model.OutboxMetricsSnapshot;
 import dev.reliableevent.internal.model.StoredEvent;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.dao.DuplicateKeyException;
@@ -14,6 +15,10 @@ import org.springframework.jdbc.support.KeyHolder;
 
 import java.sql.Statement;
 import java.sql.Timestamp;
+import java.sql.ResultSet;
+import java.sql.SQLException;
+import java.sql.Connection;
+import java.sql.PreparedStatement;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.LocalDateTime;
@@ -141,6 +146,64 @@ public final class JdbcOutboxRepository {
                 },
                 EventStatus.PENDING.code(), EventStatus.RETRY_WAIT.code(), EventStatus.DEAD.code()
         );
+    }
+
+    /** Reads all publication-age fields using one MySQL UTC timestamp and one statement. */
+    public OutboxMetricsSnapshot readMetricsSnapshot(int queryTimeoutSeconds) {
+        if (queryTimeoutSeconds <= 0) {
+            throw new IllegalArgumentException("queryTimeoutSeconds must be positive");
+        }
+        String sql = """
+                SELECT
+                  COALESCE(SUM(status IN (0, 3)), 0) AS backlog,
+                  COALESCE(SUM(status = 4), 0) AS dead,
+                  COALESCE(SUM(status IN (0, 3) AND next_attempt_at <= UTC_TIMESTAMP(3)), 0) AS ready,
+                  CASE
+                    WHEN SUM(status IN (0, 3) AND next_attempt_at <= UTC_TIMESTAMP(3)) = 0 THEN 0
+                    ELSE TIMESTAMPDIFF(MICROSECOND,
+                      MIN(CASE WHEN status IN (0, 3) AND next_attempt_at <= UTC_TIMESTAMP(3)
+                               THEN first_available_at END), UTC_TIMESTAMP(3)) / 1000000.0
+                  END AS ready_oldest_age,
+                  COALESCE(SUM(status IN (0, 1, 3) AND first_available_at <= UTC_TIMESTAMP(3)), 0)
+                    AS unfinished_overdue,
+                  CASE
+                    WHEN SUM(status IN (0, 1, 3) AND first_available_at <= UTC_TIMESTAMP(3)) = 0 THEN 0
+                    ELSE TIMESTAMPDIFF(MICROSECOND,
+                      MIN(CASE WHEN status IN (0, 1, 3) AND first_available_at <= UTC_TIMESTAMP(3)
+                               THEN first_available_at END), UTC_TIMESTAMP(3)) / 1000000.0
+                  END AS unfinished_oldest_age,
+                  COALESCE(SUM(status IN (0, 1, 3) AND first_available_at IS NULL), 0)
+                    AS unfinished_timestamp_missing
+                FROM reliable_event_outbox
+                """;
+        try (Connection connection = Objects.requireNonNull(jdbcTemplate.getDataSource(), "DataSource unavailable")
+                .getConnection();
+             PreparedStatement statement = connection.prepareStatement(sql)) {
+            statement.setQueryTimeout(queryTimeoutSeconds);
+            try (ResultSet result = statement.executeQuery()) {
+                if (!result.next()) {
+                    throw new IllegalStateException("Metrics snapshot query returned no row");
+                }
+                long ready = result.getLong("ready");
+                long unfinished = result.getLong("unfinished_overdue");
+                return new OutboxMetricsSnapshot(
+                        result.getLong("backlog"), result.getLong("dead"), ready,
+                        age(result, "ready_oldest_age", ready), unfinished,
+                        age(result, "unfinished_oldest_age", unfinished),
+                        result.getLong("unfinished_timestamp_missing"));
+            }
+        } catch (SQLException exception) {
+            throw new org.springframework.jdbc.CannotGetJdbcConnectionException(
+                    "Could not read reliable-event metrics snapshot", exception);
+        }
+    }
+
+    private static double age(ResultSet result, String column, long count) throws SQLException {
+        if (count == 0) {
+            return 0.0;
+        }
+        double age = result.getDouble(column);
+        return result.wasNull() ? Double.NaN : Math.max(0.0, age);
     }
 
     public List<ExpiredLeaseCandidate> findExpiredLeaseCandidates(int limit) {
@@ -417,12 +480,8 @@ public final class JdbcOutboxRepository {
     }
 
     private IllegalStateException staleClaim(ClaimedEvent claimedEvent) {
-        return new IllegalStateException(
-                "Event claim is no longer current: eventId="
-                        + claimedEvent.event().id().value()
-                        + ", leaseOwner="
-                        + claimedEvent.leaseOwner()
-        );
+        return new StaleEventClaimException(
+                claimedEvent.event().id().value(), claimedEvent.leaseOwner());
     }
 
     private long positiveDurationMicros(Duration duration, String name) {

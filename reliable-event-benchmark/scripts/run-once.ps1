@@ -12,7 +12,9 @@ param(
     [switch]$DropFirstReceipt,
     [ValidatePattern('^[A-Za-z0-9-]{1,48}$')][string]$Group = 'manual',
     [ValidateRange(30,7200)][int]$TimeoutSeconds = 900,
-    [string]$PollInterval = '1s'
+    [string]$PollInterval = '1s',
+    [switch]$AdaptivePollingEnabled,
+    [string]$ActivePollInterval = '100ms'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -124,6 +126,7 @@ try {
         count = $Count; historicalRows = $HistoricalRows; publisherInstances = $PublisherInstances
         claimBatchSize = $ClaimBatchSize; workerThreads = $WorkerThreads
         workerQueueCapacity = $WorkerQueueCapacity; pollInterval = $PollInterval
+        adaptivePollingEnabled = [bool]$AdaptivePollingEnabled; activePollInterval = $ActivePollInterval
         loadThreads = $LoadThreads; loadBatchSize = $LoadBatchSize
         payloadPaddingChars = 256; headerCount = 1
         pauseBrokerSeconds = $PauseBrokerSeconds; dropFirstReceipt = [bool]$DropFirstReceipt
@@ -145,7 +148,9 @@ try {
             "--benchmark.output=$(Join-Path $runDir "publisher-$index-meters.csv")",
             "--reliable-event.claim-batch-size=$ClaimBatchSize", "--reliable-event.worker-threads=$WorkerThreads",
             "--reliable-event.worker-queue-capacity=$WorkerQueueCapacity",
-            "--reliable-event.poll-interval=$PollInterval")
+            "--reliable-event.poll-interval=$PollInterval",
+            "--reliable-event.adaptive-polling-enabled=$([bool]$AdaptivePollingEnabled)",
+            "--reliable-event.active-poll-interval=$ActivePollInterval")
         if ($DropFirstReceipt -and $index -eq 0) { $publisherArgs += '--benchmark.drop-first-receipt=true' }
         $publisher = Start-BenchmarkProcess "publisher-$index" $publisherArgs
         $publisherPids.Add($publisher.Id)

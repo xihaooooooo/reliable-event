@@ -10,6 +10,7 @@ import org.junit.jupiter.api.Test;
 import java.time.Duration;
 import java.util.List;
 import java.util.Optional;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -188,6 +189,121 @@ class ReliableEventSchedulerTest {
             assertThat(nextRound.await(5, TimeUnit.SECONDS)).isTrue();
             assertThat(scheduler.isRunning()).isTrue();
         } finally {
+            scheduler.stop();
+        }
+    }
+
+    @Test
+    void adaptivePollingScansAgainWhenBusyAndReturnsToIdleDelay() throws Exception {
+        JdbcExpiredLeaseRecovery recovery = mock(JdbcExpiredLeaseRecovery.class);
+        JdbcEventPublicationWorker worker = mock(JdbcEventPublicationWorker.class);
+        EventCandidate candidate = new EventCandidate(new EventId(10), 0);
+        List<Long> scanTimes = new CopyOnWriteArrayList<>();
+        CountDownLatch threeScans = new CountDownLatch(3);
+        when(worker.findDueEventCandidates(anyInt())).thenAnswer(invocation -> {
+            scanTimes.add(System.nanoTime());
+            threeScans.countDown();
+            return scanTimes.size() == 1 ? List.of(candidate) : List.of();
+        });
+        when(worker.claimCandidate(candidate)).thenReturn(Optional.empty());
+
+        ReliableEventScheduler scheduler = new ReliableEventScheduler(
+                recovery, worker, 1, 1, 0, Duration.ofMillis(600), Duration.ofSeconds(2),
+                true, Duration.ofMillis(50));
+        try {
+            scheduler.start();
+            assertThat(threeScans.await(3, TimeUnit.SECONDS)).isTrue();
+            long busyDelay = TimeUnit.NANOSECONDS.toMillis(scanTimes.get(1) - scanTimes.get(0));
+            long idleDelay = TimeUnit.NANOSECONDS.toMillis(scanTimes.get(2) - scanTimes.get(1));
+            assertThat(busyDelay).isLessThan(450);
+            assertThat(idleDelay).isGreaterThanOrEqualTo(500);
+        } finally {
+            scheduler.stop();
+        }
+    }
+
+    @Test
+    void adaptivePollingUsesRateLimitWhileWorkIsInFlight() throws Exception {
+        JdbcExpiredLeaseRecovery recovery = mock(JdbcExpiredLeaseRecovery.class);
+        JdbcEventPublicationWorker worker = mock(JdbcEventPublicationWorker.class);
+        EventCandidate candidate = new EventCandidate(new EventId(11), 0);
+        CountDownLatch release = new CountDownLatch(1);
+        CountDownLatch threeRecoveryScans = new CountDownLatch(3);
+        List<Long> scanTimes = new CopyOnWriteArrayList<>();
+        when(recovery.recoverExpiredLeases()).thenAnswer(invocation -> {
+            scanTimes.add(System.nanoTime());
+            threeRecoveryScans.countDown();
+            return 0;
+        });
+        when(worker.findDueEventCandidates(anyInt())).thenReturn(List.of(candidate));
+        when(worker.claimCandidate(candidate)).thenAnswer(invocation -> {
+            release.await(3, TimeUnit.SECONDS);
+            return Optional.empty();
+        });
+
+        ReliableEventScheduler scheduler = new ReliableEventScheduler(
+                recovery, worker, 1, 1, 0, Duration.ofSeconds(1), Duration.ofSeconds(2),
+                true, Duration.ofMillis(100));
+        try {
+            scheduler.start();
+            assertThat(threeRecoveryScans.await(3, TimeUnit.SECONDS)).isTrue();
+            assertThat(TimeUnit.NANOSECONDS.toMillis(scanTimes.get(1) - scanTimes.get(0)))
+                    .isGreaterThanOrEqualTo(90);
+            assertThat(TimeUnit.NANOSECONDS.toMillis(scanTimes.get(2) - scanTimes.get(1)))
+                    .isGreaterThanOrEqualTo(90);
+        } finally {
+            release.countDown();
+            scheduler.stop();
+        }
+    }
+
+    @Test
+    void adaptivePollingRefillsSoonAfterCapacityIsReleasedDuringAScan() throws Exception {
+        JdbcExpiredLeaseRecovery recovery = mock(JdbcExpiredLeaseRecovery.class);
+        JdbcEventPublicationWorker worker = mock(JdbcEventPublicationWorker.class);
+        EventCandidate candidate = new EventCandidate(new EventId(12), 0);
+        CountDownLatch claimStarted = new CountDownLatch(1);
+        CountDownLatch releaseClaim = new CountDownLatch(1);
+        CountDownLatch secondSnapshot = new CountDownLatch(1);
+        CountDownLatch finishSecondSnapshot = new CountDownLatch(1);
+        CountDownLatch thirdScan = new CountDownLatch(1);
+        AtomicInteger scans = new AtomicInteger();
+        AtomicInteger snapshots = new AtomicInteger();
+        when(recovery.recoverExpiredLeases()).thenAnswer(invocation -> {
+            if (scans.incrementAndGet() == 3) {
+                thirdScan.countDown();
+            }
+            return 0;
+        });
+        org.mockito.Mockito.doAnswer(invocation -> {
+            if (snapshots.incrementAndGet() == 2) {
+                secondSnapshot.countDown();
+                finishSecondSnapshot.await(3, TimeUnit.SECONDS);
+            }
+            return null;
+        }).when(recovery).refreshSnapshotAutomatically();
+        when(worker.findDueEventCandidates(anyInt())).thenReturn(List.of(candidate));
+        when(worker.claimCandidate(candidate)).thenAnswer(invocation -> {
+            claimStarted.countDown();
+            releaseClaim.await(3, TimeUnit.SECONDS);
+            return Optional.empty();
+        });
+
+        ReliableEventScheduler scheduler = new ReliableEventScheduler(
+                recovery, worker, 1, 1, 0, Duration.ofSeconds(1), Duration.ofSeconds(2),
+                true, Duration.ofMillis(50));
+        try {
+            scheduler.start();
+            assertThat(claimStarted.await(2, TimeUnit.SECONDS)).isTrue();
+            assertThat(secondSnapshot.await(2, TimeUnit.SECONDS)).isTrue();
+            releaseClaim.countDown();
+            await().atMost(Duration.ofSeconds(2))
+                    .untilAsserted(() -> assertThat(scheduler.outstandingCount()).isZero());
+            finishSecondSnapshot.countDown();
+            assertThat(thirdScan.await(500, TimeUnit.MILLISECONDS)).isTrue();
+        } finally {
+            releaseClaim.countDown();
+            finishSecondSnapshot.countDown();
             scheduler.stop();
         }
     }

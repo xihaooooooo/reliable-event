@@ -11,9 +11,13 @@ import dev.reliableevent.jdbc.internal.model.ClaimedEvent;
 import dev.reliableevent.jdbc.internal.model.EventCandidate;
 import dev.reliableevent.jdbc.internal.model.EventStatus;
 import dev.reliableevent.jdbc.internal.model.ExpiredLeaseCandidate;
+import dev.reliableevent.jdbc.internal.model.OutboxMetricsSnapshot;
 import dev.reliableevent.jdbc.internal.observation.PublicationObserver;
 import dev.reliableevent.internal.model.StoredEvent;
 import dev.reliableevent.jdbc.internal.persistence.JdbcOutboxRepository;
+import dev.reliableevent.jdbc.internal.tracing.RegistrationTracer;
+import dev.reliableevent.jdbc.internal.tracing.PublicationTracer;
+import dev.reliableevent.internal.publication.EventSendFailureType;
 import dev.reliableevent.internal.publication.EventSendException;
 import dev.reliableevent.internal.publication.EventSender;
 import dev.reliableevent.jdbc.internal.publication.JdbcEventPublicationWorker;
@@ -25,6 +29,8 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.springframework.boot.test.system.CapturedOutput;
 import org.springframework.boot.test.system.OutputCaptureExtension;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.core.io.ClassPathResource;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.SpringBootConfiguration;
@@ -46,11 +52,14 @@ import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
 
 import java.sql.Timestamp;
+import java.sql.Connection;
+import java.sql.Statement;
 import java.nio.charset.StandardCharsets;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneOffset;
+import java.util.TimeZone;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -80,6 +89,8 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
         "classpath:schema/clear-test-data.sql"
 })
 class ReliableEventIntegrationTest {
+
+    private static final Logger LOG = LoggerFactory.getLogger(ReliableEventIntegrationTest.class);
 
     private static final Instant NOW = Instant.parse("2026-09-21T00:00:00Z");
     private static final Clock CLOCK = Clock.fixed(NOW, ZoneOffset.UTC);
@@ -148,6 +159,134 @@ class ReliableEventIntegrationTest {
                 eventId.value()
         );
         assertThat(objectMapper.readTree(payload).path("taskId").asLong()).isEqualTo(102L);
+    }
+
+    @Test
+    void tracingHeadersCommitAndRollbackWithBusinessAndOutboxRows() throws Exception {
+        JdbcReliableEventPublisher tracedPublisher = new JdbcReliableEventPublisher(
+                jdbcTemplate, objectMapper, CLOCK, 8, tracingWith("traceparent", "00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb-01"));
+
+        EventId committed = inTransaction(() -> tracedPublisher.publish(event(1021L, NOW)));
+        String headers = jdbcTemplate.queryForObject(
+                "SELECT headers FROM reliable_event_outbox WHERE id = ?", String.class, committed.value());
+        assertThat(objectMapper.readTree(headers).path("traceparent").asText())
+                .isEqualTo("00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb-01");
+
+        assertThatThrownBy(() -> inTransaction(() -> {
+            insertBusinessRecord(1022L);
+            tracedPublisher.publish(event(1022L, NOW));
+            throw new IntentionalRollbackException();
+        })).isInstanceOf(IntentionalRollbackException.class);
+
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM reliable_event_identity WHERE event_key = ?", Long.class, "1022"))
+                .isZero();
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM reliable_event_outbox WHERE event_key = ?", Long.class, "1022"))
+                .isZero();
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM test_business_record WHERE id = ?", Long.class, 1022L))
+                .isZero();
+    }
+
+    @Test
+    void publicationAttemptUsesPerAttemptHeaderCopyAndLeavesPersistedHeadersUnchanged() throws Exception {
+        String registrationTraceparent = "00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb-01";
+        EventId eventId = inTransaction(() -> publisher.publish(new ReliableEvent<>(
+                "coupon-task-execute", "m8.2-headers", new CouponTaskPayload(1023L), NOW,
+                Map.of("source", "m8.2", "traceparent", registrationTraceparent))));
+        List<StoredEvent> sentEvents = new ArrayList<>();
+        List<String> traceResults = new ArrayList<>();
+        int[] attemptNumber = {0};
+        PublicationTracer tracing = claimed -> {
+            try {
+                int thisAttempt = ++attemptNumber[0];
+                Map<String, String> headers = new java.util.LinkedHashMap<>(objectMapper.readValue(
+                        claimed.event().headersJson(), objectMapper.getTypeFactory()
+                                .constructMapType(Map.class, String.class, String.class)));
+                String spanId = String.format("%016x", thisAttempt);
+                headers.put("traceparent", "00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-" + spanId + "-01");
+                StoredEvent copy = new StoredEvent(claimed.event().id(), claimed.event().eventType(),
+                        claimed.event().eventKey(), claimed.event().payloadJson(),
+                        objectMapper.writeValueAsString(headers));
+                return new PublicationTracer.Attempt() {
+                    @Override public StoredEvent eventForSend() { return copy; }
+                    @Override public void sendSucceeded(SendReceipt receipt) { traceResults.add("send:success"); }
+                    @Override public void sendFailed(EventSendFailureType type, Throwable failure) {
+                        traceResults.add("send:" + type.name());
+                    }
+                    @Override public void stateUpdated(String targetStatus, boolean commitPending) {
+                        traceResults.add("state:" + targetStatus);
+                    }
+                    @Override public void stateUpdateFailed(String targetStatus, Throwable failure,
+                                                            boolean ownershipRejected) {
+                        traceResults.add("state:" + (ownershipRejected ? "ownership_rejected" : "failed"));
+                    }
+                    @Override public void close() { traceResults.add("close:" + thisAttempt); }
+                };
+            } catch (Exception failure) {
+                throw new AssertionError(failure);
+            }
+        };
+        EventSender sender = sent -> {
+            sentEvents.add(sent);
+            if (sentEvents.size() == 1) throw EventSendException.resultUnknown("receipt lost");
+            return new SendReceipt("m8.2-message-2");
+        };
+        JdbcEventPublicationWorker worker = new JdbcEventPublicationWorker(jdbcTemplate,
+                transactionManager, sender, CLOCK, 10, WORKER_ID, LEASE_DURATION,
+                deterministicBackoff(), PublicationObserver.NOOP, tracing);
+
+        assertThat(worker.publishDueEvents()).isZero();
+        jdbcTemplate.update("UPDATE reliable_event_outbox SET next_attempt_at = ? WHERE id = ?",
+                Timestamp.from(NOW.minusSeconds(1)), eventId.value());
+        assertThat(worker.publishDueEvents()).isOne();
+
+        String persistedHeaders = jdbcTemplate.queryForObject(
+                "SELECT headers FROM reliable_event_outbox WHERE id = ?", String.class, eventId.value());
+        assertThat(objectMapper.readTree(persistedHeaders).path("traceparent").asText())
+                .isEqualTo(registrationTraceparent);
+        assertThat(sentEvents).hasSize(2);
+        List<String> sentSpanIds = sentEvents.stream().map(sent -> {
+            try { return objectMapper.readTree(sent.headersJson()).path("traceparent").asText().substring(36, 52); }
+            catch (Exception failure) { throw new AssertionError(failure); }
+        }).toList();
+        assertThat(sentSpanIds).containsExactly("0000000000000001", "0000000000000002");
+        assertThat(traceResults).contains("send:RESULT_UNKNOWN", "state:RETRY_WAIT", "send:success", "state:PUBLISHED");
+        assertThat(attemptNumber[0]).isEqualTo(2);
+
+        EventCandidate staleCandidate = new EventCandidate(eventId, 0);
+        assertThat(worker.publishCandidate(staleCandidate)).isFalse();
+        assertThat(attemptNumber[0]).isEqualTo(2);
+    }
+
+    @Test
+    void repeatedRegistrationDoesNotReplacePersistedTraceContext() throws Exception {
+        JdbcReliableEventPublisher firstContext = new JdbcReliableEventPublisher(
+                jdbcTemplate, objectMapper, CLOCK, 8, tracingWith("traceparent", "00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb-01"));
+        JdbcReliableEventPublisher laterContext = new JdbcReliableEventPublisher(
+                jdbcTemplate, objectMapper, CLOCK, 8, tracingWith("traceparent", "00-cccccccccccccccccccccccccccccccc-dddddddddddddddd-01"));
+
+        EventId first = inTransaction(() -> firstContext.publish(event(1023L, NOW)));
+        EventId repeated = inTransaction(() -> laterContext.publish(event(1023L, NOW.plusSeconds(90))));
+        assertThat(repeated).isEqualTo(first);
+        String headers = jdbcTemplate.queryForObject(
+                "SELECT headers FROM reliable_event_outbox WHERE id = ?", String.class, first.value());
+        assertThat(objectMapper.readTree(headers).path("traceparent").asText())
+                .isEqualTo("00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb-01");
+    }
+
+    private RegistrationTracer tracingWith(String key, String value) {
+        return headers -> new RegistrationTracer.Registration() {
+            @Override public Map<String, String> headers() {
+                Map<String, String> copy = new java.util.LinkedHashMap<>(headers);
+                copy.put(key, value);
+                return Map.copyOf(copy);
+            }
+            @Override public void succeeded(EventId eventId) { }
+            @Override public void failed(Throwable failure) { }
+            @Override public void close() { }
+        };
     }
 
     @Test
@@ -441,6 +580,222 @@ class ReliableEventIntegrationTest {
         ClaimedEvent claimed = inTransaction(() -> repository.claim(due,
                 firstAvailable.plusSeconds(31), WORKER_ID, LEASE_DURATION).orElseThrow());
         assertThat(claimed.firstAvailableAt()).isEqualTo(firstAvailable);
+    }
+
+    @Test
+    void metricsSnapshotUsesOneDatabaseClockAndKeepsFirstAvailabilityAcrossStateChanges() {
+        List<EventId> ids = new ArrayList<>();
+        for (long taskId = 2000; taskId < 2008; taskId++) {
+            long currentTaskId = taskId;
+            ids.add(inTransaction(() -> publisher.publish(
+                    event(currentTaskId, Instant.now().minusSeconds(600)))));
+        }
+        jdbcTemplate.update("UPDATE reliable_event_outbox SET next_attempt_at=UTC_TIMESTAMP(3)-INTERVAL 120 SECOND, "
+                + "first_available_at=UTC_TIMESTAMP(3)-INTERVAL 300 SECOND WHERE id=?", ids.get(0).value());
+        jdbcTemplate.update("UPDATE reliable_event_outbox SET next_attempt_at=UTC_TIMESTAMP(3)-INTERVAL 120 SECOND, "
+                + "first_available_at=NULL WHERE id=?", ids.get(1).value());
+        jdbcTemplate.update("UPDATE reliable_event_outbox SET next_attempt_at=UTC_TIMESTAMP(3)+INTERVAL 1 HOUR, "
+                + "first_available_at=UTC_TIMESTAMP(3)-INTERVAL 120 SECOND WHERE id=?", ids.get(2).value());
+        jdbcTemplate.update("UPDATE reliable_event_outbox SET status=?, "
+                + "first_available_at=UTC_TIMESTAMP(3)-INTERVAL 180 SECOND WHERE id=?",
+                EventStatus.PUBLISHING.code(), ids.get(3).value());
+        jdbcTemplate.update("UPDATE reliable_event_outbox SET status=?, "
+                + "next_attempt_at=UTC_TIMESTAMP(3)+INTERVAL 1 HOUR, "
+                + "first_available_at=UTC_TIMESTAMP(3)-INTERVAL 240 SECOND WHERE id=?",
+                EventStatus.RETRY_WAIT.code(), ids.get(4).value());
+        jdbcTemplate.update("UPDATE reliable_event_outbox SET next_attempt_at=UTC_TIMESTAMP(3)+INTERVAL 1 HOUR, "
+                + "first_available_at=UTC_TIMESTAMP(3)+INTERVAL 10 MINUTE WHERE id=?", ids.get(5).value());
+        jdbcTemplate.update("UPDATE reliable_event_outbox SET status=?, "
+                + "next_attempt_at=UTC_TIMESTAMP(3)-INTERVAL 1 SECOND, first_available_at=NULL WHERE id=?",
+                EventStatus.RETRY_WAIT.code(), ids.get(6).value());
+        jdbcTemplate.update("UPDATE reliable_event_outbox SET status=?, "
+                + "first_available_at=UTC_TIMESTAMP(3)-INTERVAL 1 HOUR WHERE id=?",
+                EventStatus.DEAD.code(), ids.get(7).value());
+
+        OutboxMetricsSnapshot pending = repository.readMetricsSnapshot(2);
+        assertThat(pending.backlog()).isEqualTo(6);
+        assertThat(pending.dead()).isOne();
+        assertThat(pending.ready()).isEqualTo(3);
+        assertThat(pending.readyOldestAgeSeconds()).isBetween(295.0, 315.0);
+        assertThat(pending.unfinishedOverdue()).isEqualTo(4);
+        assertThat(pending.unfinishedOldestAgeSeconds()).isBetween(295.0, 315.0);
+        assertThat(pending.unfinishedTimestampMissing()).isEqualTo(2);
+        Timestamp originalFirstAvailable = jdbcTemplate.queryForObject(
+                "SELECT first_available_at FROM reliable_event_outbox WHERE id=?", Timestamp.class, ids.get(0).value());
+
+        jdbcTemplate.update("UPDATE reliable_event_outbox SET status=? WHERE id=?",
+                EventStatus.PUBLISHING.code(), ids.get(0).value());
+        OutboxMetricsSnapshot publishing = repository.readMetricsSnapshot(2);
+        assertThat(publishing.ready()).isEqualTo(2);
+        assertThat(publishing.unfinishedOverdue()).isEqualTo(4);
+        assertThat(publishing.unfinishedOldestAgeSeconds()).isBetween(295.0, 315.0);
+        assertThat(jdbcTemplate.queryForObject("SELECT first_available_at FROM reliable_event_outbox WHERE id=?",
+                Timestamp.class, ids.get(0).value())).isEqualTo(originalFirstAvailable);
+
+        jdbcTemplate.update("UPDATE reliable_event_outbox SET status=?, "
+                + "next_attempt_at=UTC_TIMESTAMP(3)+INTERVAL 20 MINUTE WHERE id=?",
+                EventStatus.RETRY_WAIT.code(), ids.get(0).value());
+        OutboxMetricsSnapshot retryWait = repository.readMetricsSnapshot(2);
+        assertThat(retryWait.ready()).isEqualTo(2);
+        assertThat(retryWait.unfinishedOverdue()).isEqualTo(4);
+        assertThat(retryWait.unfinishedOldestAgeSeconds()).isBetween(295.0, 315.0);
+        assertThat(jdbcTemplate.queryForObject("SELECT first_available_at FROM reliable_event_outbox WHERE id=?",
+                Timestamp.class, ids.get(0).value())).isEqualTo(originalFirstAvailable);
+
+        jdbcTemplate.update("UPDATE reliable_event_outbox SET status=? WHERE id=?",
+                EventStatus.PUBLISHED.code(), ids.get(0).value());
+        OutboxMetricsSnapshot published = repository.readMetricsSnapshot(2);
+        assertThat(published.unfinishedOverdue()).isEqualTo(3);
+        assertThat(published.unfinishedOldestAgeSeconds()).isBetween(235.0, 255.0);
+
+        jdbcTemplate.update("UPDATE reliable_event_outbox SET status=? WHERE id=?",
+                EventStatus.DEAD.code(), ids.get(3).value());
+        assertThat(repository.readMetricsSnapshot(2).unfinishedOverdue()).isEqualTo(2);
+    }
+
+    @Test
+    void metricsSnapshotDistinguishesAllMissingReadyAgeFromNoReadyRows() {
+        EventId missing = inTransaction(() -> publisher.publish(event(2100, Instant.now().minusSeconds(60))));
+        EventId future = inTransaction(() -> publisher.publish(event(2101, Instant.now().plusSeconds(600))));
+        jdbcTemplate.update("UPDATE reliable_event_outbox SET next_attempt_at=UTC_TIMESTAMP(3)-INTERVAL 1 SECOND, "
+                + "first_available_at=NULL WHERE id=?", missing.value());
+        jdbcTemplate.update("UPDATE reliable_event_outbox SET next_attempt_at=UTC_TIMESTAMP(3)+INTERVAL 10 MINUTE, "
+                + "first_available_at=UTC_TIMESTAMP(3)+INTERVAL 10 MINUTE WHERE id=?", future.value());
+
+        TimeZone previousZone = TimeZone.getDefault();
+        OutboxMetricsSnapshot onlyMissingReady;
+        try {
+            TimeZone.setDefault(TimeZone.getTimeZone("Asia/Tokyo"));
+            onlyMissingReady = repository.readMetricsSnapshot(2);
+        } finally {
+            TimeZone.setDefault(previousZone);
+        }
+        assertThat(onlyMissingReady.ready()).isOne();
+        assertThat(onlyMissingReady.readyOldestAgeSeconds()).isNaN();
+        assertThat(onlyMissingReady.unfinishedOverdue()).isZero();
+        assertThat(onlyMissingReady.unfinishedTimestampMissing()).isOne();
+
+        jdbcTemplate.update("UPDATE reliable_event_outbox SET status=? WHERE id=?",
+                EventStatus.PUBLISHED.code(), missing.value());
+        OutboxMetricsSnapshot noneReady = repository.readMetricsSnapshot(2);
+        assertThat(noneReady.ready()).isZero();
+        assertThat(noneReady.readyOldestAgeSeconds()).isZero();
+        assertThat(noneReady.unfinishedOverdue()).isZero();
+        assertThat(noneReady.unfinishedTimestampMissing()).isZero();
+    }
+
+    @Test
+    void metricsSnapshotExplainUsesExistingOutboxSchemaWithoutAddingAnIndex() {
+        String aggregate = """
+                SELECT COALESCE(SUM(status IN (0, 3)), 0) AS backlog,
+                       COALESCE(SUM(status = 4), 0) AS dead,
+                       COALESCE(SUM(status IN (0, 3) AND next_attempt_at <= UTC_TIMESTAMP(3)), 0) AS ready,
+                       MIN(CASE WHEN status IN (0, 3) AND next_attempt_at <= UTC_TIMESTAMP(3)
+                                THEN first_available_at END) AS ready_oldest,
+                       COALESCE(SUM(status IN (0, 1, 3) AND first_available_at <= UTC_TIMESTAMP(3)), 0) AS overdue,
+                       MIN(CASE WHEN status IN (0, 1, 3) AND first_available_at <= UTC_TIMESTAMP(3)
+                                THEN first_available_at END) AS overdue_oldest,
+                       COALESCE(SUM(status IN (0, 1, 3) AND first_available_at IS NULL), 0) AS missing
+                FROM reliable_event_outbox
+                """;
+        Map<String, Object> plan = jdbcTemplate.queryForMap("EXPLAIN " + aggregate);
+        List<String> indexes = jdbcTemplate.queryForList("""
+                SELECT DISTINCT INDEX_NAME FROM INFORMATION_SCHEMA.STATISTICS
+                WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'reliable_event_outbox'
+                ORDER BY INDEX_NAME
+                """, String.class);
+
+        LOG.info("M8.3 snapshot EXPLAIN: type={}, key={}, rows={}, extra={}, indexes={}",
+                plan.get("type"), plan.get("key"), plan.get("rows"), plan.get("Extra"), indexes);
+        assertThat(indexes).contains("idx_publish_scan", "idx_lease_recovery", "idx_dead_list",
+                "idx_published_retention");
+        assertThat(plan.get("type")).isEqualTo("ALL");
+    }
+
+    @Test
+    void metricsSnapshotStatementTimeoutInterruptsARealBlockedMysqlQuery() throws Exception {
+        try (Connection blocker = jdbcTemplate.getDataSource().getConnection();
+             Statement lock = blocker.createStatement()) {
+            lock.execute("LOCK TABLES reliable_event_outbox WRITE");
+            long started = System.nanoTime();
+            try {
+                assertThatThrownBy(() -> repository.readMetricsSnapshot(1))
+                        .isInstanceOf(org.springframework.jdbc.CannotGetJdbcConnectionException.class);
+                long elapsedMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started);
+                assertThat(elapsedMillis).isBetween(750L, 5000L);
+            } finally {
+                lock.execute("UNLOCK TABLES");
+            }
+        }
+    }
+
+    @Test
+    void publicationAndDeadMetricsAdvanceOnlyAfterTheOwningTransactionCommits() {
+        AtomicInteger persisted = new AtomicInteger();
+        AtomicInteger dead = new AtomicInteger();
+        PublicationObserver observer = new PublicationObserver() {
+            @Override public void stateTransitionCommitted(String status) {
+                if ("PUBLISHED".equals(status)) persisted.incrementAndGet();
+                if ("DEAD".equals(status)) dead.incrementAndGet();
+            }
+        };
+
+        ClaimedEvent published = claimedPublishedEvent(2200L);
+        new TransactionTemplate(transactionManager).execute(status -> {
+            assertThat(worker(event -> new SendReceipt("persisted"), observer)
+                    .publishClaimedEvent(published)).isTrue();
+            assertThat(persisted).hasValue(0);
+            return null;
+        });
+        assertThat(persisted).hasValue(1);
+
+        ClaimedEvent rolledBackPublish = claimedPublishedEvent(2201L);
+        new TransactionTemplate(transactionManager).execute(status -> {
+            assertThat(worker(event -> new SendReceipt("rolled-back"), observer)
+                    .publishClaimedEvent(rolledBackPublish)).isTrue();
+            status.setRollbackOnly();
+            return null;
+        });
+        assertThat(persisted).hasValue(1);
+        assertThat(statusOf(rolledBackPublish.event().id())).isEqualTo(EventStatus.PUBLISHING.code());
+
+        ClaimedEvent deadEvent = claimedPublishedEvent(2202L);
+        new TransactionTemplate(transactionManager).execute(status -> {
+            assertThat(worker(event -> { throw EventSendException.nonRetryable("invalid"); }, observer)
+                    .publishClaimedEvent(deadEvent)).isFalse();
+            assertThat(dead).hasValue(0);
+            return null;
+        });
+        assertThat(dead).hasValue(1);
+
+        ClaimedEvent rolledBackDead = claimedPublishedEvent(2203L);
+        new TransactionTemplate(transactionManager).execute(status -> {
+            assertThat(worker(event -> { throw EventSendException.nonRetryable("invalid"); }, observer)
+                    .publishClaimedEvent(rolledBackDead)).isFalse();
+            status.setRollbackOnly();
+            return null;
+        });
+        assertThat(dead).hasValue(1);
+        assertThat(statusOf(rolledBackDead.event().id())).isEqualTo(EventStatus.PUBLISHING.code());
+
+        ExpiredLeaseCandidate recoveredDead = expiredDeadCandidate(2204L);
+        JdbcExpiredLeaseRecovery recovery = new JdbcExpiredLeaseRecovery(jdbcTemplate, transactionManager,
+                100, deterministicBackoff(), observer);
+        new TransactionTemplate(transactionManager).execute(status -> {
+            assertThat(recovery.recoverCandidates(List.of(recoveredDead))).isOne();
+            assertThat(dead).hasValue(1);
+            return null;
+        });
+        assertThat(dead).hasValue(2);
+
+        ExpiredLeaseCandidate rolledBackRecovery = expiredDeadCandidate(2205L);
+        new TransactionTemplate(transactionManager).execute(status -> {
+            assertThat(recovery.recoverCandidates(List.of(rolledBackRecovery))).isOne();
+            status.setRollbackOnly();
+            return null;
+        });
+        assertThat(dead).hasValue(2);
+        assertThat(statusOf(rolledBackRecovery.id())).isEqualTo(EventStatus.PUBLISHING.code());
     }
 
     @Test
@@ -1592,6 +1947,12 @@ class ReliableEventIntegrationTest {
         return worker(sender, WORKER_ID);
     }
 
+    private JdbcEventPublicationWorker worker(EventSender sender, PublicationObserver observer) {
+        return new JdbcEventPublicationWorker(
+                jdbcTemplate, transactionManager, sender, CLOCK, 50, WORKER_ID,
+                LEASE_DURATION, deterministicBackoff(), observer, PublicationTracer.NOOP);
+    }
+
     private JdbcEventPublicationWorker worker(EventSender sender, String workerId) {
         return new JdbcEventPublicationWorker(
                 jdbcTemplate,
@@ -1647,6 +2008,24 @@ class ReliableEventIntegrationTest {
             String workerId
     ) {
         return repository.claim(candidate, NOW, workerId, LEASE_DURATION);
+    }
+
+    private ClaimedEvent claimedPublishedEvent(long taskId) {
+        EventId eventId = inTransaction(() -> publisher.publish(event(taskId, NOW)));
+        EventCandidate candidate = repository.findDueEventCandidates(NOW, 100).stream()
+                .filter(current -> current.id().equals(eventId)).findFirst().orElseThrow();
+        return inTransaction(() -> claim(candidate, WORKER_ID).orElseThrow());
+    }
+
+    private ExpiredLeaseCandidate expiredDeadCandidate(long taskId) {
+        EventId eventId = inTransaction(() -> publisher.publish(event(taskId, NOW)));
+        jdbcTemplate.update("UPDATE reliable_event_outbox SET max_attempts=1 WHERE id=?", eventId.value());
+        EventCandidate candidate = repository.findDueEventCandidates(NOW, 100).stream()
+                .filter(current -> current.id().equals(eventId)).findFirst().orElseThrow();
+        inTransaction(() -> claim(candidate, WORKER_ID).orElseThrow());
+        expireLease(eventId, 1);
+        return repository.findExpiredLeaseCandidates(100).stream()
+                .filter(current -> current.id().equals(eventId)).findFirst().orElseThrow();
     }
 
     private ExpiredLeaseCandidate expiredLeaseCandidate(long taskId) {

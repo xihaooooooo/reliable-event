@@ -1,0 +1,15 @@
+# M8.5 实施进度
+
+日期：2026-10-03（Asia/Shanghai）
+
+状态：历史实施记录，已由 [M8.5 完成记录](M8_5_COMPLETED.md)取代。此文件保留实现过程和失败尝试；M8.5 已完成，M8.6 尚未开始。
+
+已完成的实现包括独立 `observability/` Compose、Prometheus 抓取目标与规则、Alertmanager 仅发往宿主本地 receiver 的示例路由、Tempo OTLP listener、Grafana provisioning 与 14 个运维面板、启动/停止/规则验证/平台验收 PowerShell 脚本和处置说明。示例通过 Maven `observability` profile 可选地加入 Prometheus Registry 与 OTLP exporter；基础 `application.yml` 显式关闭 OTLP export，只有 `application-observability.yml` 开启并复用 Spring Boot 管理的 tracing SDK。Starter 仍不强制 exporter，也没有新增第二套追踪 SDK 或业务实现。端口、tag 和部署标签见[运行指南](../../observability/README.md)。
+
+Prometheus 告警规则使用实际 `MicrometerPublicationObserver` scrape 名称。官方 Prometheus v3.14.0 镜像内的 `promtool` 对 Prometheus config、规则和规则测试分别检查通过，规则包含 16 项（4 条 recording rule、12 条 alert）和 20 个覆盖场景。初次失败和后续成功的原始日志、退出码分别见[第一次规则尝试](/D:/trae/scp/reliable-event/target/evidence/m8.5-promtool-20261002-233537-172df66a/all-commands.log)与[成功的三项检查汇总](/D:/trae/scp/reliable-event/target/evidence/m8.5-promtool-20261002-233836-5446765e/all-commands.log)，成功输出还分别保留在该目录的 config/rules/test 日志及 exit-code 文件。这些是规则单测，不等于真实平台故障演练。
+
+Java 17 下全仓 `mvn -Dmaven.repo.local=C:\Users\20659\.m2\repository -Pobservability clean verify` 通过，8 个模块成功，34 份 Surefire XML 共 204 项，0 失败、0 错误、0 跳过；所有测试运行于 Java 17。完整日志与退出码见[全仓 clean verify 原始日志](/D:/trae/scp/reliable-event/target/evidence/m8.5-full-clean-verify-20261002-232910.log)和[退出码](/D:/trae/scp/reliable-event/target/evidence/m8.5-full-clean-verify-20261002-232910.exit-code.txt)。clean 前 48 项 M8.1–M8.4 与 M8.5 证据已复制备份后恢复；恢复后历史记录仍在 `target/evidence/`。
+
+宿主本地 receiver 已在空闲的 19080 端口完成真实 HTTP 往返：隐藏启动并核对本次 listener PID，使用 proxy-bypass 的 IPv4 loopback POST Alertmanager webhook 对象，再 GET 检查 `payload.status`、`payload.alerts[0].status` 和唯一 alertname；HTTP 均为 200。请求、响应、摘要和退出码见[本地测试摘要](/D:/trae/scp/reliable-event/target/evidence/m8.5-receiver-local-webhook-20261002-234152.log)、[请求](/D:/trae/scp/reliable-event/target/evidence/m8.5-receiver-local-webhook-20261002-234152.request.json)、[GET记录](/D:/trae/scp/reliable-event/target/evidence/m8.5-receiver-local-webhook-20261002-234152.response.jsonl)和[退出码](/D:/trae/scp/reliable-event/target/evidence/m8.5-receiver-local-webhook-20261002-234152.exit-code.txt)。最初选择的 9080 实际由宿主 `NahimicService.exe` 占用；未停止该系统服务，已将 Alertmanager route、脚本和指南改为 19080。初次 19080 断言发现 Windows PowerShell 的根数组处理改变形状；失败记录保留在[首次 roundtrip 断言日志](/D:/trae/scp/reliable-event/target/evidence/m8.5-receiver-local-test-20261002-233527.log)。当前 receiver 用 PowerShell 7 解析/压缩完整 webhook，并为每次进程启动写入独立 JSONL；旧多行记录继续保留在旧文件，不会影响后续逐行解析。容器到宿主的 Alertmanager 真实联调已通过：唯一告警名 `M85ReceiverAcceptance-20261003-002347` 的 firing 与 resolved 均到达 receiver，当前 session 的两个记录逐行 JSON 解析成功；见[验收日志](/D:/trae/scp/reliable-event/target/evidence/m8.5-alertmanager-check4-20261003-002346.log)、[本次 receiver 记录](/D:/trae/scp/reliable-event/target/evidence/m8.5-alert-receiver-20261003-002331.jsonl)和[请求及状态证据目录](/D:/trae/scp/reliable-event/target/evidence/m8.5-alertmanager-live2-20261003-002347)。
+
+该阶段的未完成状态和早期失败尝试保留为历史记录；Grafana 与真实平台验收现已完成，结论及最新证据见 [M8.5 完成记录](M8_5_COMPLETED.md)。此前 Docker Hub EOF 和 Grafana 尚未就绪的原始日志继续保留在 target/evidence，失败记录不代表最终验收结果。M8.6 仍待实施。

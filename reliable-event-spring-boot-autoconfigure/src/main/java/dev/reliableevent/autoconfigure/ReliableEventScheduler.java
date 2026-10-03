@@ -4,11 +4,13 @@ import dev.reliableevent.jdbc.internal.model.ClaimedEvent;
 import dev.reliableevent.jdbc.internal.model.EventCandidate;
 import dev.reliableevent.jdbc.internal.publication.JdbcEventPublicationWorker;
 import dev.reliableevent.jdbc.internal.recovery.JdbcExpiredLeaseRecovery;
+import dev.reliableevent.jdbc.internal.observation.PublicationObserver;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.context.SmartLifecycle;
 
 import java.time.Duration;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
@@ -37,8 +39,11 @@ public final class ReliableEventScheduler implements SmartLifecycle {
 
     private final JdbcExpiredLeaseRecovery recovery;
     private final JdbcEventPublicationWorker worker;
+    private final PublicationObserver observer;
     private final int claimBatchSize;
     private final long pollIntervalMillis;
+    private final boolean adaptivePollingEnabled;
+    private final long activePollIntervalMillis;
     private final long shutdownTimeoutNanos;
     private final Semaphore slots;
     private final Set<Long> outstandingIds = ConcurrentHashMap.newKeySet();
@@ -60,7 +65,7 @@ public final class ReliableEventScheduler implements SmartLifecycle {
             Duration pollInterval
     ) {
         this(recovery, worker, claimBatchSize, workerThreads, workerQueueCapacity,
-                pollInterval, Duration.ofSeconds(20));
+                pollInterval, Duration.ofSeconds(20), false, Duration.ofMillis(100), PublicationObserver.NOOP);
     }
 
     public ReliableEventScheduler(
@@ -72,8 +77,40 @@ public final class ReliableEventScheduler implements SmartLifecycle {
             Duration pollInterval,
             Duration shutdownTimeout
     ) {
+        this(recovery, worker, claimBatchSize, workerThreads, workerQueueCapacity,
+                pollInterval, shutdownTimeout, false, Duration.ofMillis(100), PublicationObserver.NOOP);
+    }
+
+    public ReliableEventScheduler(
+            JdbcExpiredLeaseRecovery recovery,
+            JdbcEventPublicationWorker worker,
+            int claimBatchSize,
+            int workerThreads,
+            int workerQueueCapacity,
+            Duration pollInterval,
+            Duration shutdownTimeout,
+            boolean adaptivePollingEnabled,
+            Duration activePollInterval
+    ) {
+        this(recovery, worker, claimBatchSize, workerThreads, workerQueueCapacity, pollInterval,
+                shutdownTimeout, adaptivePollingEnabled, activePollInterval, PublicationObserver.NOOP);
+    }
+
+    public ReliableEventScheduler(
+            JdbcExpiredLeaseRecovery recovery,
+            JdbcEventPublicationWorker worker,
+            int claimBatchSize,
+            int workerThreads,
+            int workerQueueCapacity,
+            Duration pollInterval,
+            Duration shutdownTimeout,
+            boolean adaptivePollingEnabled,
+            Duration activePollInterval,
+            PublicationObserver observer
+    ) {
         this.recovery = Objects.requireNonNull(recovery, "recovery must not be null");
         this.worker = Objects.requireNonNull(worker, "worker must not be null");
+        this.observer = Objects.requireNonNull(observer, "observer must not be null");
         if (claimBatchSize <= 0 || workerThreads <= 0 || workerQueueCapacity < 0) {
             throw new IllegalArgumentException("Batch size and worker threads must be positive; queue capacity must not be negative");
         }
@@ -82,6 +119,12 @@ public final class ReliableEventScheduler implements SmartLifecycle {
         this.pollIntervalMillis = pollInterval.toMillis();
         if (pollIntervalMillis <= 0) {
             throw new IllegalArgumentException("pollInterval must be at least one millisecond");
+        }
+        this.adaptivePollingEnabled = adaptivePollingEnabled;
+        Objects.requireNonNull(activePollInterval, "activePollInterval must not be null");
+        this.activePollIntervalMillis = activePollInterval.toMillis();
+        if (activePollIntervalMillis <= 0) {
+            throw new IllegalArgumentException("activePollInterval must be at least one millisecond");
         }
         Objects.requireNonNull(shutdownTimeout, "shutdownTimeout must not be null");
         if (shutdownTimeout.toMillis() <= 0) {
@@ -98,22 +141,45 @@ public final class ReliableEventScheduler implements SmartLifecycle {
                 workerThreads, workerThreads, 0L, TimeUnit.MILLISECONDS, queue,
                 namedDaemonThreads("reliable-event-send"), new ThreadPoolExecutor.AbortPolicy()
         );
+        observe(() -> observer.schedulerState(true, false));
     }
 
     /** Executes one recovery and dispatch pass without waiting for submitted sends. */
     AsyncPublicationCycleResult dispatchOnce() {
+        return dispatchOnce(false);
+    }
+
+    private AsyncPublicationCycleResult dispatchOnceAutomatically() {
+        return dispatchOnce(true);
+    }
+
+    private AsyncPublicationCycleResult dispatchOnce(boolean automatic) {
         if (stopped.get()) {
             return new AsyncPublicationCycleResult(0, 0);
         }
+        boolean succeeded = false;
         try {
-            return dispatchAndRefresh();
+            AsyncPublicationCycleResult result = dispatchAndRefresh(automatic);
+            succeeded = true;
+            return result;
         } finally {
-            recovery.refreshSnapshot();
+            if (automatic) {
+                recovery.refreshSnapshotAutomatically();
+                if (succeeded) observe(() -> observer.schedulerCycleCompleted(true, Instant.now().getEpochSecond()));
+            } else {
+                recovery.refreshSnapshot();
+            }
         }
     }
 
-    private AsyncPublicationCycleResult dispatchAndRefresh() {
-        int recoveredCount = recovery.recoverExpiredLeases();
+    private AsyncPublicationCycleResult dispatchAndRefresh(boolean automatic) {
+        int recoveredCount;
+        try {
+            recoveredCount = recovery.recoverExpiredLeases();
+        } catch (RuntimeException failure) {
+            observe(() -> observer.schedulerCycleFailed(automatic, "lease_recovery"));
+            throw failure;
+        }
         int dispatchLimit = Math.min(claimBatchSize, slots.availablePermits());
         if (dispatchLimit == 0 || stopped.get()) {
             return new AsyncPublicationCycleResult(recoveredCount, 0);
@@ -121,7 +187,13 @@ public final class ReliableEventScheduler implements SmartLifecycle {
 
         int queryLimit = (int) Math.min(Integer.MAX_VALUE,
                 (long) dispatchLimit + outstandingIds.size());
-        List<EventCandidate> candidates = worker.findDueEventCandidates(queryLimit);
+        List<EventCandidate> candidates;
+        try {
+            candidates = worker.findDueEventCandidates(queryLimit);
+        } catch (RuntimeException failure) {
+            observe(() -> observer.schedulerCycleFailed(automatic, "candidate_scan"));
+            throw failure;
+        }
         int submittedCount = 0;
         for (EventCandidate candidate : candidates) {
             if (submittedCount == dispatchLimit || stopped.get()) {
@@ -135,8 +207,9 @@ public final class ReliableEventScheduler implements SmartLifecycle {
                 slots.release();
                 continue;
             }
-            CandidateTask task = new CandidateTask(candidate);
+            CandidateTask task = new CandidateTask(candidate, automatic);
             try {
+                task.markQueued();
                 synchronized (lifecycleMonitor) {
                     if (stopped.get()) {
                         task.release();
@@ -152,6 +225,7 @@ public final class ReliableEventScheduler implements SmartLifecycle {
                 }
                 break;
             } catch (RuntimeException exception) {
+                observe(() -> observer.schedulerCycleFailed(automatic, "dispatch"));
                 task.release();
                 throw exception;
             }
@@ -164,11 +238,31 @@ public final class ReliableEventScheduler implements SmartLifecycle {
     }
 
     private void runSafely() {
+        long nextDelay = pollIntervalMillis;
+        boolean hadInFlight = adaptivePollingEnabled && outstandingCount() > 0;
         try {
-            dispatchOnce();
+            AsyncPublicationCycleResult result = dispatchOnceAutomatically();
+            if (adaptivePollingEnabled
+                    && (result.submittedCount() > 0 || hadInFlight || outstandingCount() > 0)) {
+                nextDelay = activePollIntervalMillis;
+            }
         } catch (RuntimeException exception) {
             LOG.error("event=reliable_event.scheduler.failed exceptionType={}",
                     exception.getClass().getName());
+        } finally {
+            if (adaptivePollingEnabled && !stopped.get()) {
+                try {
+                    scanner.schedule(this::runSafely, nextDelay, TimeUnit.MILLISECONDS);
+                } catch (RejectedExecutionException exception) {
+                    if (!stopped.get()) {
+                        observe(() -> observer.schedulerCycleFailed(true, "reschedule"));
+                        running = false;
+                        observe(() -> observer.schedulerState(true, false));
+                        LOG.error("event=reliable_event.scheduler.reschedule_failed exceptionType={}",
+                                exception.getClass().getName());
+                    }
+                }
+            }
         }
     }
 
@@ -181,8 +275,13 @@ public final class ReliableEventScheduler implements SmartLifecycle {
             if (stopped.get()) {
                 throw new IllegalStateException("Reliable event scheduler cannot restart after stop");
             }
-            scanner.scheduleWithFixedDelay(this::runSafely, 0, pollIntervalMillis, TimeUnit.MILLISECONDS);
+            if (adaptivePollingEnabled) {
+                scanner.schedule(this::runSafely, 0, TimeUnit.MILLISECONDS);
+            } else {
+                scanner.scheduleWithFixedDelay(this::runSafely, 0, pollIntervalMillis, TimeUnit.MILLISECONDS);
+            }
             running = true;
+            observe(() -> observer.schedulerState(true, true));
         }
     }
 
@@ -214,6 +313,7 @@ public final class ReliableEventScheduler implements SmartLifecycle {
             startedAt = System.nanoTime();
             stopped.set(true);
             running = false;
+            observe(() -> observer.schedulerState(true, false));
             completion = new CompletableFuture<>();
             stopCompletion = completion;
         }
@@ -296,10 +396,12 @@ public final class ReliableEventScheduler implements SmartLifecycle {
 
     private final class CandidateTask implements Runnable {
         private final EventCandidate candidate;
+        private final boolean automatic;
         private final AtomicBoolean released = new AtomicBoolean();
 
-        private CandidateTask(EventCandidate candidate) {
+        private CandidateTask(EventCandidate candidate, boolean automatic) {
             this.candidate = candidate;
+            this.automatic = automatic;
         }
 
         @Override
@@ -313,11 +415,13 @@ public final class ReliableEventScheduler implements SmartLifecycle {
                     admittedTasks.incrementAndGet();
                     admitted = true;
                 }
+                unmarkQueued();
                 ClaimedEvent claimed = worker.claimCandidate(candidate).orElse(null);
                 if (claimed != null && !timedOut) {
                     worker.publishClaimedEvent(claimed);
                 }
             } catch (RuntimeException exception) {
+                observe(() -> observer.schedulerCycleFailed(automatic, "dispatch"));
                 LOG.error("event=reliable_event.scheduler.task_failed eventId={} exceptionType={}",
                         candidate.id().value(), exception.getClass().getName());
             } finally {
@@ -330,9 +434,27 @@ public final class ReliableEventScheduler implements SmartLifecycle {
 
         private void release() {
             if (released.compareAndSet(false, true)) {
+                unmarkQueued();
                 outstandingIds.remove(candidate.id().value());
                 slots.release();
             }
+        }
+
+        private void markQueued() {
+            if (queuedTracked.compareAndSet(false, true)) observe(observer::candidateQueued);
+        }
+
+        private void unmarkQueued() {
+            if (queuedTracked.compareAndSet(true, false)) observe(observer::candidateDequeued);
+        }
+
+        private final AtomicBoolean queuedTracked = new AtomicBoolean();
+    }
+
+    private void observe(Runnable action) {
+        try { action.run(); }
+        catch (RuntimeException failure) {
+            LOG.warn("event=reliable_event.observation.failed exceptionType={}", failure.getClass().getName());
         }
     }
 }

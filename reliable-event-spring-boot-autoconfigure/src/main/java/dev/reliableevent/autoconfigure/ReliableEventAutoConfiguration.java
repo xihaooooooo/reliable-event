@@ -8,6 +8,7 @@ import dev.reliableevent.jdbc.DeadEventOperations;
 import dev.reliableevent.jdbc.JdbcDeadEventOperations;
 import dev.reliableevent.jdbc.JdbcPublishedEventRetention;
 import dev.reliableevent.jdbc.internal.observation.PublicationObserver;
+import dev.reliableevent.jdbc.internal.tracing.RegistrationTracer;
 import dev.reliableevent.jdbc.internal.recovery.JdbcExpiredLeaseRecovery;
 import dev.reliableevent.jdbc.internal.retry.ExponentialBackoff;
 import dev.reliableevent.rocketmq.EventDestinationResolver;
@@ -57,10 +58,15 @@ public class ReliableEventAutoConfiguration {
         ReliableEventPublisher reliableEventPublisher(
                 JdbcTemplate jdbcTemplate,
                 ObjectMapper objectMapper,
-                ReliableEventProperties properties
+                ReliableEventProperties properties,
+                ObjectProvider<RegistrationTracer> registrationTracers
         ) {
             properties.validateCore();
-            return new JdbcReliableEventPublisher(jdbcTemplate, objectMapper, properties.getMaxAttempts());
+            RegistrationTracer registrationTracer = properties.isTracingEnabled()
+                    ? registrationTracers.getIfAvailable(() -> RegistrationTracer.NOOP)
+                    : RegistrationTracer.NOOP;
+            return new JdbcReliableEventPublisher(jdbcTemplate, objectMapper, properties.getMaxAttempts(),
+                    registrationTracer);
         }
 
         @Bean

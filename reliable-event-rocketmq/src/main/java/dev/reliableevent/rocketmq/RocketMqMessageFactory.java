@@ -4,6 +4,7 @@ import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import dev.reliableevent.internal.model.StoredEvent;
+import dev.reliableevent.internal.headers.EventHeaderConstraints;
 import dev.reliableevent.internal.publication.EventSendException;
 import org.apache.rocketmq.client.apis.ClientServiceProvider;
 import org.apache.rocketmq.client.apis.message.Message;
@@ -13,21 +14,15 @@ import java.nio.charset.StandardCharsets;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Objects;
-import java.util.regex.Pattern;
 
 final class RocketMqMessageFactory {
 
     static final String EVENT_ID_PROPERTY = "reliable_event_id";
     static final String EVENT_TYPE_PROPERTY = "reliable_event_type";
     static final String EVENT_KEY_PROPERTY = "reliable_event_key";
-    static final String RESERVED_PROPERTY_PREFIX = "reliable_event_";
+    static final String RESERVED_PROPERTY_PREFIX = EventHeaderConstraints.RESERVED_PROPERTY_PREFIX;
     static final int DEFAULT_MAX_BODY_BYTES = 4 * 1024 * 1024;
 
-    private static final int MAX_HEADER_COUNT = 64;
-    private static final int MAX_HEADER_KEY_LENGTH = 128;
-    private static final int MAX_HEADER_VALUE_BYTES = 4 * 1024;
-    private static final int MAX_TOTAL_HEADER_BYTES = 16 * 1024;
-    private static final Pattern HEADER_KEY_PATTERN = Pattern.compile("[A-Za-z0-9_.-]+");
     private final ClientServiceProvider provider;
     private final ObjectMapper objectMapper;
     private final int maxBodyBytes;
@@ -111,58 +106,11 @@ final class RocketMqMessageFactory {
             }
             headers.put(entry.getKey(), entry.getValue().textValue());
         });
-        if (headers.size() > MAX_HEADER_COUNT) {
-            throw EventSendException.nonRetryable(
-                    "Reliable event has " + headers.size()
-                            + " headers and exceeds the limit of " + MAX_HEADER_COUNT
-            );
-        }
-
-        int totalBytes = 0;
-        for (Map.Entry<String, String> entry : headers.entrySet()) {
-            String key = entry.getKey();
-            String value = entry.getValue();
-            validateHeaderKey(key);
-            if (value == null || value.isBlank()) {
-                throw EventSendException.nonRetryable(
-                        "Reliable event header " + safeHeaderName(key) + " must have a non-blank value"
-                );
-            }
-            int valueBytes = value.getBytes(StandardCharsets.UTF_8).length;
-            if (valueBytes > MAX_HEADER_VALUE_BYTES) {
-                throw EventSendException.nonRetryable(
-                        "Reliable event header " + safeHeaderName(key)
-                                + " exceeds the value limit of " + MAX_HEADER_VALUE_BYTES + " bytes"
-                );
-            }
-            totalBytes = Math.addExact(
-                    totalBytes,
-                    key.getBytes(StandardCharsets.UTF_8).length + valueBytes
-            );
-            if (totalBytes > MAX_TOTAL_HEADER_BYTES) {
-                throw EventSendException.nonRetryable(
-                        "Reliable event headers exceed the total limit of "
-                                + MAX_TOTAL_HEADER_BYTES + " bytes"
-                );
-            }
+        String validationError = EventHeaderConstraints.validationError(headers);
+        if (validationError != null) {
+            throw EventSendException.nonRetryable(validationError);
         }
         return Map.copyOf(headers);
-    }
-
-    private void validateHeaderKey(String key) {
-        if (key == null
-                || key.isBlank()
-                || key.length() > MAX_HEADER_KEY_LENGTH
-                || !HEADER_KEY_PATTERN.matcher(key).matches()) {
-            throw EventSendException.nonRetryable(
-                    "Reliable event contains an invalid header name " + safeHeaderName(key)
-            );
-        }
-        if (key.startsWith(RESERVED_PROPERTY_PREFIX)) {
-            throw EventSendException.nonRetryable(
-                    "Reliable event header " + safeHeaderName(key) + " uses a reserved prefix"
-            );
-        }
     }
 
     private void requireNonBlank(String value, String name) {
@@ -175,9 +123,9 @@ final class RocketMqMessageFactory {
         if (key == null) {
             return "<null>";
         }
-        String truncated = key.length() <= MAX_HEADER_KEY_LENGTH
+        String truncated = key.length() <= EventHeaderConstraints.MAX_HEADER_KEY_LENGTH
                 ? key
-                : key.substring(0, MAX_HEADER_KEY_LENGTH);
+                : key.substring(0, EventHeaderConstraints.MAX_HEADER_KEY_LENGTH);
         StringBuilder safe = new StringBuilder(truncated.length());
         for (int index = 0; index < truncated.length(); index++) {
             char character = truncated.charAt(index);

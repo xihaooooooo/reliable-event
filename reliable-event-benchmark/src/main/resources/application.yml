@@ -11,6 +11,8 @@ spring:
 reliable-event:
   enabled: ${BENCHMARK_PUBLISHING_ENABLED:false}
   poll-interval: ${BENCHMARK_POLL_INTERVAL:1s}
+  adaptive-polling-enabled: ${BENCHMARK_ADAPTIVE_POLLING_ENABLED:false}
+  active-poll-interval: ${BENCHMARK_ACTIVE_POLL_INTERVAL:100ms}
   claim-batch-size: ${BENCHMARK_CLAIM_BATCH_SIZE:50}
   worker-threads: ${BENCHMARK_WORKER_THREADS:8}
   worker-queue-capacity: ${BENCHMARK_WORKER_QUEUE_CAPACITY:200}

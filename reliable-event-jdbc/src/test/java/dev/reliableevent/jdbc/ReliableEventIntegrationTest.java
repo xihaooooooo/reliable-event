@@ -825,6 +825,21 @@ class ReliableEventIntegrationTest {
     }
 
     @Test
+    @ExtendWith(OutputCaptureExtension.class)
+    void confirmedReceiptWithoutBrokerIdIsPublishedAndDoesNotLogAnId(CapturedOutput output) {
+        EventId id = inTransaction(() -> publisher.publish(new ReliableEvent<>(
+                "safe-type", "no-broker-id", Map.of("orderId", 7), NOW.minusSeconds(1), Map.of())));
+        JdbcEventPublicationWorker worker = new JdbcEventPublicationWorker(
+                jdbcTemplate, transactionManager, event -> new SendReceipt(null),
+                CLOCK, 50, WORKER_ID, LEASE_DURATION, deterministicBackoff());
+
+        assertThat(worker.publishDueEvents()).isOne();
+        assertThat(statusOf(id)).isEqualTo(EventStatus.PUBLISHED.code());
+        assertThat(output.getOut()).contains("event=reliable_event.send.succeeded", "status=PUBLISHED")
+                .doesNotContain("messageId=null", "messageId=");
+    }
+
+    @Test
     void migrationKeepsHistoricalAvailabilityUnknown() throws Exception {
         jdbcTemplate.execute("CREATE TABLE reliable_event_outbox_legacy (" +
                 "id BIGINT PRIMARY KEY, next_attempt_at DATETIME(3) NOT NULL)");

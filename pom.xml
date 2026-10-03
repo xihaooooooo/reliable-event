@@ -36,7 +36,13 @@
         <module>reliable-event-jdbc</module>
         <module>reliable-event-rocketmq</module>
         <module>reliable-event-spring-boot-autoconfigure</module>
-        <module>reliable-event-spring-boot-starter</module>
+        <module>reliable-event-spring-boot-starter-base</module>
+        <module>reliable-event-rocketmq-spring-boot-autoconfigure</module>
+        <module>reliable-event-rocketmq-spring-boot-starter</module>
+        <module>reliable-event-kafka</module>
+        <module>reliable-event-kafka-spring-boot-autoconfigure</module>
+        <module>reliable-event-kafka-spring-boot-starter</module>
+        <module>reliable-event-kafka-example</module>
         <module>reliable-event-example</module>
         <module>reliable-event-benchmark</module>
     </modules>

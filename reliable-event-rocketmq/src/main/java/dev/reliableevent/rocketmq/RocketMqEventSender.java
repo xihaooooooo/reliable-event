@@ -1,38 +1,34 @@
 package dev.reliableevent.rocketmq;
 
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import dev.reliableevent.internal.model.StoredEvent;
 import dev.reliableevent.internal.publication.EventSendException;
 import dev.reliableevent.internal.publication.EventSender;
 import dev.reliableevent.internal.publication.SendReceipt;
-import org.apache.rocketmq.client.apis.ClientException;
+import dev.reliableevent.spi.OutboundEvent;
+import dev.reliableevent.spi.TransportException;
+import dev.reliableevent.spi.TransportReceipt;
 import org.apache.rocketmq.client.apis.ClientServiceProvider;
-import org.apache.rocketmq.client.apis.message.Message;
-import org.apache.rocketmq.client.apis.message.MessageId;
 import org.apache.rocketmq.client.apis.producer.Producer;
 
+import java.util.LinkedHashMap;
+import java.util.Map;
 import java.util.Objects;
 
+/** Compatibility wrapper for applications that directly use the legacy EventSender API. */
 public final class RocketMqEventSender implements EventSender {
 
-    private final Producer producer;
-    private final EventDestinationResolver destinationResolver;
-    private final RocketMqMessageFactory messageFactory;
-    private final RocketMqSendFailureClassifier failureClassifier;
+    private final ObjectMapper objectMapper;
+    private final RocketMqEventTransport transport;
 
     public RocketMqEventSender(
             ClientServiceProvider provider,
             Producer producer,
             EventDestinationResolver destinationResolver,
-            ObjectMapper objectMapper
-    ) {
-        this(
-                provider,
-                producer,
-                destinationResolver,
-                objectMapper,
-                RocketMqMessageFactory.DEFAULT_MAX_BODY_BYTES
-        );
+            ObjectMapper objectMapper) {
+        this(provider, producer, destinationResolver, objectMapper, RocketMqMessageFactory.DEFAULT_MAX_BODY_BYTES);
     }
 
     public RocketMqEventSender(
@@ -40,53 +36,78 @@ public final class RocketMqEventSender implements EventSender {
             Producer producer,
             EventDestinationResolver destinationResolver,
             ObjectMapper objectMapper,
-            int maxBodyBytes
-    ) {
-        this.producer = Objects.requireNonNull(producer, "producer must not be null");
-        this.destinationResolver = Objects.requireNonNull(
-                destinationResolver,
-                "destinationResolver must not be null"
-        );
-        this.messageFactory = new RocketMqMessageFactory(provider, objectMapper, maxBodyBytes);
-        this.failureClassifier = new RocketMqSendFailureClassifier();
+            int maxBodyBytes) {
+        this.objectMapper = Objects.requireNonNull(objectMapper, "objectMapper must not be null");
+        this.transport = new RocketMqEventTransport(provider, producer, destinationResolver, maxBodyBytes);
     }
 
     @Override
     public SendReceipt send(StoredEvent event) {
         Objects.requireNonNull(event, "event must not be null");
-        RocketMqDestination destination = destinationResolver.resolve(event.eventType());
-        Message message = messageFactory.create(event, destination);
-
+        validateLegacyEvent(event);
+        TransportReceipt receipt;
         try {
-            org.apache.rocketmq.client.apis.producer.SendReceipt brokerReceipt =
-                    producer.send(message);
-            return toInternalReceipt(brokerReceipt);
-        } catch (EventSendException exception) {
-            throw exception;
-        } catch (ClientException exception) {
-            throw failureClassifier.classify(exception);
-        } catch (RuntimeException exception) {
-            throw EventSendException.resultUnknown(
-                    "RocketMQ send result is unknown after an unexpected client failure",
-                    exception
-            );
+            receipt = transport.send(new OutboundEvent(
+                    event.id(),
+                    event.eventType(),
+                    event.eventKey(),
+                    event.payloadJson(),
+                    readHeaders(event.headersJson())));
+        } catch (TransportException failure) {
+            throw toLegacyFailure(failure);
+        }
+        return new SendReceipt(receipt.brokerMessageId().orElse(null), receipt.metadata());
+    }
+
+    private Map<String, String> readHeaders(String json) {
+        if (json == null || json.isBlank()) {
+            throw EventSendException.nonRetryable("headersJson must not be blank");
+        }
+        try {
+            JsonNode root = objectMapper.readTree(json);
+            if (root == null || !root.isObject()) {
+                throw EventSendException.nonRetryable(
+                        "Reliable event headers must be a JSON object containing only string values");
+            }
+            Map<String, String> headers = new LinkedHashMap<>();
+            root.fields().forEachRemaining(entry -> {
+                if (!entry.getValue().isTextual()) {
+                    throw EventSendException.nonRetryable(
+                            "Reliable event header values must contain only strings");
+                }
+                headers.put(entry.getKey(), entry.getValue().textValue());
+            });
+            return Map.copyOf(headers);
+        } catch (JsonProcessingException failure) {
+            throw EventSendException.nonRetryable(
+                    "Reliable event headers must be valid JSON", failure);
         }
     }
 
-    private SendReceipt toInternalReceipt(
-            org.apache.rocketmq.client.apis.producer.SendReceipt brokerReceipt
-    ) {
-        if (brokerReceipt == null) {
-            throw EventSendException.resultUnknown(
-                    "RocketMQ send returned without a receipt"
-            );
+    private static void validateLegacyEvent(StoredEvent event) {
+        if (event.id() == null) {
+            throw EventSendException.nonRetryable("eventId must not be null");
         }
-        MessageId messageId = brokerReceipt.getMessageId();
-        if (messageId == null || messageId.toString().isBlank()) {
-            throw EventSendException.resultUnknown(
-                    "RocketMQ send returned without a message id"
-            );
+        if (event.eventType() == null || event.eventType().isBlank()) {
+            throw EventSendException.nonRetryable("eventType must not be blank");
         }
-        return new SendReceipt(messageId.toString());
+        if (event.eventKey() == null || event.eventKey().isBlank()) {
+            throw EventSendException.nonRetryable("eventKey must not be blank");
+        }
+        if (event.payloadJson() == null || event.payloadJson().isBlank()) {
+            throw EventSendException.nonRetryable("payloadJson must not be blank");
+        }
+        if (event.headersJson() == null || event.headersJson().isBlank()) {
+            throw EventSendException.nonRetryable("headersJson must not be blank");
+        }
+    }
+
+    private static EventSendException toLegacyFailure(TransportException failure) {
+        Throwable cause = failure.getCause();
+        return switch (failure.failureType()) {
+            case RETRYABLE -> EventSendException.retryable(failure.getMessage(), cause);
+            case NON_RETRYABLE -> EventSendException.nonRetryable(failure.getMessage(), cause);
+            case RESULT_UNKNOWN -> EventSendException.resultUnknown(failure.getMessage(), cause);
+        };
     }
 }

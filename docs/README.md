@@ -39,6 +39,7 @@
 - [M7：已发布事件保留与清理计划（已完成）](implementation/M7_PUBLISHED_EVENT_RETENTION.md)：以独立身份表保留登记去重，分批清理到期的已发布记录，并定义迁移与验收门槛。
 - [M8：自动链路追踪与可直接使用的告警计划（M8.1–M8.5 已完成；M8.6 待实施）](implementation/M8_TRACING_AND_ALERTING.md)：记录上下文持久化、逐次发布追踪、运行指标、示例消费追踪、看板与告警，以及验收边界。
 - [M8.5 本地可观测性运行指南](../observability/README.md)：独立 Prometheus、Alertmanager、Tempo、Grafana 与示例应用配置。
+- [M9：多消息中间件支持计划（M9.1–M9.3 已实施并验收）](implementation/M9_MULTI_BROKER_SUPPORT.md)：公共发送接口、RocketMQ/Kafka 专用 Starter、传输选择/严格绑定规则，以及 M9.3 真实 Broker 与消费验收记录；RabbitMQ 仍是候选，未实现。
 
 ## 进度记录
 

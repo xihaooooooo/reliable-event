@@ -100,13 +100,57 @@ class RocketMqEventSenderTest {
         verify(producer, never()).send(any(Message.class));
     }
 
+    @Test
+    void legacySenderPreservesStrictHeaderValidationWithoutLeakingValues() throws ClientException {
+        Map<String, String> invalidHeaders = Map.of(
+                "{\"reliable_event_secret\":\"do-not-print\"}", "reliable_event_secret",
+                "{\"attempt\":1}", "header values must contain only strings",
+                "[]", "JSON object",
+                "{\"bad\\nname\":\"do-not-print\"}", "bad?name");
+        invalidHeaders.forEach((headers, expectedMessage) -> {
+            assertThatThrownBy(() -> sender.send(event(headers)))
+                    .isInstanceOfSatisfying(EventSendException.class, exception -> {
+                        assertThat(exception.failureType()).isEqualTo(EventSendFailureType.NON_RETRYABLE);
+                        assertThat(exception).hasMessageContaining(expectedMessage)
+                                .hasMessageNotContaining("do-not-print");
+                    });
+        });
+        verify(producer, never()).send(any(Message.class));
+    }
+
+    @Test
+    void legacySenderTreatsNullAndBlankStoredFieldsAsPermanentFailures() throws ClientException {
+        StoredEvent[] invalid = {
+                new StoredEvent(null, "event", "key", "{}", "{}"),
+                new StoredEvent(new EventId(2), null, "key", "{}", "{}"),
+                new StoredEvent(new EventId(2), " ", "key", "{}", "{}"),
+                new StoredEvent(new EventId(2), "event", null, "{}", "{}"),
+                new StoredEvent(new EventId(2), "event", " ", "{}", "{}"),
+                new StoredEvent(new EventId(2), "event", "key", null, "{}"),
+                new StoredEvent(new EventId(2), "event", "key", " ", "{}"),
+                new StoredEvent(new EventId(2), "event", "key", "{}", null),
+                new StoredEvent(new EventId(2), "event", "key", "{}", " ")
+        };
+
+        for (StoredEvent event : invalid) {
+            assertThatThrownBy(() -> sender.send(event))
+                    .isInstanceOfSatisfying(EventSendException.class, exception ->
+                            assertThat(exception.failureType()).isEqualTo(EventSendFailureType.NON_RETRYABLE));
+        }
+        verify(producer, never()).send(any(Message.class));
+    }
+
     private StoredEvent event() {
+        return event("{}");
+    }
+
+    private StoredEvent event(String headers) {
         return new StoredEvent(
                 new EventId(1),
                 "coupon-task-execute",
                 "task-1",
                 "{\"taskId\":1}",
-                "{}"
+                headers
         );
     }
 }

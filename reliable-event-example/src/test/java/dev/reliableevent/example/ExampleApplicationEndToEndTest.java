@@ -96,6 +96,8 @@ class ExampleApplicationEndToEndTest {
     private static final String PROBE_GROUP = "reliable-event-example-probe-test";
     private static final String ROCKET_HOME = "/home/rocketmq/rocketmq-5.5.0";
     private static final String BROKER_CONFIG_PATH = ROCKET_HOME + "/conf/example-test.conf";
+    private static final String PROXY_CONFIG_PATH = ROCKET_HOME + "/conf/example-proxy-test.json";
+    private static final int PROXY_GRPC_PORT = Integer.getInteger("reliableEventTest.rocketmqProxyPort", 8081);
     private static final ClientServiceProvider PROVIDER = ClientServiceProvider.loadService();
 
     @Container
@@ -137,9 +139,11 @@ class ExampleApplicationEndToEndTest {
                         brokerIP1=127.0.0.1
                         autoCreateTopicEnable=false
                         """, 0644), BROKER_CONFIG_PATH)
-                .withCommand("sh", "mqbroker", "--enable-proxy", "-c", BROKER_CONFIG_PATH)
+                .withCopyToContainer(Transferable.of(proxyConfig(), 0644), PROXY_CONFIG_PATH)
+                .withCommand("sh", "mqbroker", "--enable-proxy", "-c", BROKER_CONFIG_PATH,
+                        "--proxyConfigPath", PROXY_CONFIG_PATH)
                 .waitingFor(Wait.forListeningPort().withStartupTimeout(Duration.ofMinutes(3)));
-        broker.bindFixedPort(8081, 8081);
+        broker.bindFixedPort(PROXY_GRPC_PORT, PROXY_GRPC_PORT);
         nameserver.start();
         broker.start();
         await().atMost(Duration.ofSeconds(30)).pollInterval(Duration.ofMillis(250))
@@ -198,7 +202,7 @@ class ExampleApplicationEndToEndTest {
         startApplication(true);
         MemorySpanExporter.reset();
         ClientConfiguration configuration = ClientConfiguration.newBuilder()
-                .setEndpoints("localhost:8081")
+                .setEndpoints("localhost:" + PROXY_GRPC_PORT)
                 .setRequestTimeout(Duration.ofSeconds(10))
                 .enableSsl(false)
                 .build();
@@ -313,7 +317,7 @@ class ExampleApplicationEndToEndTest {
     void lostSuccessfulReceiptProducesTwoBrokerMessagesButOneBusinessEffect() throws Exception {
         startApplication(false);
         ClientConfiguration configuration = ClientConfiguration.newBuilder()
-                .setEndpoints("localhost:8081")
+                .setEndpoints("localhost:" + PROXY_GRPC_PORT)
                 .setRequestTimeout(Duration.ofSeconds(10))
                 .enableSsl(false)
                 .build();
@@ -438,7 +442,7 @@ class ExampleApplicationEndToEndTest {
     void replayAfterUnknownResultKeepsIdentityAndConsumerEffectIdempotent() throws Exception {
         startApplication(false, true, 1);
         ClientConfiguration configuration = ClientConfiguration.newBuilder()
-                .setEndpoints("localhost:8081")
+                .setEndpoints("localhost:" + PROXY_GRPC_PORT)
                 .setRequestTimeout(Duration.ofSeconds(10))
                 .enableSsl(false)
                 .build();
@@ -504,7 +508,7 @@ class ExampleApplicationEndToEndTest {
                 "--reliable-event.cleanup-interval=100ms",
                 "--reliable-event.cleanup-batch-size=10");
         ClientConfiguration configuration = ClientConfiguration.newBuilder()
-                .setEndpoints("localhost:8081")
+                .setEndpoints("localhost:" + PROXY_GRPC_PORT)
                 .setRequestTimeout(Duration.ofSeconds(10))
                 .enableSsl(false)
                 .build();
@@ -597,7 +601,7 @@ class ExampleApplicationEndToEndTest {
                         "--reliable-event.poll-interval=100ms",
                         "--reliable-event.initial-retry-delay=100ms",
                         "--reliable-event.max-retry-delay=100ms",
-                        "--reliable-event.rocketmq.endpoints=localhost:8081",
+                        "--reliable-event.rocketmq.endpoints=localhost:" + PROXY_GRPC_PORT,
                         "--reliable-event.rocketmq.request-timeout=10s",
                         "--reliable-event.rocketmq.mappings.order-created.destination=" + TOPIC + ":created"
                 };
@@ -738,6 +742,10 @@ class ExampleApplicationEndToEndTest {
     private static org.testcontainers.containers.Container.ExecResult command(String arguments)
             throws Exception {
         return broker.execInContainer("sh", "-c", ROCKET_HOME + "/bin/mqadmin " + arguments);
+    }
+
+    private static String proxyConfig() {
+        return "{\"grpcServerPort\":" + PROXY_GRPC_PORT + ",\"useEndpointPortFromRequest\":true}";
     }
 
     private record Created(long orderId, long eventId) { }

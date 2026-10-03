@@ -61,7 +61,9 @@ final class MicrometerPublicationTracer implements PublicationTracer {
             public void sendSucceeded(SendReceipt receipt) {
                 safely(() -> {
                     span.tag("reliable_event.send.result", "success");
-                    span.tag("reliable_event.message_id", receipt.messageId());
+                    if (receipt.messageId() != null) {
+                        span.tag("reliable_event.message_id", receipt.messageId());
+                    }
                     span.event("reliable_event.sender.acknowledged");
                 }, "Unable to record successful sender receipt");
             }
@@ -153,6 +155,10 @@ final class MicrometerPublicationTracer implements PublicationTracer {
     }
 
     private StoredEvent injectAttemptContext(StoredEvent original, Map<String, String> headers, Span span) {
+        if (EventHeaderConstraints.validationError(headers) != null) {
+            warn("Stored publication headers exceed the event header budget");
+            return original;
+        }
         try {
             Map<String, String> generated = new LinkedHashMap<>();
             propagator.inject(span.context(), generated, (carrier, key, value) -> {

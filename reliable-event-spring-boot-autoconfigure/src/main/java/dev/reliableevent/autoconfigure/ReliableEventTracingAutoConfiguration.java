@@ -1,7 +1,7 @@
 package dev.reliableevent.autoconfigure;
 
-import dev.reliableevent.jdbc.internal.tracing.RegistrationTracer;
 import dev.reliableevent.jdbc.internal.tracing.PublicationTracer;
+import dev.reliableevent.jdbc.internal.tracing.RegistrationTracer;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.micrometer.tracing.Span;
 import io.micrometer.tracing.Tracer;

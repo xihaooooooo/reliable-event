@@ -19,10 +19,11 @@ final class RocketMqTestEnvironment implements AutoCloseable {
     static final String TOPIC = "reliable-event-test-topic";
     static final String TAG = "execute";
     static final String CONSUMER_GROUP = "reliable-event-test-consumer";
-    static final int PROXY_GRPC_PORT = 8081;
+    static final int PROXY_GRPC_PORT = Integer.getInteger("reliableEventTest.rocketmqProxyPort", 8081);
 
     private static final String ROCKETMQ_HOME = "/home/rocketmq/rocketmq-5.5.0";
     private static final String BROKER_CONFIG_PATH = ROCKETMQ_HOME + "/conf/reliable-event-test.conf";
+    private static final String PROXY_CONFIG_PATH = ROCKETMQ_HOME + "/conf/reliable-event-proxy-test.json";
     private static final String BROKER_CONFIG = """
             brokerClusterName=DefaultCluster
             brokerName=broker-a
@@ -56,12 +57,15 @@ final class RocketMqTestEnvironment implements AutoCloseable {
                         Transferable.of(BROKER_CONFIG, 0644),
                         BROKER_CONFIG_PATH
                 )
+                .withCopyToContainer(Transferable.of(proxyConfig(), 0644), PROXY_CONFIG_PATH)
                 .withCommand(
                         "sh",
                         "mqbroker",
                         "--enable-proxy",
                         "-c",
-                        BROKER_CONFIG_PATH
+                        BROKER_CONFIG_PATH,
+                        "--proxyConfigPath",
+                        PROXY_CONFIG_PATH
                 )
                 .waitingFor(Wait.forListeningPort().withStartupTimeout(Duration.ofMinutes(3)));
         broker.bindFixedPort(PROXY_GRPC_PORT, PROXY_GRPC_PORT);
@@ -156,6 +160,10 @@ final class RocketMqTestEnvironment implements AutoCloseable {
         } catch (java.io.IOException exception) {
             throw new IllegalStateException("Unable to create RocketMQ test topic", exception);
         }
+    }
+
+    private static String proxyConfig() {
+        return "{\"grpcServerPort\":" + PROXY_GRPC_PORT + ",\"useEndpointPortFromRequest\":true}";
     }
 
     private boolean brokerRegistrationIsVisible() {

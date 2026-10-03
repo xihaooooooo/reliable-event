@@ -1,7 +1,7 @@
 package dev.reliableevent.rocketmq;
 
-import dev.reliableevent.internal.publication.EventSendException;
-import dev.reliableevent.internal.publication.EventSendFailureType;
+import dev.reliableevent.spi.TransportException;
+import dev.reliableevent.spi.TransportFailureType;
 import org.junit.jupiter.api.Test;
 
 import java.util.HashMap;
@@ -23,9 +23,9 @@ class MapEventDestinationResolverTest {
 
         assertThat(resolver.resolve("coupon-task-execute")).isEqualTo(destination);
         assertThatThrownBy(() -> resolver.resolve("Coupon-Task-Execute"))
-                .isInstanceOfSatisfying(EventSendException.class, exception ->
+                .isInstanceOfSatisfying(TransportException.class, exception ->
                         assertThat(exception.failureType())
-                                .isEqualTo(EventSendFailureType.NON_RETRYABLE)
+                                .isEqualTo(TransportFailureType.NON_RETRYABLE)
                 );
     }
 
@@ -34,9 +34,9 @@ class MapEventDestinationResolverTest {
         MapEventDestinationResolver resolver = new MapEventDestinationResolver(Map.of());
 
         assertThatThrownBy(() -> resolver.resolve("missing"))
-                .isInstanceOfSatisfying(EventSendException.class, exception -> {
+                .isInstanceOfSatisfying(TransportException.class, exception -> {
                     assertThat(exception.failureType())
-                            .isEqualTo(EventSendFailureType.NON_RETRYABLE);
+                            .isEqualTo(TransportFailureType.NON_RETRYABLE);
                     assertThat(exception).hasMessageContaining("missing");
                 });
         assertThatThrownBy(() -> new MapEventDestinationResolver(Map.of(

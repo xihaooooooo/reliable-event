@@ -8,11 +8,9 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 class SendReceiptTest {
 
     @Test
-    void requiresANonBlankMessageId() {
+    void permitsAnAbsentMessageIdButRejectsBlankValues() {
         assertThat(new SendReceipt("message-1").messageId()).isEqualTo("message-1");
-        assertThatThrownBy(() -> new SendReceipt(null))
-                .isInstanceOf(IllegalArgumentException.class)
-                .hasMessageContaining("messageId");
+        assertThat(new SendReceipt(null).messageId()).isNull();
         assertThatThrownBy(() -> new SendReceipt(" "))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("messageId");

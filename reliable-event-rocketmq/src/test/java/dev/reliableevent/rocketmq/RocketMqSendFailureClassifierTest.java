@@ -1,11 +1,11 @@
 package dev.reliableevent.rocketmq;
 
-import dev.reliableevent.internal.publication.EventSendException;
-import dev.reliableevent.internal.publication.EventSendFailureType;
 import org.apache.rocketmq.client.apis.ClientException;
 import org.apache.rocketmq.client.java.exception.BadRequestException;
 import org.apache.rocketmq.client.java.exception.ProxyTimeoutException;
 import org.apache.rocketmq.client.java.exception.TooManyRequestsException;
+import dev.reliableevent.spi.TransportException;
+import dev.reliableevent.spi.TransportFailureType;
 import org.junit.jupiter.api.Test;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -18,9 +18,9 @@ class RocketMqSendFailureClassifierTest {
     void classifiesDeterministicRejectionsAsNonRetryable() {
         ClientException cause = new BadRequestException(400, "request-1", "invalid message secret");
 
-        EventSendException result = classifier.classify(cause);
+        TransportException result = classifier.classify(cause);
 
-        assertThat(result.failureType()).isEqualTo(EventSendFailureType.NON_RETRYABLE);
+        assertThat(result.failureType()).isEqualTo(TransportFailureType.NON_RETRYABLE);
         assertThat(result).hasCause(cause)
                 .hasMessageContaining("BadRequestException")
                 .hasMessageNotContaining("secret");
@@ -28,23 +28,23 @@ class RocketMqSendFailureClassifierTest {
 
     @Test
     void classifiesThrottlingAsRetryable() {
-        EventSendException result = classifier.classify(
+        TransportException result = classifier.classify(
                 new TooManyRequestsException(429, "request-2", "slow down")
         );
 
-        assertThat(result.failureType()).isEqualTo(EventSendFailureType.RETRYABLE);
+        assertThat(result.failureType()).isEqualTo(TransportFailureType.RETRYABLE);
     }
 
     @Test
     void classifiesTimeoutsAndUnknownClientErrorsAsResultUnknown() {
-        EventSendException timeout = classifier.classify(
+        TransportException timeout = classifier.classify(
                 new ProxyTimeoutException(504, "request-3", "deadline")
         );
         ClientException unknownCause = new ClientException("unexpected secret");
-        EventSendException unknown = classifier.classify(unknownCause);
+        TransportException unknown = classifier.classify(unknownCause);
 
-        assertThat(timeout.failureType()).isEqualTo(EventSendFailureType.RESULT_UNKNOWN);
-        assertThat(unknown.failureType()).isEqualTo(EventSendFailureType.RESULT_UNKNOWN);
+        assertThat(timeout.failureType()).isEqualTo(TransportFailureType.RESULT_UNKNOWN);
+        assertThat(unknown.failureType()).isEqualTo(TransportFailureType.RESULT_UNKNOWN);
         assertThat(unknown).hasCause(unknownCause)
                 .hasMessageNotContaining("secret");
     }

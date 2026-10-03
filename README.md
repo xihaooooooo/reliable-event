@@ -1,10 +1,10 @@
 # ReliableEvent
 
-ReliableEvent 是一个面向 Spring Boot 3 与 RocketMQ 的可靠消息 Starter。
+ReliableEvent 是一个面向 Spring Boot 3 的事务 Outbox 事件发布组件。RocketMQ 与 Kafka 均提供专用 Starter；M9.3 Kafka 适配已完成真实 Broker、Outbox 状态和外部消费验收。
 
 它通过 Transactional Outbox 模式，让业务数据与待发布事件在同一个 MySQL 本地事务中提交，再由后台发布器完成消息发送、失败重试、租约恢复和死信处理。
 
-当前仓库已完成 M0 至 M5.1、独立的 M5.3 基准测试、M6.1 至 M6.4 死信操作，以及 M8.1 至 M8.4 追踪和运行指标；M5.2 私有优惠券链路已取消，不属于 `0.1.0` 发布条件。业务方可以在活动事务中登记事件，模块会持久化 JSON Payload、避免重复登记。Starter 启动后按固定延迟恢复过期租约并扫描到期事件，将候选放入有界本地执行器；候选只有在线程开始执行时才使用版本号条件抢占，在事务外通过 RocketMQ 5.x gRPC 适配同步发送，再按版本、租约 Owner 和有效期更新状态。Context 关闭时会停止新抢占、撤销排队候选，并在有界时间内等待在途发送和状态更新。存在 `MeterRegistry` 时还会记录发布、延迟、积压、死信及租约恢复指标；默认 Starter 自动运行时还可使用独立的 Outbox 聚合快照采样器。
+当前仓库已完成 M0 至 M5.1、独立的 M5.3 基准测试、M6.1 至 M6.4 死信操作，以及 M8.1 至 M8.5 追踪和运行指标；M9.1 至 M9.3 已实施并验收；M5.2 私有优惠券链路已取消，不属于 `0.1.0` 发布条件。业务方可以在活动事务中登记事件，模块会持久化 JSON Payload、避免重复登记。Starter 启动后按固定延迟恢复过期租约并扫描到期事件，将候选放入有界本地执行器；候选只有在线程开始执行时才使用版本号条件抢占，在事务外由选定适配器同步确认发送，再按版本、租约 Owner 和有效期更新状态。Context 关闭时会停止新抢占、撤销排队候选，并在有界时间内等待在途发送和状态更新。存在 `MeterRegistry` 时还会记录发布、延迟、积压、死信及租约恢复指标；默认 Starter 自动运行时还可使用独立的 Outbox 聚合快照采样器。
 
 版本号条件抢占已经通过真实 MySQL 8.0 双 Worker 并发竞争测试。发送失败后事件会按照带随机抖动的指数退避进入 `RETRY_WAIT`；达到最大尝试次数或发生明确不可重试错误时进入 `DEAD`，不再自动扫描。租约使用数据库时间计算，错误 Owner、旧版本和过期租约都不能完成状态更新；过期的 `PUBLISHING` 事件可以限量、按快照条件恢复为 `RETRY_WAIT` 或 `DEAD`。独立 JVM 故障测试验证了至少一次语义窗口；真实 RocketMQ 5.5.0 测试进一步验证了 Topic/Tag/Key/Body/属性映射、Broker 不可用恢复，以及结果未知后重投产生不同 Message ID 的预期重复消息。
 
@@ -13,7 +13,8 @@ ReliableEvent 是一个面向 Spring Boot 3 与 RocketMQ 的可靠消息 Starter
 - Java 17
 - Spring Boot 3
 - MySQL 8.0
-- RocketMQ
+- RocketMQ（当前已验收）
+- Kafka（M9.3 已验收）
 - 至少一次投递语义
 - 多实例安全抢占
 - 指数退避重试
@@ -52,15 +53,15 @@ mvn verify
 
 ## 工件与许可
 
-源码采用 [Apache License 2.0](LICENSE)。当前 Maven 版本仍为 `0.1.0-SNAPSHOT`，尚未发布到公开工件仓库；接入前可在本仓库根目录运行 `mvn -pl reliable-event-spring-boot-starter -am -DskipTests install` 安装本地工件。正式发布与版本号以 [M5.4 发布检查](docs/implementation/M5_4_RELEASE_CHECK.md)的结论为准。
+源码采用 [Apache License 2.0](LICENSE)。当前 Maven 版本仍为 `0.1.0-SNAPSHOT`，尚未发布到公开工件仓库；接入前可在本仓库根目录运行 `mvn -pl reliable-event-rocketmq-spring-boot-starter -am -DskipTests install` 安装本地工件。正式发布与版本号以 [M5.4 发布检查](docs/implementation/M5_4_RELEASE_CHECK.md)的结论为准。
 
-计划对外提供父 POM `dev.reliableevent:reliable-event-parent` 和五个库工件：`reliable-event-core`、`reliable-event-jdbc`、`reliable-event-rocketmq`、`reliable-event-spring-boot-autoconfigure`、`reliable-event-spring-boot-starter`。示例与基准模块是源码仓库中的验证材料，不作为库工件发布。
+当前对外工件规划包含父 POM `dev.reliableevent:reliable-event-parent` 与十个库工件：`reliable-event-core`、`reliable-event-jdbc`、`reliable-event-rocketmq`、`reliable-event-spring-boot-autoconfigure`、`reliable-event-spring-boot-starter-base`、`reliable-event-rocketmq-spring-boot-autoconfigure`、`reliable-event-rocketmq-spring-boot-starter`、`reliable-event-kafka`、`reliable-event-kafka-spring-boot-autoconfigure`、`reliable-event-kafka-spring-boot-starter`。旧坐标 `reliable-event-spring-boot-starter` 已从源码仓库移除；历史验收和文档中出现的旧坐标仅记录当时状态，不再是当前接入入口。示例与基准模块是源码仓库中的验证材料，不作为库工件发布。
 
 ## 当前 Starter 接入方式
 
 M7 起，新建库的正式建表 SQL 同时创建 Outbox 和永久登记身份表。已有 Outbox 表的部署必须先按[运维指南](docs/OPERATIONS.md#建表和迁移)暂停事件登记、回填及核对身份，再切换所有应用实例；不能仅重新执行 `CREATE TABLE IF NOT EXISTS` 完成升级。
 
-引入 `dev.reliableevent:reliable-event-spring-boot-starter:0.1.0-SNAPSHOT`，配置应用的数据源并创建 [Outbox 表](reliable-event-jdbc/src/main/resources/schema/reliable-event-outbox.sql)。已有 M4.4 表先执行 [M4.5 增量 SQL](reliable-event-jdbc/src/main/resources/schema/reliable-event-outbox-m4-5.sql)。然后提供 RocketMQ 5.x Proxy 地址与事件目标：
+RocketMQ 应用使用 `dev.reliableevent:reliable-event-rocketmq-spring-boot-starter:0.1.0-SNAPSHOT`。仅登记的实例可用 `reliable-event-spring-boot-starter-base` 并设置 `reliable-event.scheduling-enabled=false`；同一 Outbox 还需有发布实例处理事件。Base 不包含 RocketMQ 客户端类；若应用提供自定义 `EventTransport` 或旧 `EventSender`，则可保留默认调度。配置应用的数据源并创建 [Outbox 表](reliable-event-jdbc/src/main/resources/schema/reliable-event-outbox.sql)。已有 M4.4 表先执行 [M4.5 增量 SQL](reliable-event-jdbc/src/main/resources/schema/reliable-event-outbox-m4-5.sql)。RocketMQ 默认传输仍使用原配置键：
 
 ```yaml
 reliable-event:
@@ -70,6 +71,8 @@ reliable-event:
       order-created:
         destination: orders-topic:created
 ```
+
+Kafka 专用 Starter `dev.reliableevent:reliable-event-kafka-spring-boot-starter` 已通过 M9.3 真实服务与外部消费验收。它使用 `reliable-event.kafka.bootstrap-servers` 和 `mappings.<eventType>.topic` 配置路由；必须由部署先创建 Topic。独立 MySQL/Kafka 示例见 [Kafka 订单示例](reliable-event-kafka-example/README.md)；实现边界与验收记录见 [M9 计划](docs/implementation/M9_MULTI_BROKER_SUPPORT.md#19-m93-kafka-实现边界与验收记录) 与 [接入运维指南](docs/OPERATIONS.md#配置与启动)。
 
 `orders-topic` 是配置示意，使用前须创建目标 Topic。在业务事务内调用 `ReliableEventPublisher.publish(event)`，Starter 默认自动持续发布。可通过 `reliable-event.poll-interval`、`worker-threads`、`worker-queue-capacity` 和 `claim-batch-size` 控制扫描与本地容量。可选的 `adaptive-polling-enabled=true` 使有在途任务或本轮提交任务时按 `active-poll-interval` 继续扫描，空闲及扫描失败时回到 `poll-interval`；默认保持固定延迟扫描。`shutdown-timeout` 控制停机时等待在途任务的上限，默认 `20s`，应小于 Spring 的 `spring.lifecycle.timeout-per-shutdown-phase`。设置 `scheduling-enabled=false` 后保留显式调用 `JdbcEventPublicationCycle.runOnce()` 的方式。完整配置、迁移和排障步骤见 [接入与运维指南](docs/OPERATIONS.md)；容量协议见 [M4.3 实施文档](docs/implementation/M4_3_SCHEDULING_AND_BOUNDED_CONCURRENCY.md)，停机语义见 [M4.4 实施文档](docs/implementation/M4_4_GRACEFUL_SHUTDOWN.md)。
 
@@ -84,5 +87,5 @@ M7 将 `(event_type, event_key) → EventId` 永久保存在 `reliable_event_ide
 1. 不自研消息代理，不取代 RocketMQ。
 2. 不承诺 Exactly Once，下游必须按事件键实现幂等。
 3. 不用功能数量证明价值，用事务测试、并发测试、故障注入和基准测试证明行为。
-4. 第一版只支持单数据源 MySQL 8.0 和 RocketMQ。
+4. 当前专用 Starter 支持单数据源 MySQL 8.0 与 RocketMQ、Kafka；RabbitMQ 尚未实现。
 5. 原创示例承担公开端到端验证；M5.2 私有优惠券链路已取消，不把未经完整验收的私有接入作为项目成果。

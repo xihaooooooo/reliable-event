@@ -1,6 +1,7 @@
 package dev.reliableevent.rocketmq;
 
-import dev.reliableevent.internal.publication.EventSendException;
+import dev.reliableevent.spi.TransportException;
+import dev.reliableevent.spi.TransportFailureType;
 
 import java.util.LinkedHashMap;
 import java.util.Map;
@@ -28,14 +29,15 @@ public final class MapEventDestinationResolver implements EventDestinationResolv
     @Override
     public RocketMqDestination resolve(String eventType) {
         if (eventType == null || eventType.isBlank()) {
-            throw EventSendException.nonRetryable("Reliable event type must not be blank");
+            throw new TransportException(
+                    TransportFailureType.NON_RETRYABLE,
+                    "Reliable event type must not be blank");
         }
         RocketMqDestination destination = destinations.get(eventType);
         if (destination == null) {
-            throw EventSendException.nonRetryable(
-                    "No RocketMQ destination is configured for event type "
-                            + safeEventType(eventType)
-            );
+            throw new TransportException(
+                    TransportFailureType.NON_RETRYABLE,
+                    "No RocketMQ destination is configured for event type " + safeEventType(eventType));
         }
         return destination;
     }

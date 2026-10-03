@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import dev.reliableevent.ReliableEvent;
 import dev.reliableevent.ReliableEventPublisher;
 import dev.reliableevent.internal.publication.EventSender;
+import dev.reliableevent.spi.EventTransport;
 import dev.reliableevent.jdbc.DeadEventOperations;
 import dev.reliableevent.jdbc.JdbcDeadEventOperations;
 import dev.reliableevent.jdbc.JdbcPublishedEventRetention;
@@ -15,19 +16,15 @@ import dev.reliableevent.jdbc.internal.observation.PublicationObserver;
 import dev.reliableevent.jdbc.internal.tracing.RegistrationTracer;
 import dev.reliableevent.jdbc.internal.tracing.PublicationTracer;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
-import dev.reliableevent.rocketmq.EventDestinationResolver;
-import dev.reliableevent.rocketmq.RocketMqDestination;
-import org.apache.rocketmq.client.apis.ClientServiceProvider;
-import org.apache.rocketmq.client.apis.ClientConfiguration;
-import org.apache.rocketmq.client.apis.SessionCredentialsProvider;
-import org.apache.rocketmq.client.apis.producer.Producer;
-import org.apache.rocketmq.client.apis.producer.ProducerBuilder;
 import org.junit.jupiter.api.Test;
 import org.springframework.boot.autoconfigure.AutoConfigurations;
 import org.springframework.boot.actuate.autoconfigure.tracing.MicrometerTracingAutoConfiguration;
 import org.springframework.boot.actuate.autoconfigure.opentelemetry.OpenTelemetryAutoConfiguration;
 import org.springframework.boot.actuate.autoconfigure.tracing.OpenTelemetryTracingAutoConfiguration;
 import org.springframework.boot.test.context.runner.ApplicationContextRunner;
+import org.springframework.boot.test.context.TestConfiguration;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Primary;
 import org.springframework.boot.test.context.FilteredClassLoader;
 import org.springframework.boot.env.YamlPropertySourceLoader;
 import org.springframework.core.io.ByteArrayResource;
@@ -60,9 +57,86 @@ class ReliableEventAutoConfigurationTest {
                     ReliableEventAutoConfiguration.class,
                     ReliableEventPublicationAutoConfiguration.class,
                     ReliableEventMetricsSnapshotAutoConfiguration.class,
-                    ReliableEventTracingAutoConfiguration.class
+                    ReliableEventTracingAutoConfiguration.class,
+                    ReliableEventTransportSelectionAutoConfiguration.class,
+                    ReliableEventTransportBridgeAutoConfiguration.class
             ))
             .withPropertyValues("reliable-event.scheduling-enabled=false");
+
+    @Test
+    void publicTransportUsesBridgeWithoutBrokerTypes() {
+        runner.withBean(EventTransport.class, () -> event -> dev.reliableevent.spi.TransportReceipt.confirmed())
+                .withBean(JdbcTemplate.class, () -> mock(JdbcTemplate.class))
+                .withBean(DataSource.class, () -> mock(DataSource.class))
+                .withBean(PlatformTransactionManager.class, () -> mock(PlatformTransactionManager.class))
+                .withBean(ObjectMapper.class, ObjectMapper::new)
+                .run(context -> {
+                    assertThat(context).hasNotFailed();
+                    assertThat(context).hasSingleBean(EventSender.class);
+                    assertThat(context.getBean(EventSender.class))
+                            .isInstanceOf(EventTransportSenderBridge.class);
+
+                });
+    }
+
+    @Test
+    void systemEnvironmentPropertyNamesUseBootRelaxedBindingAndRemainStrict() {
+        runner.withBean(EventSender.class, () -> mock(EventSender.class))
+                .withInitializer(context -> addSystemEnvironment(context,
+                        "RELIABLEEVENT_CLAIMBATCHSIZE", "17"))
+                .run(context -> {
+                    assertThat(context).hasNotFailed();
+                    assertThat(context.getBean(ReliableEventProperties.class).getClaimBatchSize()).isEqualTo(17);
+                });
+
+        runner.withBean(EventSender.class, () -> mock(EventSender.class))
+                .withInitializer(context -> addSystemEnvironment(context,
+                        "RELIABLEEVENT_CLAIMBATCHSZIE", "17"))
+                .run(context -> assertThat(context).hasFailed()
+                        .getFailure().hasMessageContaining("claimbatchszie"));
+    }
+
+    @Test
+    void publicAndLegacySendingEntryPointsFailFastWhenBothAreDefined() {
+        runner.withBean(EventTransport.class, () -> event -> dev.reliableevent.spi.TransportReceipt.confirmed())
+                .withBean(EventSender.class, () -> mock(EventSender.class))
+                .withBean(JdbcTemplate.class, () -> mock(JdbcTemplate.class))
+                .withBean(DataSource.class, () -> mock(DataSource.class))
+                .withBean(PlatformTransactionManager.class, () -> mock(PlatformTransactionManager.class))
+                .withBean(ObjectMapper.class, ObjectMapper::new)
+                .run(context -> assertThat(context).hasFailed()
+                        .getFailure().hasMessageContaining("Both EventSender and EventTransport"));
+    }
+
+    @Test
+    void multiplePublicTransportBeansFailEvenWhenOneIsPrimary() {
+        jdbcRunner().withUserConfiguration(MultipleTransportConfiguration.class)
+                .run(context -> assertThat(context).hasFailed()
+                        .getFailure().hasMessageContaining("Exactly one EventTransport bean is required"));
+    }
+
+    @Test
+    void disabledReliableEventBacksOffFromAllSendingAssembly() {
+        jdbcRunner().withBean(EventTransport.class,
+                        () -> event -> dev.reliableevent.spi.TransportReceipt.confirmed())
+                .withPropertyValues("reliable-event.enabled=false")
+                .run(context -> {
+                    assertThat(context).hasNotFailed();
+                    assertThat(context).doesNotHaveBean(EventSender.class);
+
+                    assertThat(context).doesNotHaveBean(JdbcEventPublicationWorker.class);
+                });
+    }
+
+    @TestConfiguration(proxyBeanMethods = false)
+    static class MultipleTransportConfiguration {
+        @Bean @Primary EventTransport primaryTransport() {
+            return event -> dev.reliableevent.spi.TransportReceipt.confirmed();
+        }
+        @Bean EventTransport secondTransport() {
+            return event -> dev.reliableevent.spi.TransportReceipt.confirmed();
+        }
+    }
 
     @Test
     void publishedRetentionIsOffByDefaultAndRequiresExplicitDuration() {
@@ -402,7 +476,7 @@ class ReliableEventAutoConfigurationTest {
                 .run(context -> {
                     assertThat(context).hasNotFailed();
                     assertThat(context).doesNotHaveBean(ReliableEventPublisher.class);
-                    assertThat(context).doesNotHaveBean(Producer.class);
+
                     assertThat(context).doesNotHaveBean(JdbcEventPublicationCycle.class);
                     assertThat(context).doesNotHaveBean(ReliableEventScheduler.class);
                 });
@@ -420,7 +494,7 @@ class ReliableEventAutoConfigurationTest {
                     assertThat(context).hasSingleBean(JdbcEventPublicationWorker.class);
                     assertThat(context).hasSingleBean(JdbcEventPublicationCycle.class);
                     assertThat(context).doesNotHaveBean(ReliableEventScheduler.class);
-                    assertThat(context).doesNotHaveBean(Producer.class);
+
                 });
     }
 
@@ -462,90 +536,6 @@ class ReliableEventAutoConfigurationTest {
     }
 
     @Test
-    void defaultProducerUsesMappedTopicsOneAttemptAndCloses() throws Exception {
-        ClientServiceProvider provider = mock(ClientServiceProvider.class);
-        ProducerBuilder builder = mock(ProducerBuilder.class, RETURNS_SELF);
-        Producer producer = mock(Producer.class);
-        when(provider.newProducerBuilder()).thenReturn(builder);
-        when(builder.build()).thenReturn(producer);
-        jdbcRunner().withBean(ClientServiceProvider.class, () -> provider)
-                .withPropertyValues(
-                        "reliable-event.rocketmq.endpoints=localhost:8081",
-                        "reliable-event.rocketmq.mappings.order-created.destination=events:created",
-                        "reliable-event.rocketmq.mappings.order-updated.destination=events:updated"
-                ).run(context -> {
-                    assertThat(context).hasNotFailed();
-                    assertThat(context).getBean(Producer.class).isSameAs(producer);
-                    assertThat(context).hasSingleBean(EventSender.class);
-                    assertThat(context).hasSingleBean(JdbcEventPublicationCycle.class);
-                });
-        verify(builder).setTopics("events");
-        verify(builder).setMaxAttempts(1);
-        verify(producer).close();
-    }
-
-    @Test
-    void customProducerIsNotClosedByAutoConfiguration() throws Exception {
-        Producer producer = mock(Producer.class);
-        ClientServiceProvider provider = mock(ClientServiceProvider.class);
-        jdbcRunner().withBean(Producer.class, () -> producer,
-                        definition -> definition.setDestroyMethodName(""))
-                .withBean(ClientServiceProvider.class, () -> provider)
-                .withPropertyValues("reliable-event.rocketmq.mappings.order-created.destination=events:created")
-                .run(context -> {
-                    assertThat(context).hasNotFailed();
-                    assertThat(context).getBean(Producer.class).isSameAs(producer);
-                });
-        org.mockito.Mockito.verify(producer, org.mockito.Mockito.never()).close();
-    }
-
-    @Test
-    void customResolverWithoutProducerFailsClearly() {
-        EventDestinationResolver resolver = eventType -> new RocketMqDestination("events", null);
-        ClientServiceProvider provider = mock(ClientServiceProvider.class);
-        jdbcRunner().withBean(EventDestinationResolver.class, () -> resolver)
-                .withBean(ClientServiceProvider.class, () -> provider)
-                .withPropertyValues("reliable-event.rocketmq.endpoints=localhost:8081")
-                .run(context -> assertThat(context.getStartupFailure())
-                        .hasMessageContaining("Custom EventDestinationResolver requires a custom Producer"));
-    }
-
-    @Test
-    void customResolverAndProducerNeedNoMapping() {
-        EventDestinationResolver resolver = eventType -> new RocketMqDestination("events", null);
-        jdbcRunner().withBean(EventDestinationResolver.class, () -> resolver)
-                .withBean(Producer.class, () -> mock(Producer.class),
-                        definition -> definition.setDestroyMethodName(""))
-                .withBean(ClientServiceProvider.class, () -> mock(ClientServiceProvider.class))
-                .run(context -> {
-                    assertThat(context).hasNotFailed();
-                    assertThat(context).hasSingleBean(EventSender.class);
-                    assertThat(context).doesNotHaveBean(ClientConfiguration.class);
-                });
-    }
-
-    @Test
-    void customCredentialProviderTakesPrecedenceOverStaticProperties() throws Exception {
-        SessionCredentialsProvider credentials = mock(SessionCredentialsProvider.class);
-        ClientServiceProvider provider = mock(ClientServiceProvider.class);
-        ProducerBuilder builder = mock(ProducerBuilder.class, RETURNS_SELF);
-        when(provider.newProducerBuilder()).thenReturn(builder);
-        when(builder.build()).thenReturn(mock(Producer.class));
-        jdbcRunner().withBean(SessionCredentialsProvider.class, () -> credentials)
-                .withBean(ClientServiceProvider.class, () -> provider)
-                .withPropertyValues(
-                        "reliable-event.rocketmq.endpoints=localhost:8081",
-                        "reliable-event.rocketmq.mappings.order-created.destination=events:created",
-                        "reliable-event.rocketmq.access-key=public",
-                        "reliable-event.rocketmq.secret-key=private"
-                ).run(context -> {
-                    assertThat(context).hasNotFailed();
-                    assertThat(context.getBean(ClientConfiguration.class).getCredentialsProvider())
-                            .contains(credentials);
-                });
-    }
-
-    @Test
     void missingJdbcClassBacksOff() {
         runner.withClassLoader(new FilteredClassLoader(JdbcTemplate.class))
                 .withBean(ObjectMapper.class, ObjectMapper::new)
@@ -553,71 +543,6 @@ class ReliableEventAutoConfigurationTest {
                 .run(context -> {
                     assertThat(context).hasNotFailed();
                     assertThat(context).doesNotHaveBean(ReliableEventPublisher.class);
-                });
-    }
-
-    @Test
-    void missingRocketMqClassBacksOffWithoutLoadingItsConfiguration() {
-        runner.withClassLoader(new FilteredClassLoader(
-                        "org.apache.rocketmq.client.apis", "dev.reliableevent.rocketmq"))
-                .withBean(DataSource.class, () -> mock(DataSource.class))
-                .withBean(JdbcTemplate.class, () -> mock(JdbcTemplate.class))
-                .withBean(PlatformTransactionManager.class, () -> mock(PlatformTransactionManager.class))
-                .withBean(ObjectMapper.class, ObjectMapper::new)
-                .run(context -> {
-                    assertThat(context).hasNotFailed();
-                    assertThat(context).hasSingleBean(ReliableEventPublisher.class);
-                    assertThat(context).doesNotHaveBean(EventSender.class);
-                });
-    }
-
-    @Test
-    void missingDataSourceDoesNotConnectToBroker() {
-        ClientServiceProvider provider = mock(ClientServiceProvider.class);
-        runner.withBean(ObjectMapper.class, ObjectMapper::new)
-                .withBean(ClientServiceProvider.class, () -> provider)
-                .run(context -> {
-                    assertThat(context).hasNotFailed();
-                    assertThat(context).doesNotHaveBean(ReliableEventPublisher.class);
-                    assertThat(context).doesNotHaveBean(Producer.class);
-                });
-        org.mockito.Mockito.verify(provider, org.mockito.Mockito.never()).newProducerBuilder();
-    }
-
-    @Test
-    void yamlBindsEventTypeWithHyphenAndPreservesCase() {
-        String yaml = """
-                reliable-event:
-                  shutdown-timeout: 9s
-                  adaptive-polling-enabled: true
-                  active-poll-interval: 250ms
-                  rocketmq:
-                    mappings:
-                      Order-Created:
-                        destination: events:created
-                      coupon-task-execute:
-                        destination: coupons:execute
-                """;
-        runner.withInitializer(context -> {
-                    var source = new ByteArrayResource(yaml.getBytes(StandardCharsets.UTF_8));
-                    try {
-                        context.getEnvironment().getPropertySources().addFirst(
-                                new YamlPropertySourceLoader().load("test-yaml", source).get(0)
-                        );
-                    } catch (java.io.IOException exception) {
-                        throw new IllegalStateException(exception);
-                    }
-                })
-                .withBean(EventSender.class, () -> mock(EventSender.class))
-                .run(context -> {
-                    assertThat(context).hasNotFailed();
-                    ReliableEventProperties properties = context.getBean(ReliableEventProperties.class);
-                    assertThat(properties.destinations()).containsKeys("Order-Created", "coupon-task-execute");
-                    assertThat(properties.destinations().get("Order-Created"))
-                            .isEqualTo(new RocketMqDestination("events", "created"));
-                    assertThat(properties.getShutdownTimeout()).isEqualTo(Duration.ofSeconds(9));
-                    assertThat(properties.isAdaptivePollingEnabled()).isTrue();
-                    assertThat(properties.getActivePollInterval()).isEqualTo(Duration.ofMillis(250));
                 });
     }
 
@@ -653,49 +578,22 @@ class ReliableEventAutoConfigurationTest {
         }
     }
 
-    @Test
-    void invalidDestinationAndCredentialPairFailBeforeProducerBuild() {
-        for (String property : new String[]{
-                "reliable-event.rocketmq.mappings.order-created.destination=bad:tag:extra",
-                "reliable-event.rocketmq.access-key=public",
-                "reliable-event.rocketmq.request-timeout=40s"
-        }) {
-            ClientServiceProvider provider = mock(ClientServiceProvider.class);
-            jdbcRunner().withBean(ClientServiceProvider.class, () -> provider)
-                    .withPropertyValues(
-                            "reliable-event.rocketmq.endpoints=localhost:8081",
-                            "reliable-event.rocketmq.mappings.order-created.destination=events:created",
-                            property
-                    )
-                    .run(context -> assertThat(context).hasFailed());
-            org.mockito.Mockito.verify(provider, org.mockito.Mockito.never()).newProducerBuilder();
-        }
-    }
-
-    @Test
-    void invalidOrMissingBrokerConfigurationFailsBeforeConnection() {
-        for (String property : new String[]{
-                "reliable-event.rocketmq.endpoints=",
-                "reliable-event.rocketmq.mappings.order-created.destination=",
-                "reliable-event.rocketmq.mappings.order-created.destination=bad topic"
-        }) {
-            ClientServiceProvider provider = mock(ClientServiceProvider.class);
-            jdbcRunner().withBean(ClientServiceProvider.class, () -> provider)
-                    .withPropertyValues(
-                            "reliable-event.rocketmq.endpoints=localhost:8081",
-                            "reliable-event.rocketmq.mappings.order-created.destination=events:created",
-                            property
-                    )
-                    .run(context -> assertThat(context).hasFailed());
-            org.mockito.Mockito.verify(provider, org.mockito.Mockito.never()).newProducerBuilder();
-        }
-    }
-
     private ApplicationContextRunner jdbcRunner() {
         return runner.withBean(DataSource.class, () -> mock(DataSource.class))
                 .withBean(JdbcTemplate.class, () -> mock(JdbcTemplate.class))
                 .withBean(PlatformTransactionManager.class, () -> mock(PlatformTransactionManager.class))
                 .withBean(ObjectMapper.class, ObjectMapper::new);
+    }
+
+    private void addSystemEnvironment(
+            org.springframework.context.ConfigurableApplicationContext context,
+            String key,
+            String value) {
+        var environment = context.getEnvironment();
+        environment.getPropertySources().addFirst(new org.springframework.core.env.SystemEnvironmentPropertySource(
+                org.springframework.core.env.StandardEnvironment.SYSTEM_ENVIRONMENT_PROPERTY_SOURCE_NAME,
+                java.util.Map.of(key, value)));
+        org.springframework.boot.context.properties.source.ConfigurationPropertySources.attach(environment);
     }
 
     private String storedTraceparent(String headersJson) {

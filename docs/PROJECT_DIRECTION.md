@@ -359,7 +359,8 @@ reliable-event/
 ├── reliable-event-jdbc
 ├── reliable-event-rocketmq
 ├── reliable-event-spring-boot-autoconfigure
-├── reliable-event-spring-boot-starter
+├── reliable-event-spring-boot-starter-base
+├── reliable-event-rocketmq-spring-boot-starter
 ├── reliable-event-testkit
 ├── reliable-event-example
 ├── benchmark
@@ -372,7 +373,7 @@ reliable-event/
 - `jdbc`：Outbox写入、扫描、抢占、状态流转和清理；
 - `rocketmq`：RocketMQ发送适配和目标映射；
 - `autoconfigure`：Spring Boot条件装配及配置校验；
-- `starter`：依赖聚合，不包含业务逻辑；
+- `starter-base` 与 RocketMQ 专用 Starter：依赖聚合，不包含业务逻辑；旧通用 Starter 坐标已移除；
 - `testkit`：Fake发送适配、等待断言和测试夹具；
 - `example`：完全原创的最小示例，不复制优惠券项目代码；
 - `benchmark`：数据构造、压测脚本和报告模板。

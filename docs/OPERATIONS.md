@@ -1,12 +1,12 @@
 # ReliableEvent 接入与运维
 
-本文对应当前 `0.1.0-SNAPSHOT` 实现：Java 17 编译目标、Spring Boot 3、单数据源 MySQL 8.0、RocketMQ 5.x gRPC Proxy。首次接入可先运行[原创订单示例](../reliable-event-example/README.md)，再将下列配置和检查用于自己的应用。示例中的 Topic、端口和凭据仅供本地演示。
+本文对应当前 `0.1.0-SNAPSHOT` 实现：Java 17 编译目标、Spring Boot 3、单数据源 MySQL 8.0、RocketMQ 5.x gRPC Proxy；Kafka 专用适配已通过 M9.3 验收，与 RocketMQ 一样按专用 Starter 接入。首次接入可先运行对应中间件的独立示例，再将下列配置和检查用于自己的应用。示例中的 Topic、端口和凭据仅供本地演示。
 
 ## 接入前检查
 
 1. 应用使用一个 MySQL 8.0 `DataSource`，业务表和 `reliable_event_outbox` 位于**同一物理本地事务**。`ReliableEventPublisher.publish(...)` 必须在活动的 Spring 数据库事务内调用；没有活动事务会失败。逻辑数据源或分片路由需要用提交与回滚测试确认实际事务资源一致。
 2. 为 JDBC 连接配置一致的 UTC 时间约定，并用未来 `availableAt` 事件检查数据库与应用时钟。Outbox 的时间列是 `DATETIME(3)`；租约比较使用数据库 `UTC_TIMESTAMP(3)`，时间约定不一致会影响到期判断。原创示例的 JDBC URL 使用 `connectionTimeZone=UTC`。
-3. RocketMQ 5.x Proxy 地址对应用可达，并且目标 Topic 已创建。`rocketmq.endpoints` 是 gRPC Proxy 地址，不能把 NameServer 地址直接填入。事件类型必须有明确的 `topic[:tag]` 映射。
+3. 所选 Broker 地址对应用可达，并且目标 Topic 已创建。RocketMQ `rocketmq.endpoints` 是 gRPC Proxy 地址，不能填 NameServer；Kafka 使用 `reliable-event.kafka.bootstrap-servers`。事件类型必须有明确路由映射。
 4. 消费者以稳定的事件 ID 或 `(eventType, eventKey)` 实现持久化幂等。消息发送成功与消费业务提交是两个事实；生产端可能发送重复消息。
 
 在业务事务中调用 `publish` 时，`eventType + eventKey` 是 Outbox 唯一登记键。同一键再次登记会返回原事件 ID，原记录的 Payload、Header 和可用时间不会被覆盖。这个机制不能代替业务请求本身的幂等控制。`availableAt` 是最早允许扫描的时间，不是硬实时发送保证；第一版也不保证消息顺序。
@@ -36,16 +36,38 @@ M7 写入协议要求 `reliable_event_identity` 与 Outbox 同库、同一事务
 
 ## 配置与启动
 
-当前 Starter 坐标为 `dev.reliableevent:reliable-event-spring-boot-starter:0.1.0-SNAPSHOT`。应用提供 `DataSource`、`JdbcTemplate`、`PlatformTransactionManager` 和 Jackson `ObjectMapper`；默认装配要求只有一个可选的 `DataSource`。示例配置：
+RocketMQ 应用使用 `dev.reliableevent:reliable-event-rocketmq-spring-boot-starter:0.1.0-SNAPSHOT`。旧坐标 `reliable-event-spring-boot-starter` 已删除，不再提供兼容入口。仅登记的应用可使用 `dev.reliableevent:reliable-event-spring-boot-starter-base` 并设置 `reliable-event.scheduling-enabled=false`；同一 Outbox 需要另有发布实例处理事件。若 base 应用提供自定义 `EventTransport` 或旧 `EventSender`，可保留默认调度；默认调度开启但没有 Sender 时启动失败。Base 的运行时依赖不含 RocketMQ 客户端。RocketMQ 默认装配要求单一可选 `DataSource`，并要求 `JdbcTemplate`、`PlatformTransactionManager` 和 Jackson `ObjectMapper`。示例配置：
 
 ```yaml
 reliable-event:
+  transport: rocketmq # 可省略；安装唯一的内置适配器时默认选中
   rocketmq:
     endpoints: localhost:8081
     mappings:
       order-created:
         destination: orders-topic:created
 ```
+
+自定义 `EventTransport` 或旧 `EventSender` 时默认退让到 `custom`，不会创建默认 RocketMQ 客户端；也可显式设置 `transport: custom`。多个已安装适配器必须显式选择，缺少适配器、重复自定义发送入口和未知配置键会在启动时失败。RocketMQ 设置只在 RocketMQ 适配器加载时校验；切换到其他已注册传输且仍保留 `rocketmq.*` 配置时，日志只提示该命名空间未使用，不打印配置值。自定义 Sender 自行负责单次发送等待预算，需确保外部发送完成时间与 Outbox 租约协调。
+
+Kafka 独立应用使用专用坐标 `dev.reliableevent:reliable-event-kafka-spring-boot-starter:0.1.0-SNAPSHOT`。仅安装 Kafka Starter 时可省略 `transport` 并选择唯一的 Kafka 内置适配器；同时安装 RocketMQ 和 Kafka Starter 时必须显式设为 `rocketmq` 或 `kafka`。Kafka 示例配置如下：
+
+```yaml
+reliable-event:
+  transport: kafka
+  lease-duration: 30s
+  kafka:
+    bootstrap-servers: localhost:9092
+    mappings:
+      order-created:
+        topic: orders
+```
+
+Kafka 生产适配器不创建 Topic。生产端使用事件业务键作为 record key，数据库中的原始 JSON UTF-8 字节作为 value，身份和追踪放入 headers；有效记录位置作为诊断回执，Broker Message ID 保持为空。默认 Producer 使用 `acks=all`、幂等和单次应用级发送；默认总等待预算为 7 秒，租约必须严格大于该预算加 1 秒状态更新预留。`delivery-timeout` 必须不小于 `request-timeout + linger`，`max-body-bytes` 加 Kafka 记录余量必须能由 Kafka 的整数 `max.request.size` 表达。应用仍须将 Broker/topic `max.message.bytes` 配到可接收业务 payload 的大小；客户端本地 body 限制不会自动调整 Broker 限制。
+
+应用自行提供 `Producer<String, byte[]>` 时必须配置 `reliable-event.kafka.custom-producer-send-budget`，并自行保证 String/byte[] 序列化、`acks=all`、幂等、非事务 Producer 和实际阻塞/确认时间均符合声明预算。框架只要求唯一 typed Producer、按声明值校验租约并保留该 Producer 的应用销毁责任；它不能验证用户 Producer 的实际配置。更复杂事务发送可提供自定义 `EventTransport`。Kafka 配置（含 mappings 子对象）采用严格字段校验；未知 Kafka 属性在启动时失败。认证配置通过受控外部配置提供，不能在日志中输出凭据。
+
+Kafka 的专用预算属性为：`max-block` 默认 `1s`、`request-timeout` 默认 `3s`、`delivery-timeout` 默认 `5s`、`linger` 默认 `0`，其中 `delivery-timeout` 必须至少等于 request timeout 加 linger；`shutdown-timeout` 默认 `5s`。默认发送总预算为 `max-block + delivery-timeout + 1s` 确认余量。`max-body-bytes` 默认 4 MiB，超过上限的 Payload 在调用 Producer 前按不可重试失败处理；Kafka 默认 `max.request.size` 在该上限外额外预留 32 KiB 记录/header 开销。`producer-properties` 只用于其它合法 Kafka Producer 设置，不能覆盖 Broker 地址、序列化器、确认/幂等/重试、预算时间、事务 ID、Partitioner 或 Interceptor。
 
 该 Topic 名是示意值，部署前须创建相应 RocketMQ 资源。默认 Producer 启动时需要 Proxy 地址和至少一个映射；使用自定义 `Producer`、`EventSender` 或目标解析器时，应按自动配置的 Bean 条件核对自己的组合，不能假定默认配置仍生效。RocketMQ 凭据通过部署环境注入，不能提交到仓库。
 

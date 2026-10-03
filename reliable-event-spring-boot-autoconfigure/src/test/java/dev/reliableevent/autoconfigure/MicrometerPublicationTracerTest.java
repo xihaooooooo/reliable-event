@@ -6,6 +6,7 @@ import dev.reliableevent.internal.model.StoredEvent;
 import dev.reliableevent.internal.publication.SendReceipt;
 import dev.reliableevent.jdbc.internal.model.ClaimedEvent;
 import dev.reliableevent.jdbc.internal.tracing.PublicationTracer;
+import dev.reliableevent.spi.EventTransport;
 import io.micrometer.tracing.Tracer;
 import io.micrometer.tracing.propagation.Propagator;
 import io.micrometer.tracing.otel.bridge.OtelBaggageManager;
@@ -30,9 +31,68 @@ import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.TimeUnit;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class MicrometerPublicationTracerTest {
     private final ObjectMapper objectMapper = new ObjectMapper();
+
+    @Test
+    void confirmedReceiptWithoutMessageIdDoesNotAddMessageIdAttribute() throws Exception {
+        CollectingExporter exporter = new CollectingExporter();
+        SdkTracerProvider provider = SdkTracerProvider.builder()
+                .addSpanProcessor(SimpleSpanProcessor.create(exporter)).build();
+        OpenTelemetrySdk sdk = OpenTelemetrySdk.builder().setTracerProvider(provider)
+                .setPropagators(ContextPropagators.create(W3CTraceContextPropagator.getInstance())).build();
+        OtelCurrentTraceContext current = new OtelCurrentTraceContext();
+        Tracer tracer = new OtelTracer(sdk.getTracer("m9.1-test"), current, ignored -> { },
+                new OtelBaggageManager(current, List.of(), List.of()));
+        Propagator propagator = new OtelPropagator(sdk.getPropagators(), sdk.getTracer("m9.1-test"));
+        PublicationTracer.Attempt attempt = new MicrometerPublicationTracer(tracer, propagator, objectMapper)
+                .begin(claimed(storedEvent(Map.of()), 1));
+        attempt.sendSucceeded(new SendReceipt(null));
+        attempt.close();
+
+        assertThat(provider.forceFlush().join(10, TimeUnit.SECONDS).isSuccess()).isTrue();
+        SpanData span = exporter.spans.stream().findFirst().orElseThrow();
+        assertThat(span.getAttributes().asMap().keySet())
+                .noneMatch(key -> key.getKey().equals("reliable_event.message_id"));
+        sdk.close();
+    }
+
+    @Test
+    void tracingDoesNotReplaceInvalidPersistedHeadersBeforeTransportValidation() throws Exception {
+        CollectingExporter exporter = new CollectingExporter();
+        SdkTracerProvider provider = SdkTracerProvider.builder()
+                .addSpanProcessor(SimpleSpanProcessor.create(exporter)).build();
+        OpenTelemetrySdk sdk = OpenTelemetrySdk.builder().setTracerProvider(provider)
+                .setPropagators(ContextPropagators.create(W3CTraceContextPropagator.getInstance())).build();
+        OtelCurrentTraceContext current = new OtelCurrentTraceContext();
+        Tracer tracer = new OtelTracer(sdk.getTracer("m9.1-invalid-header-test"), current, ignored -> { },
+                new OtelBaggageManager(current, List.of(), List.of()));
+        Propagator propagator = new OtelPropagator(sdk.getPropagators(), sdk.getTracer("m9.1-invalid-header-test"));
+        EventTransport transport = org.mockito.Mockito.mock(EventTransport.class);
+        EventTransportSenderBridge bridge = new EventTransportSenderBridge(transport, objectMapper);
+        PublicationTracer micrometerTracer = new MicrometerPublicationTracer(tracer, propagator, objectMapper);
+
+        for (Map<String, String> invalidHeaders : List.of(
+                Map.of("traceparent", " "),
+                Map.of("tracestate", "x".repeat(4097)))) {
+            StoredEvent original = storedEvent(invalidHeaders);
+            PublicationTracer.Attempt attempt = micrometerTracer.begin(claimed(original, 1));
+            try {
+                assertThat(attempt.eventForSend()).isSameAs(original);
+                assertThatThrownBy(() -> bridge.send(attempt.eventForSend()))
+                        .isInstanceOf(dev.reliableevent.internal.publication.EventSendException.class)
+                        .extracting(failure -> ((dev.reliableevent.internal.publication.EventSendException) failure)
+                                .failureType())
+                        .isEqualTo(dev.reliableevent.internal.publication.EventSendFailureType.NON_RETRYABLE);
+            } finally {
+                attempt.close();
+            }
+        }
+        org.mockito.Mockito.verifyNoInteractions(transport);
+        sdk.close();
+    }
 
     @Test
     void retriesAreIndependentChildrenAndMissingOrBadContextStartsRootWithoutLeakingScope() throws Exception {

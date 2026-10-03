@@ -236,13 +236,19 @@ public final class JdbcEventPublicationWorker {
         SendReceipt acknowledged = receipt;
         safelyTrace(() -> tracing.sendSucceeded(acknowledged));
         observe(() -> observer.sendSucceeded(claimedEvent, acknowledged, elapsed, acknowledgedAt));
-        eventLog(LOG.atInfo(), claimedEvent)
-                .addKeyValue("event", "reliable_event.send.succeeded")
-                .addKeyValue("messageId", receipt.messageId())
-                .log("event=reliable_event.send.succeeded eventId={} eventType={} eventKey={} attemptCount={} leaseOwner={} messageId={}",
-                claimedEvent.event().id().value(), claimedEvent.event().eventType(),
-                claimedEvent.event().eventKey(), claimedEvent.attemptCount(),
-                claimedEvent.leaseOwner(), receipt.messageId());
+        var sendSuccessLog = eventLog(LOG.atInfo(), claimedEvent)
+                .addKeyValue("event", "reliable_event.send.succeeded");
+        if (receipt.messageId() == null) {
+            sendSuccessLog.log("event=reliable_event.send.succeeded eventId={} eventType={} eventKey={} attemptCount={} leaseOwner={}",
+                    claimedEvent.event().id().value(), claimedEvent.event().eventType(),
+                    claimedEvent.event().eventKey(), claimedEvent.attemptCount(), claimedEvent.leaseOwner());
+        } else {
+            sendSuccessLog.addKeyValue("messageId", receipt.messageId())
+                    .log("event=reliable_event.send.succeeded eventId={} eventType={} eventKey={} attemptCount={} leaseOwner={} messageId={}",
+                            claimedEvent.event().id().value(), claimedEvent.event().eventType(),
+                            claimedEvent.event().eventKey(), claimedEvent.attemptCount(),
+                            claimedEvent.leaseOwner(), receipt.messageId());
+        }
         boolean outerTransaction = TransactionSynchronizationManager.isActualTransactionActive();
         try {
             transaction.executeWithoutResult(
@@ -253,14 +259,20 @@ public final class JdbcEventPublicationWorker {
             );
             observe(() -> observer.stateUpdated("PUBLISHED", outerTransaction));
             safelyTrace(() -> tracing.stateUpdated("PUBLISHED", outerTransaction));
-            eventLog(LOG.atInfo(), claimedEvent)
+            var persistedLog = eventLog(LOG.atInfo(), claimedEvent)
                     .addKeyValue("event", "reliable_event.publish.persisted")
-                    .addKeyValue("messageId", receipt.messageId())
-                    .addKeyValue("status", "PUBLISHED")
-                    .log("event=reliable_event.publish.persisted eventId={} eventType={} eventKey={} attemptCount={} leaseOwner={} messageId={} status=PUBLISHED",
-                    claimedEvent.event().id().value(), claimedEvent.event().eventType(),
-                    claimedEvent.event().eventKey(), claimedEvent.attemptCount(),
-                    claimedEvent.leaseOwner(), receipt.messageId());
+                    .addKeyValue("status", "PUBLISHED");
+            if (receipt.messageId() == null) {
+                persistedLog.log("event=reliable_event.publish.persisted eventId={} eventType={} eventKey={} attemptCount={} leaseOwner={} status=PUBLISHED",
+                        claimedEvent.event().id().value(), claimedEvent.event().eventType(),
+                        claimedEvent.event().eventKey(), claimedEvent.attemptCount(), claimedEvent.leaseOwner());
+            } else {
+                persistedLog.addKeyValue("messageId", receipt.messageId())
+                        .log("event=reliable_event.publish.persisted eventId={} eventType={} eventKey={} attemptCount={} leaseOwner={} messageId={} status=PUBLISHED",
+                                claimedEvent.event().id().value(), claimedEvent.event().eventType(),
+                                claimedEvent.event().eventKey(), claimedEvent.attemptCount(),
+                                claimedEvent.leaseOwner(), receipt.messageId());
+            }
         } catch (RuntimeException stateFailure) {
             observe(() -> observer.stateUpdateFailed("PUBLISHED",
                     stateFailure instanceof StaleEventClaimException));

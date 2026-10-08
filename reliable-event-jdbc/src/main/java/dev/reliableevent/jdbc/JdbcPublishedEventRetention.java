@@ -134,12 +134,13 @@ public final class JdbcPublishedEventRetention {
         return jdbc.update("""
                 DELETE i FROM reliable_event_identity i
                 WHERE i.published_at < ? AND i.id IN (
-                """ + placeholders + ") AND NOT EXISTS (
+                %s) AND NOT EXISTS (
                     SELECT 1 FROM reliable_event_outbox o
                     WHERE o.id = i.id
                 ) AND NOT EXISTS (
                     SELECT 1 FROM reliable_event_outbox o
                     WHERE o.event_type = i.event_type AND o.event_key = i.event_key
-                )", args.toArray());
+                )
+                """.formatted(placeholders), args.toArray());
     }
 }

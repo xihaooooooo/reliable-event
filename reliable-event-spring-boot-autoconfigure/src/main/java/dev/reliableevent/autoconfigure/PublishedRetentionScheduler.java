@@ -2,6 +2,7 @@ package dev.reliableevent.autoconfigure;
 
 import dev.reliableevent.jdbc.JdbcPublishedEventRetention;
 import dev.reliableevent.jdbc.PublishedRetentionResult;
+import dev.reliableevent.jdbc.RetentionRunResult;
 import dev.reliableevent.jdbc.internal.observation.PublicationObserver;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -21,6 +22,7 @@ public final class PublishedRetentionScheduler implements SmartLifecycle {
     private final JdbcPublishedEventRetention retention;
     private final PublicationObserver observer;
     private final Duration keepFor;
+    private final Duration identityKeepFor;
     private final int batchSize;
     private final Duration stopTimeout;
     private final long intervalMillis;
@@ -34,9 +36,17 @@ public final class PublishedRetentionScheduler implements SmartLifecycle {
     public PublishedRetentionScheduler(JdbcPublishedEventRetention retention,
                                        PublicationObserver observer, Duration keepFor,
                                        int batchSize, Duration interval, Duration stopTimeout) {
+        this(retention, observer, keepFor, null, batchSize, interval, stopTimeout);
+    }
+
+    public PublishedRetentionScheduler(JdbcPublishedEventRetention retention,
+                                       PublicationObserver observer, Duration keepFor,
+                                       Duration identityKeepFor, int batchSize,
+                                       Duration interval, Duration stopTimeout) {
         this.retention = Objects.requireNonNull(retention);
         this.observer = Objects.requireNonNull(observer);
         this.keepFor = Objects.requireNonNull(keepFor);
+        this.identityKeepFor = identityKeepFor;
         this.batchSize = batchSize;
         this.intervalMillis = Objects.requireNonNull(interval).toMillis();
         this.stopTimeout = Objects.requireNonNull(stopTimeout);
@@ -48,11 +58,18 @@ public final class PublishedRetentionScheduler implements SmartLifecycle {
     private void runSafely() {
         long started = System.nanoTime();
         try {
-            PublishedRetentionResult result = retention.runOnce(keepFor, batchSize);
+            RetentionRunResult runResult = identityKeepFor == null
+                    ? new RetentionRunResult(retention.runOnce(keepFor, batchSize), 0)
+                    : retention.runOnceWithIdentityRetention(keepFor, identityKeepFor, batchSize);
+            PublishedRetentionResult result = runResult.published();
             long elapsed = System.nanoTime() - started;
             if (result.scanned() > 0 || result.deleted() > 0) {
                 LOG.info("event=reliable_event.retention.completed scanned={} deleted={} oldestEligibleAgeSeconds={} durationNanos={}",
                         result.scanned(), result.deleted(), result.oldestEligibleAgeSeconds(), elapsed);
+            }
+            if (runResult.identitiesDeleted() > 0) {
+                LOG.info("event=reliable_event.identity_retention.completed deleted={}",
+                        runResult.identitiesDeleted());
             }
             observe(() -> observer.cleanupCompleted(result, elapsed));
         } catch (RuntimeException failure) {

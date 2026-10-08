@@ -21,6 +21,7 @@ import org.springframework.boot.autoconfigure.condition.ConditionalOnSingleCandi
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.beans.factory.InitializingBean;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.transaction.PlatformTransactionManager;
 
@@ -36,6 +37,11 @@ import java.util.concurrent.ThreadLocalRandom;
 @ConditionalOnProperty(prefix = "reliable-event", name = "enabled", havingValue = "true", matchIfMissing = true)
 @EnableConfigurationProperties(ReliableEventProperties.class)
 public class ReliableEventAutoConfiguration {
+
+    @Bean
+    InitializingBean reliableEventRetentionPropertiesValidation(ReliableEventProperties properties) {
+        return properties::validateRetention;
+    }
 
     @Configuration(proxyBeanMethods = false)
     @ConditionalOnClass({JdbcTemplate.class, JdbcReliableEventPublisher.class})
@@ -127,7 +133,9 @@ public class ReliableEventAutoConfiguration {
             properties.validateRetention();
             return new PublishedRetentionScheduler(retention,
                     observers.getIfAvailable(() -> PublicationObserver.NOOP),
-                    properties.getPublishedRetention(), properties.getCleanupBatchSize(),
+                    properties.getPublishedRetention(),
+                    properties.isIdentityRetentionEnabled() ? properties.getIdentityRetention() : null,
+                    properties.getCleanupBatchSize(),
                     properties.getCleanupInterval(), properties.getShutdownTimeout());
         }
     }

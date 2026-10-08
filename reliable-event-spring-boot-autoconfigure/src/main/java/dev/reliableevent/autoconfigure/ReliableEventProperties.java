@@ -16,6 +16,8 @@ public class ReliableEventProperties {
     private boolean publishedRetentionEnabled = false;
     private boolean tracingEnabled = true;
     private Duration publishedRetention;
+    private boolean identityRetentionEnabled = false;
+    private Duration identityRetention;
     private int cleanupBatchSize = 100;
     private Duration cleanupInterval = Duration.ofHours(1);
     private int claimBatchSize = 50;
@@ -54,6 +56,12 @@ public class ReliableEventProperties {
     public void setTracingEnabled(boolean tracingEnabled) { this.tracingEnabled = tracingEnabled; }
     public Duration getPublishedRetention() { return publishedRetention; }
     public void setPublishedRetention(Duration publishedRetention) { this.publishedRetention = publishedRetention; }
+    public boolean isIdentityRetentionEnabled() { return identityRetentionEnabled; }
+    public void setIdentityRetentionEnabled(boolean identityRetentionEnabled) {
+        this.identityRetentionEnabled = identityRetentionEnabled;
+    }
+    public Duration getIdentityRetention() { return identityRetention; }
+    public void setIdentityRetention(Duration identityRetention) { this.identityRetention = identityRetention; }
     public int getCleanupBatchSize() { return cleanupBatchSize; }
     public void setCleanupBatchSize(int cleanupBatchSize) { this.cleanupBatchSize = cleanupBatchSize; }
     public Duration getCleanupInterval() { return cleanupInterval; }
@@ -132,10 +140,17 @@ public class ReliableEventProperties {
     }
 
     public void validateRetention() {
+        if (identityRetentionEnabled && !publishedRetentionEnabled) {
+            throw invalid("identity-retention-enabled",
+                    "requires published-retention-enabled=true so publication time can be preserved");
+        }
         if (!publishedRetentionEnabled) {
             return;
         }
         positiveMillis(publishedRetention, "published-retention");
+        if (identityRetentionEnabled) {
+            positiveMillis(identityRetention, "identity-retention");
+        }
         if (cleanupBatchSize < 1 || cleanupBatchSize > JdbcPublishedEventRetention.MAX_BATCH_SIZE) {
             throw invalid("cleanup-batch-size", "must be between 1 and "
                     + JdbcPublishedEventRetention.MAX_BATCH_SIZE);

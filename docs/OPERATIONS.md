@@ -9,7 +9,7 @@
 3. 所选 Broker 地址对应用可达，并且目标 Topic 已创建。RocketMQ `rocketmq.endpoints` 是 gRPC Proxy 地址，不能填 NameServer；Kafka 使用 `reliable-event.kafka.bootstrap-servers`。事件类型必须有明确路由映射。
 4. 消费者以稳定的事件 ID 或 `(eventType, eventKey)` 实现持久化幂等。消息发送成功与消费业务提交是两个事实；生产端可能发送重复消息。
 
-在业务事务中调用 `publish` 时，`eventType + eventKey` 是 Outbox 唯一登记键。同一键再次登记会返回原事件 ID，原记录的 Payload、Header 和可用时间不会被覆盖。这个机制不能代替业务请求本身的幂等控制。`availableAt` 是最早允许扫描的时间，不是硬实时发送保证；第一版也不保证消息顺序。
+在业务事务中调用 `publish` 时，`eventType + eventKey` 是 Outbox 唯一登记键。默认永久保留身份时，或对应身份尚未物理删除时，同一键再次登记会返回原事件 ID，原记录的 Payload、Header 和可用时间不会被覆盖。这个机制不能代替业务请求本身的幂等控制。`availableAt` 是最早允许扫描的时间，不是硬实时发送保证；第一版也不保证消息顺序。
 
 ## 建表和迁移
 
@@ -27,6 +27,8 @@ M7 写入协议要求 `reliable_event_identity` 与 Outbox 同库、同一事务
 1. 保持 `published-retention-enabled=false`，备份 Outbox、身份与重放审计相关数据，暂停所有事件登记入口并等待在途业务事务结束。旧实例仍可完成发送，但不得继续登记。
 2. 如旧表缺少 M4.5/M6.1 字段或索引，先按适用版本执行相应增量 SQL。执行一次[身份表创建与全量回填 SQL](../reliable-event-jdbc/src/main/resources/schema/reliable-event-identity-m7-1.sql)，再运行[一致性核对 SQL](../reliable-event-jdbc/src/main/resources/schema/reliable-event-identity-m7-1-check.sql)。三个异常计数在首次迁移时均须为零；核对最大 ID 与身份表的 `AUTO_INCREMENT` 起点。回填包含全部状态，不只包含 `PUBLISHED`。
 3. 执行一次[M7 清理扫描索引 SQL](../reliable-event-jdbc/src/main/resources/schema/reliable-event-outbox-m7-2.sql)。保持登记暂停，直到所有实例都运行新的身份表登记协议，再恢复入口。验证新登记、重复登记、回滚及双表一致性后，才单独考虑打开清理开关。
+
+身份保留期限是可选的，默认关闭且旧身份表无需新列。若要为已有 M7 部署启用，先暂停所有登记入口及 Outbox 清理并等待在途事务结束，备份两表；执行一次[身份保留列和索引迁移](../reliable-event-jdbc/src/main/resources/schema/reliable-event-identity-retention.sql)，再执行[可重复的发布时间回填 SQL](../reliable-event-jdbc/src/main/resources/schema/reliable-event-identity-retention-backfill.sql)。它从仍存在的 `PUBLISHED` Outbox 行复制真实 `published_at`；旧版本清理留下的孤立身份没有原始成功时间，脚本只在确认孤立行确由旧版 PUBLISHED 清理产生后，以统一迁移时刻作为保守起算时间。检查不匹配的孤立身份并先处理；不要把 `registered_at` 当作成功时间。关闭身份保留期间若 Outbox 清理仍运行，重新启用前暂停登记和清理并再次执行可重复的回填脚本，这会让该期间产生的孤立身份从重新启用迁移时刻起完整保留一个身份期限。
 
 身份表不可用时新发布器会失败，不能降级为旧协议。清理开始后，关闭清理开关即可暂停删除，但不能直接回滚到旧版发布器；旧版无法识别已清理行的身份。恢复备份时应让 Outbox、身份及重放审计位于相容的数据时间点。`DATETIME(3)` 按 UTC 解释，数据源应使用 UTC 连接时区；M7 的成功发布时刻按 UTC 写入。
 
@@ -103,7 +105,19 @@ M8.3 的数据库年龄和过期判断在聚合 SQL 内使用数据库 UTC 时�
 
 快照是数据库 Outbox 的单行聚合结果，同一存储的多个实例会重复读取相同记录，不能将快照 Gauge 跨实例求和。`publication.persisted`、`dead.entered`、发送和 Scheduler 计数属于实例局部进度，应先计算各实例的 `rate` 或 `increase` 再聚合；inflight/queued 则按实例求和。采样超时只保证等待方在本地预算后返回，不代表数据库驱动已停止。停止回调独立于发布停机预算；整个 Spring Context 的关闭时间仍由 Spring 生命周期配置管理。
 
-M7 清理默认关闭。确认迁移与新写入一致后，设置 `published-retention-enabled=true`，并显式指定正数 `published-retention`（例如 `30d`）。`cleanup-batch-size` 默认 100、范围 1–1000；`cleanup-interval` 默认 `1h`，至少 `1ms`。JDBC 模块也提供 `JdbcPublishedEventRetention.runOnce(retention, batchSize)` 供受控单轮执行，返回扫描数、删除数和剩余最老到期行年龄。自动清理与发布扫描独立运行，只删除 `status=PUBLISHED` 且 `published_at` 早于数据库 UTC 截止时间的行。配置变更需重启应用；停机等待复用 `shutdown-timeout`，数据库调用不响应中断时可能在超时后结束。
+M7 Outbox 清理默认关闭。确认迁移与新写入一致后，可按下面的示例开启 Outbox 清理和身份期限；`30d` 与 `90d` 只是配置示例，应按业务可重提旧键的最长时间设定：
+
+```yaml
+reliable-event:
+  published-retention-enabled: true
+  published-retention: 30d
+  identity-retention-enabled: true
+  identity-retention: 90d
+```
+
+身份期限启用时必须同时开启 Outbox 清理。成功发布时间在同一事务内从将删除的 Outbox 行复制到身份表；身份清理只删除已到期且按 ID 和业务键均无 Outbox 关联的身份。`PENDING`、`PUBLISHING`、`RETRY_WAIT` 和 `DEAD` 的身份因仍有关联 Outbox 而不会被删除。到期只表示符合清理条件；在批次实际物理删除之前，重复登记仍返回原 ID。删除后同 `(event_type, event_key)` 再登记会生成新 ID 并重新入队，因此期限须覆盖业务可能重提旧键的最长时间。
+
+两种清理共用 `cleanup-batch-size`（默认 100，范围 1–1000）和 `cleanup-interval`（默认 `1h`，至少 `1ms`）。Outbox 到期但尚未物理删除时身份不会删除；身份期限可短于 Outbox 期限，但身份最早要等 Outbox 删除后才满足无关联条件。手动调用 `JdbcPublishedEventRetention.runOnce(retention, batchSize)` 只执行 Outbox 清理并保留身份；启用身份期限时调用 `runOnceWithIdentityRetention(outboxRetention, identityRetention, batchSize)`，它在同一事务中分别返回 Outbox 与身份删除数。配置变更需重启应用；停机等待复用 `shutdown-timeout`，数据库调用不响应中断时可能在超时后结束。
 
 ## 追踪与示例消费
 
@@ -210,7 +224,7 @@ LIMIT 50;
 
 ## 数据增长与保留
 
-M7 提供默认关闭的 `PUBLISHED` 行分批清理，保留期从生产端成功记录的 `published_at` 计算；它不证明消费者已完成。清理后 Outbox 中的 Payload、Headers 和状态历史不可在线查询，`reliable_event_identity` 则永久保留事件 ID、类型和业务键，以保证重复登记不重新入队。`PENDING`、`PUBLISHING`、`RETRY_WAIT`、`DEAD` 不清理；没有在线完整消息归档。开启前应确定完整消息的备份和排障窗口，监测身份表及审计表增长、索引、备份耗时和磁盘空间。M5.3 的旧基准来自 M7 写入协议之前，不能直接当作新协议的性能数字。
+M7 提供默认关闭的 `PUBLISHED` 行分批清理，保留期从生产端成功记录的 `published_at` 计算；它不证明消费者已完成。身份保留关闭时，身份默认永久保留并永久去重；开启身份清理后，身份在成功发布时间超过配置期限且 Outbox 已物理删除后才删除。身份删除前重复登记返回原 ID，物理删除后重复键会得到新 ID 并重新入队。`PENDING`、`PUBLISHING`、`RETRY_WAIT`、`DEAD` 不清理；没有在线完整消息归档。开启前应确定完整消息的备份和排障窗口，监测身份表及审计表增长、索引、备份耗时和磁盘空间。M5.3 的旧基准来自 M7 写入协议之前，不能直接当作新协议的性能数字。
 
 M6.2 的重放审计行同样会持续积累；其中的操作者、原因与旧失败摘要应按业务数据保护要求控制访问、备份和保留期限。
 

@@ -29,6 +29,8 @@ CREATE TABLE IF NOT EXISTS reliable_event_identity (
     event_type    VARCHAR(128) NOT NULL,
     event_key     VARCHAR(192) NOT NULL,
     registered_at DATETIME(3) NOT NULL,
+    published_at  DATETIME(3) NULL,
     PRIMARY KEY (id),
-    UNIQUE KEY uk_event_identity (event_type, event_key)
+    UNIQUE KEY uk_event_identity (event_type, event_key),
+    KEY idx_identity_retention (published_at, id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;

@@ -80,7 +80,7 @@ Kafka 专用 Starter `dev.reliableevent:reliable-event-kafka-spring-boot-starter
 
 处理 `DEAD` 事件时，先执行[审计表迁移](reliable-event-jdbc/src/main/resources/schema/reliable-event-replay-audit-m6-2.sql)，再设置 `reliable-event.dead-operations-enabled=true`，即可向应用注入 `DeadEventOperations` 查询与单条重放接口。默认不开启管理 Bean，也不提供 HTTP 端点。调用方须鉴权、核对 Broker 和消费者事实，并保存真实操作者与原因；步骤见[运维指南](docs/OPERATIONS.md)和[公开示例](reliable-event-example/README.md#人工处理-dead-事件)。
 
-M7 将 `(event_type, event_key) → EventId` 永久保存在 `reliable_event_identity`。完成迁移核对后，可显式配置 `published-retention-enabled=true` 与正数 `published-retention`，按批次清理到期的 `PUBLISHED` 行。清理默认关闭；清理后重复登记仍返回原 ID，不产生新消息。清理一旦执行，就不能回退到旧版只写 Outbox 的发布器。M7 的当前源码尚未纳入此前的正式发布检查。
+M7 将 `(event_type, event_key) → EventId` 保存在 `reliable_event_identity`，默认永久保留。完成迁移核对后，可配置 `published-retention-enabled=true` 与正数 `published-retention`，按批次清理到期的 `PUBLISHED` 行；如需释放去重身份，再配置 `identity-retention-enabled=true` 和正数 `identity-retention`。身份保留默认关闭，只有成功发布时间到期且 Outbox 已物理删除后才清理；身份物理删除后重复键会得到新 ID 并重新入队。已有库启用身份期限前须执行身份保留列迁移和保守时间回填，详见[接入与运维指南](docs/OPERATIONS.md#建表和迁移)。清理一旦执行，就不能回退到旧版只写 Outbox 的发布器。M7 的当前源码尚未纳入此前的正式发布检查。
 
 ## 项目原则
 

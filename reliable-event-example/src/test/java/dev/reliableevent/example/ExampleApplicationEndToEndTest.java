@@ -13,7 +13,10 @@ import dev.reliableevent.jdbc.DeadEventOperations;
 import dev.reliableevent.jdbc.DeadEventReplayRequest;
 import dev.reliableevent.jdbc.DeadEventReplayResult;
 import dev.reliableevent.jdbc.internal.publication.JdbcEventPublicationWorker;
+import dev.reliableevent.jdbc.internal.recovery.JdbcExpiredLeaseRecovery;
 import dev.reliableevent.jdbc.internal.retry.ExponentialBackoff;
+import dev.reliableevent.autoconfigure.ReliableEventScheduler;
+import dev.reliableevent.jdbc.internal.observation.PublicationObserver;
 import dev.reliableevent.rocketmq.MapEventDestinationResolver;
 import dev.reliableevent.rocketmq.RocketMqEventSender;
 import org.apache.rocketmq.client.apis.ClientConfiguration;
@@ -40,9 +43,11 @@ import org.springframework.boot.builder.SpringApplicationBuilder;
 import org.springframework.boot.web.servlet.context.ServletWebServerApplicationContext;
 import org.springframework.context.ConfigurableApplicationContext;
 import org.springframework.boot.test.context.TestConfiguration;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.context.annotation.Bean;
 import org.springframework.core.io.ClassPathResource;
 import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.jdbc.datasource.DataSourceTransactionManager;
 import org.springframework.jdbc.datasource.DriverManagerDataSource;
 import org.springframework.jdbc.datasource.init.ResourceDatabasePopulator;
 import org.springframework.transaction.PlatformTransactionManager;
@@ -61,6 +66,9 @@ import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
@@ -70,6 +78,7 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
@@ -169,13 +178,16 @@ class ExampleApplicationEndToEndTest {
     @BeforeEach
     void createTables() {
         DriverManagerDataSource dataSource = new DriverManagerDataSource(
-                MYSQL.getJdbcUrl(), MYSQL.getUsername(), MYSQL.getPassword());
+                mysqlJdbcUrlUtc(), MYSQL.getUsername(), MYSQL.getPassword());
         new ResourceDatabasePopulator(
                 new ClassPathResource("schema/reliable-event-outbox.sql"),
                 new ClassPathResource("schema/reliable-event-replay-audit-m6-2.sql"),
                 new ClassPathResource("schema/example-tables.sql")
         ).execute(dataSource);
         jdbc = new JdbcTemplate(dataSource);
+        assertThat(jdbc.queryForObject("SELECT @@session.time_zone", String.class))
+                .as("MySQL test sessions use UTC for lease and retry timestamps")
+                .isIn("UTC", "+00:00");
     }
 
     @AfterEach
@@ -370,6 +382,341 @@ class ExampleApplicationEndToEndTest {
                     .untilAsserted(() -> assertThat(effectCount(created.orderId())).isOne());
             assertThat(consumedCount(created.orderId())).isOne();
         }
+    }
+
+    @Test
+    void confirmedChildCrashAndRealRedeliveryKeepOneOrderBusinessEffect() throws Exception {
+        startApplication(false);
+        MemorySpanExporter.reset();
+        Created created = postOrder("child-crash", 5);
+        ClientConfiguration configuration = ClientConfiguration.newBuilder()
+                .setEndpoints("localhost:" + PROXY_GRPC_PORT)
+                .setRequestTimeout(Duration.ofSeconds(10))
+                .enableSsl(false)
+                .build();
+        try (SimpleConsumer probe = PROVIDER.newSimpleConsumerBuilder()
+                .setClientConfiguration(configuration)
+                .setConsumerGroup(PROBE_GROUP)
+                .setAwaitDuration(Duration.ofSeconds(3))
+                .setSubscriptionExpressions(Map.of(TOPIC, FilterExpression.SUB_ALL))
+                .build()) {
+            Path evidence = Path.of("target", "evidence", "m9.4-rocketmq-example-confirmed-crash");
+            Files.createDirectories(evidence);
+            String runId = UUID.randomUUID().toString();
+            Path marker = evidence.resolve("order-" + created.orderId() + "-" + runId + ".ready");
+            Path output = evidence.resolve("order-" + created.orderId() + "-" + runId + ".child.log");
+            String classpath = System.getProperty("surefire.test.class.path",
+                    System.getProperty("java.class.path"));
+            Process child = new ProcessBuilder(javaExecutable(), "-cp", classpath,
+                    RocketMqExampleCrashProcess.class.getName(), mysqlJdbcUrlUtc(), MYSQL.getUsername(),
+                    MYSQL.getPassword(), Long.toString(created.eventId()),
+                    "localhost:" + PROXY_GRPC_PORT, TOPIC, marker.toAbsolutePath().toString())
+                    .redirectErrorStream(true).redirectOutput(output.toFile()).start();
+            long childPid = child.pid();
+            try {
+                await("example child confirms through real RocketMQ before parent termination")
+                        .atMost(Duration.ofSeconds(45))
+                        .until(() -> exampleConfirmationMarkerIsComplete(marker, created.eventId()));
+                List<MessageView> firstMessage = receiveFor(probe,
+                        Long.toString(created.orderId()), 1);
+                assertExampleMessage(firstMessage.get(0), created, "child-crash", 5);
+                await().atMost(Duration.ofSeconds(30)).pollInterval(Duration.ofMillis(100))
+                        .untilAsserted(() -> {
+                            assertThat(effectCount(created.orderId())).isOne();
+                            assertThat(consumedCount(created.orderId())).isOne();
+                        });
+                child.destroyForcibly();
+                assertThat(child.waitFor(15, TimeUnit.SECONDS)).isTrue();
+                int childExit = child.exitValue();
+                assertThat(childExit).isNotZero();
+                assertThat(status(created.eventId())).isEqualTo(1);
+
+                jdbc.update("UPDATE reliable_event_outbox SET lease_until=UTC_TIMESTAMP(3)-INTERVAL 1 SECOND WHERE id=?",
+                        created.eventId());
+                JdbcExpiredLeaseRecovery recovery = new JdbcExpiredLeaseRecovery(jdbc,
+                        context.getBean(PlatformTransactionManager.class), 8,
+                        new ExponentialBackoff(Duration.ofMillis(1), Duration.ofMillis(1), 0, () -> 0));
+                assertThat(recovery.recoverExpiredLeases()).isOne();
+                assertThat(status(created.eventId())).isEqualTo(3);
+                jdbc.update("UPDATE reliable_event_outbox SET next_attempt_at=UTC_TIMESTAMP(3)-INTERVAL 1 SECOND WHERE id=?",
+                        created.eventId());
+                assertThat(worker(context.getBean(EventSender.class), Clock.systemUTC())
+                        .publishDueEvents()).isOne();
+                await().atMost(Duration.ofSeconds(30)).pollInterval(Duration.ofMillis(100))
+                        .untilAsserted(() -> assertThat(status(created.eventId())).isEqualTo(2));
+                List<MessageView> replay = receiveFor(probe, Long.toString(created.orderId()), 1);
+                assertExampleMessage(replay.get(0), created, "child-crash", 5);
+                assertThat(replay.get(0).getMessageId()).isNotEqualTo(firstMessage.get(0).getMessageId());
+                await("example consumer acknowledges the actual duplicate and reports idempotent skip")
+                        .atMost(Duration.ofSeconds(30)).pollInterval(Duration.ofMillis(100))
+                        .untilAsserted(() -> assertThat(MemorySpanExporter.finishedSpans())
+                                .anySatisfy(span -> {
+                                    assertThat(span.getName()).isEqualTo("example.order.consume");
+                                    assertThat(span.getAttributes().get(AttributeKey.stringKey(
+                                            "reliable_event.consume.result"))).isEqualTo("idempotent_skip");
+                                    assertThat(span.getAttributes().get(AttributeKey.stringKey(
+                                            "reliable_event.ack.result"))).isEqualTo("success");
+                                    assertThat(span.getAttributes().get(AttributeKey.stringKey(
+                                            "reliable_event.message_id")))
+                                            .isEqualTo(replay.get(0).getMessageId().toString());
+                                }));
+                assertThat(effectCount(created.orderId())).isOne();
+                assertThat(consumedCount(created.orderId())).isOne();
+                Files.writeString(evidence.resolve("order-" + created.orderId() + "-" + runId + ".timeline"),
+                        "childPid=" + childPid + "\nchildExit=" + childExit + "\n" +
+                                "firstRealBrokerMessageId=" + firstMessage.get(0).getMessageId() + "\n" +
+                                "firstConsumedBy=OrderMessageHandler\nbusinessEffectAfterFirst=1\n" +
+                                "leaseExpiry=SQL test injection, not elapsed production lease time\n" +
+                                "mysqlSessionTimeZone=" + sessionTimeZone() + "\n" +
+                                "recovered=RETRY_WAIT\n" +
+                                "secondRealBrokerMessageId=" + replay.get(0).getMessageId() + "\n" +
+                                "eventId=" + created.eventId() + "\nrealMessages=2\n" +
+                                "OrderMessageHandlerSkippedDuplicate=true\nbusinessEffectFinal=1\n" +
+                                "consumedIdentityRowsFinal=1\nfinalOutboxStatus=PUBLISHED\n");
+            } finally {
+                stopOwnedChild(child);
+            }
+        }
+    }
+
+    @Test
+    void contextClosesFrameworkOwnedRocketMqClientsAfterRealSend() throws Exception {
+        Set<String> threadsBeforeContext = liveRocketMqThreadNames();
+        startApplication(false);
+        Producer producer = context.getBean(Producer.class);
+        assertThat(producer).isNotNull();
+        Created created = postOrder("native-close", 1);
+        assertThat(worker(context.getBean(EventSender.class), Clock.systemUTC())
+                .publishDueEvents()).isOne();
+        assertThat(status(created.eventId())).isEqualTo(2);
+        Set<String> activeProducerThreads = liveRocketMqThreadNames();
+        activeProducerThreads.removeAll(threadsBeforeContext);
+        assertThat(activeProducerThreads).as("native Producer created RocketMQ client threads")
+                .isNotEmpty();
+        ConfigurableApplicationContext ownedContext = context;
+        long started = System.nanoTime();
+        ownedContext.close();
+        long elapsedMillis = Duration.ofNanos(System.nanoTime() - started).toMillis();
+        context = null;
+
+        assertThat(ownedContext.isActive()).isFalse();
+        assertThat(elapsedMillis).isLessThan(10_000L);
+        await("framework-owned RocketMQ client threads terminate after context shutdown")
+                .atMost(Duration.ofSeconds(10)).pollInterval(Duration.ofMillis(100))
+                .until(() -> {
+                    Set<String> remaining = liveRocketMqThreadNames();
+                    remaining.retainAll(activeProducerThreads);
+                    return remaining.isEmpty();
+                });
+        Path evidence = Path.of("target", "evidence", "m9.4-rocketmq-example-shutdown");
+        Files.createDirectories(evidence);
+        Files.writeString(evidence.resolve("native-producer-context-close.timeline"),
+                "frameworkOwnedContext=real RocketMQ Producer plus example SimpleConsumer\n" +
+                        "realSendStatus=PUBLISHED\n" +
+                        "additionalRocketMqClientThreadNames=" + activeProducerThreads + "\n" +
+                        "remainingAdditionalClientThreadNames=[]\ncontextClosed=true\n" +
+                        "elapsedMillis=" + elapsedMillis + "\nlimitMillis=10000\n");
+    }
+
+    @Test
+    void userSuppliedNativeRocketMqProducerRemainsUsableAfterApplicationContextCloses() throws Exception {
+        startApplication(false, false, 8, "--test.rocketmq.user-producer=true");
+        Producer userProducer = context.getBean(Producer.class);
+        SimpleConsumer probe = null;
+        try {
+            probe = newProbeConsumer();
+            ConfigurableApplicationContext ownedContext = context;
+            ownedContext.close();
+            context = null;
+            assertThat(ownedContext.isActive()).isFalse();
+
+            String key = "user-producer-after-context-" + UUID.randomUUID();
+            byte[] body = "{\"contextClosed\":true}".getBytes(StandardCharsets.UTF_8);
+            var message = PROVIDER.newMessageBuilder().setTopic(TOPIC).setTag("created")
+                    .setKeys(key).setBody(body).build();
+            var receipt = userProducer.send(message);
+            assertThat(receipt.getMessageId().toString()).isNotBlank();
+            List<MessageView> delivered = receiveFor(probe, key, 1);
+            assertThat(delivered.get(0).getMessageId()).isEqualTo(receipt.getMessageId());
+            assertThat(delivered.get(0).getTag()).contains("created");
+            ByteBuffer payload = delivered.get(0).getBody().asReadOnlyBuffer();
+            byte[] receivedBody = new byte[payload.remaining()];
+            payload.get(receivedBody);
+            assertThat(receivedBody).isEqualTo(body);
+            Path evidence = Path.of("target", "evidence", "m9.4-rocketmq-example-shutdown");
+            Files.createDirectories(evidence);
+            Files.writeString(evidence.resolve("user-producer-survives-context.timeline"),
+                    "producerOwnership=user-supplied native Producer bean with no framework destroy method\n" +
+                            "applicationContextClosed=true\n" +
+                            "realBrokerSendAfterContextClose=true\nmessageId=" + receipt.getMessageId() + "\n" +
+                            "realBrokerPayloadMatched=true\n");
+        } finally {
+            if (context != null) { context.close(); context = null; }
+            if (probe != null) probe.close();
+            userProducer.close();
+        }
+    }
+
+    @Test
+    void normalContextStopWaitsForARealBrokerConfirmationBeforeClosingRocketMqClients() throws Exception {
+        Set<String> clientThreadsBeforeContext = liveRocketMqThreadNames();
+        startApplication(true, false, 8, "--test.rocketmq.shutdown-barrier=true",
+                "--reliable-event.shutdown-timeout=8s");
+        CountDownLatch confirmed = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        Path evidence = Path.of("target", "evidence", "m9.4-rocketmq-example-shutdown");
+        Files.createDirectories(evidence);
+        try (SimpleConsumer probe = newProbeConsumer()) {
+            ShutdownBarrier.armFirst(confirmed, release);
+            Created created = postOrder("normal-stop", 1);
+            await("scheduler reaches the observer after a real Broker receipt")
+                    .atMost(Duration.ofSeconds(30)).until(() -> confirmed.getCount() == 0);
+            assertThat(status(created.eventId())).isEqualTo(1);
+            Set<String> activeContextAndProbeThreads = liveRocketMqThreadNames();
+            activeContextAndProbeThreads.removeAll(clientThreadsBeforeContext);
+            ConfigurableApplicationContext ownedContext = context;
+            ReliableEventScheduler scheduler = ownedContext.getBean(ReliableEventScheduler.class);
+            Thread closer = new Thread(ownedContext::close, "m9.4-normal-context-close");
+            closer.start();
+            await().atMost(Duration.ofSeconds(5)).until(() -> !scheduler.isRunning());
+            release.countDown();
+            closer.join(15_000);
+            assertThat(closer.isAlive()).isFalse();
+            context = null;
+            assertThat(ShutdownBarrier.stateFinished().await(10, TimeUnit.SECONDS)).isTrue();
+            assertThat(status(created.eventId())).isEqualTo(2);
+            MessageView delivered = receiveFor(probe, Long.toString(created.orderId()), 1).get(0);
+            assertExampleMessage(delivered, created, "normal-stop", 1);
+            probe.close();
+            await("framework-owned RocketMQ client threads terminate after normal stop")
+                    .atMost(Duration.ofSeconds(10)).until(() -> {
+                        Set<String> remaining = liveRocketMqThreadNames();
+                        remaining.retainAll(activeContextAndProbeThreads);
+                        return remaining.isEmpty();
+                    });
+            Files.writeString(evidence.resolve("normal-inflight-stop.timeline"),
+                    "barrier=PublicationObserver after real Broker confirmation\n" +
+                            "eventId=" + created.eventId() + "\nmessageId=" + delivered.getMessageId() + "\n" +
+                            "statusBeforeRelease=PUBLISHING\nstatusAfterStop=PUBLISHED\n" +
+                            "schedulerStoppedBeforeProducerContextClose=true\nrealBrokerMessageCount=1\n" +
+                            "observerMessageId=" + ShutdownBarrier.confirmedMessageId + "\n" +
+                            "mysqlSessionTimeZone=" + sessionTimeZone() + "\n" +
+                            "contextAndProbeClientThreadsExited=true\n");
+        } finally {
+            release.countDown();
+            ShutdownBarrier.disarm();
+            if (context != null) { context.close(); context = null; }
+        }
+    }
+
+    @Test
+    void shutdownTimeoutReleasesQueuedCandidatesAndRecoversAnUncommittedRealConfirmationLease()
+            throws Exception {
+        Set<String> clientThreadsBeforeContext = liveRocketMqThreadNames();
+        startApplication(true, false, 8, "--test.rocketmq.shutdown-barrier=true",
+                "--reliable-event.shutdown-timeout=500ms", "--reliable-event.worker-threads=1",
+                "--reliable-event.worker-queue-capacity=2", "--reliable-event.claim-batch-size=3");
+        CountDownLatch confirmed = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        ShutdownBarrier.armFirst(confirmed, release);
+        Path evidence = Path.of("target", "evidence", "m9.4-rocketmq-example-shutdown");
+        Files.createDirectories(evidence);
+        try (SimpleConsumer probe = newProbeConsumer()) {
+            Created first = postOrder("timeout-stop-active", 1);
+            Created queuedOne = postOrder("timeout-stop-queued-one", 1);
+            Created queuedTwo = postOrder("timeout-stop-queued-two", 1);
+            await("active publication reaches real Broker receipt before shutdown timeout")
+                    .atMost(Duration.ofSeconds(30)).until(() -> confirmed.getCount() == 0);
+            await("two candidates are actually queued behind the active worker")
+                    .atMost(Duration.ofSeconds(10)).until(() -> ShutdownBarrier.queuedCandidates.get() == 2);
+            assertThat(status(first.eventId())).isEqualTo(1);
+            long closeStarted = System.nanoTime();
+            ConfigurableApplicationContext ownedContext = context;
+            ownedContext.close();
+            long closeMillis = Duration.ofNanos(System.nanoTime() - closeStarted).toMillis();
+            context = null;
+            assertThat(ownedContext.isActive()).isFalse();
+            assertThat(closeMillis).isLessThan(10_000L);
+            assertThat(status(first.eventId())).isEqualTo(1);
+            assertThat(status(queuedOne.eventId())).isZero();
+            assertThat(status(queuedTwo.eventId())).isZero();
+            assertThat(ShutdownBarrier.queuedCandidates).hasValue(0);
+            assertThat(ShutdownBarrier.activeWorkers).hasValue(1);
+            Set<String> clientThreadsAfterClose = liveRocketMqThreadNames();
+
+            release.countDown();
+            assertThat(ShutdownBarrier.completed().await(10, TimeUnit.SECONDS)).isTrue();
+            assertThat(ShutdownBarrier.stateFinished().await(10, TimeUnit.SECONDS)).isTrue();
+            await("timed-out publication worker exits after the barrier is released")
+                    .atMost(Duration.ofSeconds(10)).until(() -> ShutdownBarrier.activeWorkers.get() == 0);
+            assertThat(status(first.eventId())).isEqualTo(1);
+            jdbc.update("UPDATE reliable_event_outbox SET lease_until=UTC_TIMESTAMP(3)-INTERVAL 1 SECOND WHERE id=?",
+                    first.eventId());
+            DataSourceTransactionManager externalTransactions =
+                    new DataSourceTransactionManager(jdbc.getDataSource());
+            JdbcExpiredLeaseRecovery recovery = new JdbcExpiredLeaseRecovery(jdbc, externalTransactions, 8,
+                    new ExponentialBackoff(Duration.ofMillis(1), Duration.ofMillis(1), 0, () -> 0));
+            assertThat(recovery.recoverExpiredLeases()).isOne();
+            assertThat(status(first.eventId())).isEqualTo(3);
+            assertThat(attemptCount(first.eventId())).isOne();
+            assertThat(ShutdownBarrier.interruptedWhileWaiting).isTrue();
+            MessageView confirmedDelivery = assertOnlyFirstMessageFor(probe, first, queuedOne, queuedTwo);
+            String confirmedMessageId = ShutdownBarrier.confirmedMessageId;
+            assertThat(confirmedDelivery.getMessageId().toString()).isEqualTo(confirmedMessageId);
+            probe.close();
+            long threadCloseStarted = System.nanoTime();
+            Set<String> remaining = new HashSet<>();
+            long threadDeadline = System.nanoTime() + Duration.ofSeconds(30).toNanos();
+            do {
+                remaining.clear();
+                remaining.addAll(liveRocketMqThreadNames());
+                remaining.removeAll(clientThreadsBeforeContext);
+                if (remaining.isEmpty()) break;
+                Thread.sleep(200);
+            } while (System.nanoTime() < threadDeadline);
+            long threadCloseMillis = Duration.ofNanos(System.nanoTime() - threadCloseStarted).toMillis();
+            String threadDiagnostics = liveRocketMqThreadDiagnostics();
+            Files.writeString(evidence.resolve("timeout-inflight-stop.timeline"),
+                    "barrier=PublicationObserver after real Broker confirmation\n" +
+                            "shutdownTimeoutMillis=500\ncontextCloseMillis=" + closeMillis + "\n" +
+                            "activeBeforeStop=PUBLISHING\nactiveAfterTimedOutStop=PUBLISHING\n" +
+                            "leaseExpiry=SQL test injection, not elapsed production lease time\n" +
+                            "recoveryStatus=RETRY_WAIT\nattemptCount=1\n" +
+                            "firstRealBrokerMessageId=" + confirmedDelivery.getMessageId() + "\n" +
+                            "queuedOneStatus=PENDING\nqueuedTwoStatus=PENDING\n" +
+                            "queuedOneRealMessages=0 during probe window\nqueuedTwoRealMessages=0 during probe window\n" +
+                            "mysqlSessionTimeZone=" + sessionTimeZone() + "\n" +
+                            "frameworkOwnedContextClosed=true\nclientThreadsSeenImmediatelyAfterClose=" +
+                            clientThreadsAfterClose + "\nprobeClosedBeforeThreadWait=true\n" +
+                            "newRocketMqThreadExitWaitMillis=" + threadCloseMillis + "\n" +
+                            "allContextAndProbeClientThreadsExited=" + remaining.isEmpty() + "\n" +
+                            "remainingRocketMqThreadDiagnostics=" + threadDiagnostics + "\n");
+            assertThat(remaining).as("new RocketMQ threads still alive after context and Probe close: " +
+                    threadDiagnostics).isEmpty();
+        } finally {
+            release.countDown();
+            ShutdownBarrier.disarm();
+            if (context != null) { context.close(); context = null; }
+        }
+    }
+
+    private Set<String> liveRocketMqThreadNames() {
+        Set<String> names = new HashSet<>();
+        for (Thread thread : Thread.getAllStackTraces().keySet()) {
+            if (thread.isAlive() && thread.getName().toLowerCase().contains("rocketmq")) {
+                names.add(thread.getName());
+            }
+        }
+        return names;
+    }
+
+    private String liveRocketMqThreadDiagnostics() {
+        return Thread.getAllStackTraces().entrySet().stream()
+                .filter(entry -> entry.getKey().isAlive() &&
+                        entry.getKey().getName().toLowerCase().contains("rocketmq"))
+                .map(entry -> entry.getKey().getName() + "[state=" + entry.getKey().getState() +
+                        ",stack=" + java.util.Arrays.stream(entry.getValue()).limit(5).toList() + "]")
+                .sorted().toList().toString();
     }
 
     @Test
@@ -590,7 +937,7 @@ class ExampleApplicationEndToEndTest {
                                   String... extraProperties) {
         String[] properties = new String[] {
                         "--server.port=0",
-                        "--spring.datasource.url=" + MYSQL.getJdbcUrl(),
+                        "--spring.datasource.url=" + mysqlJdbcUrlUtc(),
                         "--spring.datasource.username=" + MYSQL.getUsername(),
                         "--spring.datasource.password=" + MYSQL.getPassword(),
                         "--example.rocketmq.topic=" + TOPIC,
@@ -607,7 +954,8 @@ class ExampleApplicationEndToEndTest {
                 };
         String[] all = java.util.Arrays.copyOf(properties, properties.length + extraProperties.length);
         System.arraycopy(extraProperties, 0, all, properties.length, extraProperties.length);
-        context = new SpringApplicationBuilder(ExampleApplication.class, TracingTestConfiguration.class)
+        context = new SpringApplicationBuilder(ExampleApplication.class, TracingTestConfiguration.class,
+                ShutdownBarrierConfiguration.class, UserProducerConfiguration.class)
                 .run(all);
     }
 
@@ -674,6 +1022,90 @@ class ExampleApplicationEndToEndTest {
         return matches;
     }
 
+    private SimpleConsumer newProbeConsumer() throws Exception {
+        ClientConfiguration configuration = ClientConfiguration.newBuilder()
+                .setEndpoints("localhost:" + PROXY_GRPC_PORT)
+                .setRequestTimeout(Duration.ofSeconds(10))
+                .enableSsl(false)
+                .build();
+        return PROVIDER.newSimpleConsumerBuilder()
+                .setClientConfiguration(configuration)
+                .setConsumerGroup(PROBE_GROUP)
+                .setAwaitDuration(Duration.ofSeconds(3))
+                .setSubscriptionExpressions(Map.of(TOPIC, FilterExpression.SUB_ALL))
+                .build();
+    }
+
+    private MessageView assertOnlyFirstMessageFor(SimpleConsumer probe, Created first,
+                                                   Created queuedOne, Created queuedTwo) throws Exception {
+        List<MessageView> firstMessages = new ArrayList<>();
+        long deadline = System.nanoTime() + Duration.ofSeconds(8).toNanos();
+        Set<String> queuedKeys = Set.of(Long.toString(queuedOne.orderId()),
+                Long.toString(queuedTwo.orderId()));
+        while ((firstMessages.isEmpty() || System.nanoTime() < deadline)
+                && System.nanoTime() < deadline) {
+            for (MessageView message : probe.receive(8, Duration.ofSeconds(10))) {
+                if (message.getKeys().contains(Long.toString(first.orderId()))) {
+                    firstMessages.add(message);
+                } else {
+                    assertThat(message.getKeys()).doesNotContainAnyElementsOf(queuedKeys);
+                }
+                probe.ack(message);
+            }
+        }
+        assertThat(firstMessages).hasSize(1);
+        assertExampleMessage(firstMessages.get(0), first, "timeout-stop-active", 1);
+        return firstMessages.get(0);
+    }
+
+    private boolean exampleConfirmationMarkerIsComplete(Path marker, long eventId) throws Exception {
+        if (!Files.exists(marker)) return false;
+        List<String> lines = Files.readAllLines(marker);
+        return lines.contains("boundary=real-broker-confirmed-before-state-commit")
+                && lines.contains("eventId=" + eventId)
+                && lines.stream().anyMatch(line -> line.startsWith("messageId=")
+                && !line.substring("messageId=".length()).isBlank());
+    }
+
+    private void assertExampleMessage(MessageView message, Created created,
+                                      String itemCode, int quantity) throws Exception {
+        assertThat(message.getTopic()).isEqualTo(TOPIC);
+        assertThat(message.getTag()).contains("created");
+        assertThat(message.getKeys()).contains(Long.toString(created.orderId()));
+        assertThat(message.getProperties())
+                .containsEntry("reliable_event_id", Long.toString(created.eventId()))
+                .containsEntry("reliable_event_type", OrderService.EVENT_TYPE)
+                .containsEntry("reliable_event_key", Long.toString(created.orderId()));
+        ByteBuffer body = message.getBody().asReadOnlyBuffer();
+        byte[] bytes = new byte[body.remaining()];
+        body.get(bytes);
+        JsonNode payload = mapper.readTree(new String(bytes, StandardCharsets.UTF_8));
+        assertThat(payload.path("orderId").asLong()).isEqualTo(created.orderId());
+        assertThat(payload.path("itemCode").asText()).isEqualTo(itemCode);
+        assertThat(payload.path("quantity").asInt()).isEqualTo(quantity);
+    }
+
+    private void stopOwnedChild(Process child) throws InterruptedException {
+        if (child.isAlive()) child.destroyForcibly();
+        if (child.isAlive()) child.waitFor(15, TimeUnit.SECONDS);
+    }
+
+    private static String javaExecutable() {
+        String executable = System.getProperty("os.name", "").toLowerCase().contains("win")
+                ? "java.exe" : "java";
+        return Path.of(System.getProperty("java.home"), "bin", executable).toString();
+    }
+
+    private static String mysqlJdbcUrlUtc() {
+        String url = MYSQL.getJdbcUrl();
+        return url + (url.contains("?") ? "&" : "?")
+                + "connectionTimeZone=UTC&forceConnectionTimeZoneToSession=true";
+    }
+
+    private String sessionTimeZone() {
+        return jdbc.queryForObject("SELECT @@session.time_zone", String.class);
+    }
+
     private int status(long eventId) {
         return jdbc.queryForObject("SELECT status FROM reliable_event_outbox WHERE id = ?",
                 Integer.class, eventId);
@@ -720,6 +1152,114 @@ class ExampleApplicationEndToEndTest {
         @Bean
         SdkTracerProviderBuilderCustomizer memorySpanExporterCustomizer(MemorySpanExporter exporter) {
             return builder -> builder.addSpanProcessor(SimpleSpanProcessor.create(exporter));
+        }
+    }
+
+    @TestConfiguration(proxyBeanMethods = false)
+    @ConditionalOnProperty(name = "test.rocketmq.shutdown-barrier", havingValue = "true")
+    static class ShutdownBarrierConfiguration {
+        @Bean
+        PublicationObserver shutdownBarrierPublicationObserver() {
+            return new PublicationObserver() {
+                @Override
+                public void sendSucceeded(dev.reliableevent.jdbc.internal.model.ClaimedEvent event,
+                                          dev.reliableevent.internal.publication.SendReceipt receipt,
+                                          long elapsedNanos, Instant at) {
+                    if (!ShutdownBarrier.enter(event.event().eventKey())) return;
+                    ShutdownBarrier.confirmedMessageId = receipt.messageId();
+                    ShutdownBarrier.entered.countDown();
+                    boolean interrupted = false;
+                    while (true) {
+                        try {
+                            ShutdownBarrier.release.await();
+                            break;
+                        } catch (InterruptedException ignored) {
+                            interrupted = true;
+                        }
+                    }
+                    ShutdownBarrier.interruptedWhileWaiting = interrupted;
+                    ShutdownBarrier.completed.countDown();
+                }
+
+                @Override
+                public void stateTransitionCommitted(String status) {
+                    if ("PUBLISHED".equals(status)) ShutdownBarrier.stateFinished.countDown();
+                }
+
+                @Override
+                public void stateUpdateFailed(String status, boolean ownershipRejected) {
+                    if ("PUBLISHED".equals(status)) ShutdownBarrier.stateFinished.countDown();
+                }
+
+                @Override public void candidateQueued() { ShutdownBarrier.queuedCandidates.incrementAndGet(); }
+                @Override public void candidateDequeued() { ShutdownBarrier.queuedCandidates.decrementAndGet(); }
+                @Override public void workerStarted() { ShutdownBarrier.activeWorkers.incrementAndGet(); }
+                @Override public void workerFinished() { ShutdownBarrier.activeWorkers.decrementAndGet(); }
+            };
+        }
+    }
+
+    @TestConfiguration(proxyBeanMethods = false)
+    @ConditionalOnProperty(name = "test.rocketmq.user-producer", havingValue = "true")
+    static class UserProducerConfiguration {
+        @Bean
+        ClientConfiguration userProducerClientConfiguration() {
+            return ClientConfiguration.newBuilder()
+                    .setEndpoints("localhost:" + PROXY_GRPC_PORT)
+                    .setRequestTimeout(Duration.ofSeconds(10))
+                    .enableSsl(false)
+                    .build();
+        }
+
+        @Bean(destroyMethod = "")
+        Producer userSuppliedNativeRocketMqProducer(ClientConfiguration configuration) throws Exception {
+            return PROVIDER.newProducerBuilder().setClientConfiguration(configuration)
+                    .setTopics(TOPIC).setMaxAttempts(1).build();
+        }
+    }
+
+    private static final class ShutdownBarrier {
+        private static volatile String targetEventKey;
+        private static volatile CountDownLatch entered = new CountDownLatch(0);
+        private static volatile CountDownLatch release = new CountDownLatch(0);
+        private static volatile CountDownLatch completed = new CountDownLatch(0);
+        private static volatile CountDownLatch stateFinished = new CountDownLatch(0);
+        private static final AtomicBoolean triggered = new AtomicBoolean();
+        private static final AtomicInteger queuedCandidates = new AtomicInteger();
+        private static final AtomicInteger activeWorkers = new AtomicInteger();
+        private static volatile String confirmedMessageId;
+        private static volatile boolean interruptedWhileWaiting;
+
+        private static void arm(String eventKey, CountDownLatch reached, CountDownLatch allow,
+                                boolean blockFirst) {
+            targetEventKey = blockFirst ? "*" : eventKey;
+            entered = reached;
+            release = allow;
+            completed = new CountDownLatch(1);
+            stateFinished = new CountDownLatch(1);
+            confirmedMessageId = null;
+            interruptedWhileWaiting = false;
+            triggered.set(false);
+            queuedCandidates.set(0);
+            activeWorkers.set(0);
+        }
+
+        private static void armFirst(CountDownLatch reached, CountDownLatch allow) {
+            arm("*", reached, allow, true);
+        }
+
+        private static boolean enter(String eventKey) {
+            String target = targetEventKey;
+            if (target == null || !(target.equals("*") || target.equals(eventKey))) return false;
+            return triggered.compareAndSet(false, true);
+        }
+
+        private static CountDownLatch completed() { return completed; }
+        private static CountDownLatch stateFinished() { return stateFinished; }
+
+        private static void disarm() {
+            targetEventKey = null;
+            release.countDown();
         }
     }
 

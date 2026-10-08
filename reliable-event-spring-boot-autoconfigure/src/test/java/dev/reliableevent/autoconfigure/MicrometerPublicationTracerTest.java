@@ -28,6 +28,10 @@ import java.util.Collection;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -216,6 +220,99 @@ class MicrometerPublicationTracerTest {
                 .getParentSpanContext().isValid()).isFalse();
         sdk.close();
     }
+
+    @Test
+    void concurrentAttemptsKeepTheirTraceContextAndCloseOnlyTheirOwnScope() throws Exception {
+        CollectingExporter exporter = new CollectingExporter();
+        SdkTracerProvider provider = SdkTracerProvider.builder()
+                .addSpanProcessor(SimpleSpanProcessor.create(exporter)).build();
+        OpenTelemetrySdk sdk = OpenTelemetrySdk.builder()
+                .setTracerProvider(provider)
+                .setPropagators(ContextPropagators.create(W3CTraceContextPropagator.getInstance()))
+                .build();
+        OtelCurrentTraceContext current = new OtelCurrentTraceContext();
+        Tracer tracer = new OtelTracer(sdk.getTracer("m9.4-concurrent-test"), current, ignored -> { },
+                new OtelBaggageManager(current, List.of(), List.of()));
+        Propagator propagator = new OtelPropagator(sdk.getPropagators(), sdk.getTracer("m9.4-concurrent-test"));
+        PublicationTracer publicationTracer = new MicrometerPublicationTracer(tracer, propagator, objectMapper);
+        Map<Long, Map<String, String>> contexts = Map.of(
+                61L, registrationHeaders(tracer, propagator),
+                62L, registrationHeaders(tracer, propagator));
+        CountDownLatch bothAttemptsStarted = new CountDownLatch(2);
+        CountDownLatch releaseAttempts = new CountDownLatch(1);
+        ExecutorService executor = Executors.newFixedThreadPool(2);
+        try {
+            Future<ConcurrentAttemptResult> first = executor.submit(() -> runConcurrentAttempt(
+                    publicationTracer, tracer, contexts.get(61L), 61L, bothAttemptsStarted, releaseAttempts));
+            Future<ConcurrentAttemptResult> second = executor.submit(() -> runConcurrentAttempt(
+                    publicationTracer, tracer, contexts.get(62L), 62L, bothAttemptsStarted, releaseAttempts));
+
+            assertThat(bothAttemptsStarted.await(5, TimeUnit.SECONDS)).isTrue();
+            releaseAttempts.countDown();
+            ConcurrentAttemptResult firstResult = first.get(5, TimeUnit.SECONDS);
+            ConcurrentAttemptResult secondResult = second.get(5, TimeUnit.SECONDS);
+
+            assertThat(firstResult.traceId()).isEqualTo(traceId(contexts.get(61L).get("traceparent")));
+            assertThat(secondResult.traceId()).isEqualTo(traceId(contexts.get(62L).get("traceparent")));
+            assertThat(firstResult.traceId()).isNotEqualTo(secondResult.traceId());
+            assertThat(firstResult.attemptSpanId()).isNotEqualTo(secondResult.attemptSpanId());
+            assertThat(firstResult.scopeCleared()).isTrue();
+            assertThat(secondResult.scopeCleared()).isTrue();
+
+            assertThat(provider.forceFlush().join(10, TimeUnit.SECONDS).isSuccess()).isTrue();
+            SpanData firstSpan = findSpan(new ArrayList<>(exporter.spans), firstResult.attemptSpanId());
+            SpanData secondSpan = findSpan(new ArrayList<>(exporter.spans), secondResult.attemptSpanId());
+            assertThat(firstSpan.getTraceId()).isEqualTo(firstResult.traceId());
+            assertThat(secondSpan.getTraceId()).isEqualTo(secondResult.traceId());
+            assertThat(firstSpan.getParentSpanId()).isEqualTo(firstResult.parentSpanId());
+            assertThat(secondSpan.getParentSpanId()).isEqualTo(secondResult.parentSpanId());
+        } finally {
+            releaseAttempts.countDown();
+            executor.shutdownNow();
+            sdk.close();
+        }
+    }
+
+    private ConcurrentAttemptResult runConcurrentAttempt(PublicationTracer publicationTracer, Tracer tracer,
+                                                          Map<String, String> registrationHeaders, long eventId,
+                                                          CountDownLatch bothAttemptsStarted,
+                                                          CountDownLatch releaseAttempts) throws Exception {
+        PublicationTracer.Attempt attempt = publicationTracer.begin(
+                claimed(storedEvent(registrationHeaders), 1));
+        String traceId;
+        String attemptSpanId;
+        try {
+            StoredEvent outbound = attempt.eventForSend();
+            Map<String, String> outboundHeaders = readHeaders(outbound);
+            String outboundTraceparent = outboundHeaders.get("traceparent");
+            traceId = traceId(outboundTraceparent);
+            attemptSpanId = spanId(outboundTraceparent);
+            assertThat(tracer.currentSpan()).isNotNull();
+            assertThat(tracer.currentSpan().context().spanId()).isEqualTo(attemptSpanId);
+            bothAttemptsStarted.countDown();
+            assertThat(releaseAttempts.await(5, TimeUnit.SECONDS)).isTrue();
+            attempt.sendSucceeded(new SendReceipt("message-" + eventId));
+        } finally {
+            attempt.close();
+        }
+        return new ConcurrentAttemptResult(traceId, attemptSpanId,
+                spanId(registrationHeaders.get("traceparent")), tracer.currentSpan() == null);
+    }
+
+    private Map<String, String> registrationHeaders(Tracer tracer, Propagator propagator) {
+        var registration = tracer.nextSpan().name("concurrent-registration").start();
+        try {
+            Map<String, String> headers = new java.util.LinkedHashMap<>();
+            propagator.inject(registration.context(), headers,
+                    (carrier, key, value) -> carrier.put(key, value));
+            return Map.copyOf(headers);
+        } finally {
+            registration.end();
+        }
+    }
+
+    private record ConcurrentAttemptResult(String traceId, String attemptSpanId, String parentSpanId,
+                                           boolean scopeCleared) { }
 
     private StoredEvent storedEvent(Map<String, String> headers) throws Exception {
         return new StoredEvent(new EventId(51), "test.event", "same-key", "{\"payload\":true}",

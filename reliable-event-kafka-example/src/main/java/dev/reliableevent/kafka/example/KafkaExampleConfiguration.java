@@ -10,6 +10,9 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.beans.factory.ObjectProvider;
+import io.micrometer.tracing.Tracer;
+import io.micrometer.tracing.propagation.Propagator;
 
 import java.util.Map;
 import java.util.Properties;
@@ -57,6 +60,9 @@ class KafkaExampleConfiguration {
             @Value("${example.kafka.topic}") String topic,
             @Value("${example.kafka.consumer-group}") String group,
             OrderMessageHandler handler,
+            ObjectProvider<Tracer> tracers,
+            ObjectProvider<Propagator> propagators,
+            @Value("${reliable-event.tracing-enabled:true}") boolean tracingEnabled,
             @Value("${example.kafka.poll-timeout:500ms}") java.time.Duration pollTimeout) {
         Map<String, Object> config = Map.of(
                 ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers,
@@ -65,7 +71,9 @@ class KafkaExampleConfiguration {
                 ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest",
                 ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class,
                 ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, ByteArrayDeserializer.class);
-        return new ExampleConsumerLoop(config, topic, pollTimeout, handler);
+        if (!tracingEnabled) return new ExampleConsumerLoop(config, topic, pollTimeout, handler);
+        return new ExampleConsumerLoop(config, topic, pollTimeout, handler,
+                tracers.getIfAvailable(), propagators.getIfAvailable());
     }
 
     record TopicProvisioner(String topic) { }

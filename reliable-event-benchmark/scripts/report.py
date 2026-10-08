@@ -48,6 +48,14 @@ def main(run_dir):
     registrations = rows(run_dir / "registration.csv")
     faults = rows(run_dir / "faults.csv") if (run_dir / "faults.csv").exists() else []
     expected = int(metadata["count"])
+    sample_epochs = [int(value) for sample in samples if (value := numeric(sample, "epoch_ms")) is not None]
+    sample_window = {
+        "sample_count": len(sample_epochs),
+        "start_epoch_ms": sample_epochs[0] if sample_epochs else None,
+        "end_epoch_ms": sample_epochs[-1] if sample_epochs else None,
+        "duration_ms": sample_epochs[-1] - sample_epochs[0] if len(sample_epochs) > 1 else None,
+        "nominal_period_ms": metadata.get("m94SamplePeriodNominalMs"),
+    }
 
     statuses = Counter(int(event["status"]) for event in events)
     lags = []
@@ -118,8 +126,27 @@ def main(run_dir):
     connections = [value for value in connections if value is not None]
     active_connections = [numeric(sample, "threads_running") for sample in samples]
     active_connections = [value for value in active_connections if value is not None]
-    publisher_memory = [numeric(sample, "publisher_memory_bytes") for sample in samples]
+    publisher_memory = []
+    for sample in samples:
+        working_set = numeric(sample, "publisher_working_set_bytes")
+        if working_set is None:  # Read M5.3 evidence that used the earlier CSV field name.
+            working_set = numeric(sample, "publisher_memory_bytes")
+        publisher_memory.append(working_set)
     publisher_memory = [value for value in publisher_memory if value is not None]
+    publisher_private_bytes = [numeric(sample, "publisher_private_bytes") for sample in samples]
+    publisher_private_bytes = [value for value in publisher_private_bytes if value is not None]
+    publisher_thread_count = [numeric(sample, "publisher_thread_count") for sample in samples]
+    publisher_thread_count = [value for value in publisher_thread_count if value is not None]
+    publisher_handle_count = [numeric(sample, "publisher_handle_count") for sample in samples]
+    publisher_handle_count = [value for value in publisher_handle_count if value is not None]
+    receiver_memory = [numeric(sample, "receiver_working_set_bytes") for sample in samples]
+    receiver_memory = [value for value in receiver_memory if value is not None]
+    receiver_private_bytes = [numeric(sample, "receiver_private_bytes") for sample in samples]
+    receiver_private_bytes = [value for value in receiver_private_bytes if value is not None]
+    receiver_thread_count = [numeric(sample, "receiver_thread_count") for sample in samples]
+    receiver_thread_count = [value for value in receiver_thread_count if value is not None]
+    receiver_handle_count = [numeric(sample, "receiver_handle_count") for sample in samples]
+    receiver_handle_count = [value for value in receiver_handle_count if value is not None]
     lock_waits = [numeric(sample, "innodb_row_lock_waits") for sample in samples]
     lock_time = [numeric(sample, "innodb_row_lock_time_ms") for sample in samples]
     published_times = sorted(int(event["published_epoch_ms"]) for event in events
@@ -144,6 +171,7 @@ def main(run_dir):
         "registration_duration_seconds": load_duration_ns / 1e9 if load_duration_ns else None,
         "registration_events_per_second": expected / (load_duration_ns / 1e9) if load_duration_ns else None,
         "outbox_rows": len(events),
+        "resource_sample_window": sample_window,
         "status_counts": {str(code): statuses[code] for code in range(5)},
         "state_conserved": len(events) == expected and statuses[2] == expected,
         "first_to_published_time_difference": distribution(lags),
@@ -165,6 +193,13 @@ def main(run_dir):
         "mysql_connected_threads_maximum": max(connections) if connections else None,
         "mysql_running_threads_maximum": max(active_connections) if active_connections else None,
         "publisher_memory_bytes_maximum": max(publisher_memory) if publisher_memory else None,
+        "publisher_private_bytes_maximum_sampled": max(publisher_private_bytes) if publisher_private_bytes else None,
+        "publisher_thread_count_maximum_sampled": max(publisher_thread_count) if publisher_thread_count else None,
+        "publisher_handle_count_maximum_sampled": max(publisher_handle_count) if publisher_handle_count else None,
+        "receiver_memory_bytes_maximum_sampled": max(receiver_memory) if receiver_memory else None,
+        "receiver_private_bytes_maximum_sampled": max(receiver_private_bytes) if receiver_private_bytes else None,
+        "receiver_thread_count_maximum_sampled": max(receiver_thread_count) if receiver_thread_count else None,
+        "receiver_handle_count_maximum_sampled": max(receiver_handle_count) if receiver_handle_count else None,
         "mysql_block_io_first_last": [samples[0].get("mysql_block_io"), samples[-1].get("mysql_block_io")] if samples else None,
         "broker_block_io_first_last": [samples[0].get("broker_block_io"), samples[-1].get("broker_block_io")] if samples else None,
         "innodb_row_lock_waits_delta": lock_waits[-1] - lock_waits[0] if len(lock_waits) >= 2 and None not in (lock_waits[0], lock_waits[-1]) else None,
@@ -181,6 +216,10 @@ def main(run_dir):
         " The PUBLISHED timestamp precedes the database commit and is not a precise commit time.",
         "",
         f"- Registered: {summary['registered_events']} / {expected}; Outbox rows: {summary['outbox_rows']}",
+        f"- Resource sampling window (actual first/last epoch ms, duration ms, samples, nominal period ms): "
+        f"{sample_window['start_epoch_ms']} / {sample_window['end_epoch_ms']} / "
+        f"{sample_window['duration_ms']} / {sample_window['sample_count']} / "
+        f"{sample_window['nominal_period_ms']}",
         f"- Final states (0/1/2/3/4): {summary['status_counts']}; conserved: {summary['state_conserved']}",
         f"- Registration events/s: {summary['registration_events_per_second']}",
         f"- Publication events/s, first batch commit return to last PUBLISHED timestamp: {overall_publish_rate};"
@@ -194,7 +233,12 @@ def main(run_dir):
         f"- MySQL CPU avg/max (% of one CPU): {summary['mysql_cpu_pct_average']} / {summary['mysql_cpu_pct_maximum']};"
         f" max connected/running threads: {summary['mysql_connected_threads_maximum']} /"
         f" {summary['mysql_running_threads_maximum']}",
-        f"- Publisher memory max (bytes): {summary['publisher_memory_bytes_maximum']};"
+        f"- Publisher maximum sampled working set/private bytes: {summary['publisher_memory_bytes_maximum']} / "
+        f"{summary['publisher_private_bytes_maximum_sampled']}; maximum sampled threads/handles: "
+        f"{summary['publisher_thread_count_maximum_sampled']} / {summary['publisher_handle_count_maximum_sampled']};"
+        f" receiver working set/private bytes: {summary['receiver_memory_bytes_maximum_sampled']} / "
+        f"{summary['receiver_private_bytes_maximum_sampled']}; receiver threads/handles: "
+        f"{summary['receiver_thread_count_maximum_sampled']} / {summary['receiver_handle_count_maximum_sampled']};"
         f" MySQL block I/O first/last: {summary['mysql_block_io_first_last']};"
         f" Broker block I/O first/last: {summary['broker_block_io_first_last']}",
         f"- InnoDB row lock waits/time deltas: {summary['innodb_row_lock_waits_delta']} / {summary['innodb_row_lock_time_ms_delta']} ms",

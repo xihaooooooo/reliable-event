@@ -6,6 +6,7 @@ import org.apache.kafka.clients.admin.ConfigEntry;
 import org.apache.kafka.clients.admin.NewTopic;
 import org.apache.kafka.common.config.ConfigResource;
 import org.apache.kafka.clients.consumer.ConsumerConfig;
+import org.apache.kafka.clients.consumer.KafkaConsumer;
 import org.apache.kafka.clients.producer.KafkaProducer;
 import org.apache.kafka.clients.producer.ProducerConfig;
 import org.apache.kafka.clients.producer.ProducerRecord;
@@ -22,6 +23,7 @@ import dev.reliableevent.internal.publication.EventSender;
 import dev.reliableevent.jdbc.internal.publication.JdbcEventPublicationWorker;
 import dev.reliableevent.jdbc.internal.retry.ExponentialBackoff;
 import org.springframework.boot.builder.SpringApplicationBuilder;
+import org.springframework.boot.web.context.WebServerApplicationContext;
 import org.springframework.context.ConfigurableApplicationContext;
 import org.springframework.core.io.ClassPathResource;
 import org.springframework.jdbc.core.JdbcTemplate;
@@ -41,6 +43,7 @@ import java.time.Duration;
 import java.util.Map;
 import java.util.Properties;
 import java.util.UUID;
+import java.util.ArrayList;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.TimeUnit;
 
@@ -134,6 +137,62 @@ class KafkaOrderEndToEndTest {
     }
 
     @Test
+    void httpRegistrationKafkaAttemptAndConsumerShareTraceWithoutChangingStoredContext() throws Exception {
+        String traceId = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        String httpSpanId = "1111111111111111";
+        String requestTraceparent = "00-" + traceId + "-" + httpSpanId + "-01";
+        int port = ((WebServerApplicationContext) context).getWebServer().getPort();
+        var request = java.net.http.HttpRequest.newBuilder(java.net.URI.create("http://localhost:" + port + "/orders"))
+                .header("Content-Type", "application/json")
+                .header("traceparent", requestTraceparent)
+                .POST(java.net.http.HttpRequest.BodyPublishers.ofString("{\"itemCode\":\"tracebook\",\"quantity\":2}"))
+                .build();
+        var response = java.net.http.HttpClient.newHttpClient().send(request,
+                java.net.http.HttpResponse.BodyHandlers.ofString());
+        assertThat(response.statusCode()).isEqualTo(201);
+        var created = context.getBean(com.fasterxml.jackson.databind.ObjectMapper.class)
+                .readValue(response.body(), OrderService.CreatedOrder.class);
+        String storedHeadersBeforeSend = jdbc.queryForObject(
+                "SELECT headers FROM reliable_event_outbox WHERE id=?", String.class, created.eventId());
+        String storedRegistrationParent = context.getBean(com.fasterxml.jackson.databind.ObjectMapper.class)
+                .readTree(storedHeadersBeforeSend).path("traceparent").asText();
+        assertThat(storedRegistrationParent).startsWith("00-" + traceId + "-");
+        assertThat(storedRegistrationParent).isNotEqualTo(requestTraceparent);
+
+        assertThat(publishPending()).isEqualTo(1);
+        var wireRecords = readWireRecords("kafka-trace-wire-" + UUID.randomUUID());
+        assertThat(wireRecords).hasSize(1);
+        String attemptTraceparent = headerValue(wireRecords.get(0), "traceparent");
+        assertThat(attemptTraceparent).startsWith("00-" + traceId + "-");
+        assertThat(attemptTraceparent.substring(36, 52))
+                .isNotEqualTo(storedRegistrationParent.substring(36, 52));
+        assertThat(headerValue(wireRecords.get(0), "reliable_event_id")).isEqualTo(Long.toString(created.eventId()));
+
+        String traceConsumerGroup = "kafka-trace-consumer-" + UUID.randomUUID();
+        var tracing = new KafkaConsumerTracingTest.TracingFixture();
+        ExampleConsumerLoop traceConsumer = new ExampleConsumerLoop(consumerConfiguration(traceConsumerGroup), topic,
+                Duration.ofMillis(100), context.getBean(OrderMessageHandler.class), tracing.tracer, tracing.propagator);
+        consumerLoops.add(traceConsumer);
+        traceConsumer.start();
+        try {
+            await(() -> effectCount(created.orderId()) == 1 && committed(traceConsumerGroup, 0) == 1,
+                    Duration.ofSeconds(20));
+            assertThat(tracing.ended).hasSize(1);
+            var consumedSpan = tracing.ended.get(0);
+            assertThat(consumedSpan.getTraceId()).isEqualTo(traceId);
+            assertThat(consumedSpan.getParentSpanId()).isEqualTo(attemptTraceparent.substring(36, 52));
+            assertThat(consumedSpan.getKind()).isEqualTo(io.opentelemetry.api.trace.SpanKind.CONSUMER);
+        } finally {
+            traceConsumer.stop();
+            tracing.close();
+        }
+        String storedHeadersAfterSend = jdbc.queryForObject(
+                "SELECT headers FROM reliable_event_outbox WHERE id=?", String.class, created.eventId());
+        assertThat(storedHeadersAfterSend).isEqualTo(storedHeadersBeforeSend);
+        assertThat(effectCount(created.orderId())).isOne();
+    }
+
+    @Test
     void databaseFailureLeavesTheFailedOffsetUncommittedAndReplaysItAfterRepair() throws Exception {
         OrderService.CreatedOrder created = context.getBean(OrderService.class).create("cup", 1);
         publishPending();
@@ -197,6 +256,14 @@ class KafkaOrderEndToEndTest {
             await(() -> committed(consumerGroup, 0) == 2, Duration.ofSeconds(20));
             assertThat(effectCount(created.orderId())).isOne();
             assertThat(count("example_consumed_event")).isOne();
+            var wireRecords = readWireRecords("kafka-wire-" + UUID.randomUUID());
+            assertThat(wireRecords).hasSize(2);
+            var traceparents = wireRecords.stream().map(record -> headerValue(record, "traceparent")).toList();
+            assertThat(traceparents).allMatch(KafkaOrderEndToEndTest::validTraceParent);
+            assertThat(traceparents.stream().map(value -> value.substring(3, 35)).distinct()).hasSize(1);
+            assertThat(traceparents.stream().map(value -> value.substring(36, 52)).distinct()).hasSize(2);
+            assertThat(wireRecords).allMatch(record -> Long.toString(created.eventId())
+                    .equals(headerValue(record, "reliable_event_id")));
         } finally {
             exampleConsumer.stop();
         }
@@ -260,6 +327,27 @@ class KafkaOrderEndToEndTest {
                 ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, org.apache.kafka.common.serialization.ByteArrayDeserializer.class);
     }
 
+    private java.util.List<org.apache.kafka.clients.consumer.ConsumerRecord<String, byte[]>> readWireRecords(String group) {
+        try (KafkaConsumer<String, byte[]> consumer = new KafkaConsumer<>(consumerConfiguration(group))) {
+            consumer.subscribe(java.util.List.of(topic));
+            java.util.List<org.apache.kafka.clients.consumer.ConsumerRecord<String, byte[]>> records = new ArrayList<>();
+            long deadline = System.nanoTime() + Duration.ofSeconds(15).toNanos();
+            while (records.size() < 2 && System.nanoTime() < deadline) {
+                for (var record : consumer.poll(Duration.ofMillis(200)).records(topic)) records.add(record);
+            }
+            return records;
+        }
+    }
+
+    private static String headerValue(org.apache.kafka.clients.consumer.ConsumerRecord<?, ?> record, String name) {
+        var header = record.headers().lastHeader(name);
+        return header == null || header.value() == null ? null : new String(header.value(), StandardCharsets.UTF_8);
+    }
+
+    private static boolean validTraceParent(String value) {
+        return value != null && value.matches("00-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}");
+    }
+
     private KafkaProducer<String, byte[]> producer() {
         return new KafkaProducer<>(Map.of(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, KAFKA.getBootstrapServers(),
                 ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class,
@@ -271,7 +359,9 @@ class KafkaOrderEndToEndTest {
         return new JdbcEventPublicationWorker(jdbc,
                 context.getBean(org.springframework.transaction.PlatformTransactionManager.class), sender,
                 java.time.Clock.systemUTC(), 10, "kafka-example-state-test", Duration.ofSeconds(30),
-                new ExponentialBackoff(Duration.ofMillis(10), Duration.ofMillis(10), 0, () -> 0));
+                new ExponentialBackoff(Duration.ofMillis(10), Duration.ofMillis(10), 0, () -> 0),
+                dev.reliableevent.jdbc.internal.observation.PublicationObserver.NOOP,
+                context.getBean(dev.reliableevent.jdbc.internal.tracing.PublicationTracer.class));
     }
 
     private int publishPending() {

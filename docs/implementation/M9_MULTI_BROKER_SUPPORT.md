@@ -1,7 +1,7 @@
 # M9：多消息中间件支持实施计划
 
 > 编写日期：2026-10-03（Asia/Shanghai）  
-> 状态：M9.1 公共发送契约、M9.2 RocketMQ 模块拆分和 M9.3 Kafka 适配均已实施并验收。Kafka 已通过真实 Broker、MySQL Outbox 状态、独立示例和仓库外安装件消费验证；RabbitMQ 仍未实现。  
+> 状态：M9.1 公共发送契约、M9.2 RocketMQ 模块拆分和 M9.3 Kafka 适配均已实施并验收。M9.4 故障、并发、追踪及资源审计正在实施；M9.5“最终工件与运维交接”待进行。Kafka 已通过真实 Broker、MySQL Outbox 状态、独立示例和仓库外安装件消费验证；RabbitMQ 仍未实现。
 > 源码依据：编写时 HEAD 为 `ac5e6ca`。当前产品仍是 `0.1.0-SNAPSHOT`，已实现 RocketMQ；M8.1–M8.5 已完成，M8.6 待实施。
 
 ## 1. 目标与交付范围
@@ -402,7 +402,7 @@ M8.6 的真实观测故障演练及开销检查继续保持待实施状态。M9 
 
 公共 SPI 名称已在 M9.1 确定；Kafka 版本与发送预算依据当前 Spring Boot BOM 和 Kafka 3.9 配置约束冻结，剩余实现细节按验收门槛推进。
 
-建议执行顺序为 M9.0 → M9.1 → M9.2 → Kafka M9.3 → M9.4 → M9.5。M9.1 至 M9.3 已完成；M9.4 广泛故障审计与 M9.5 正式发布尚未完成。
+建议执行顺序为 M9.0 → M9.1 → M9.2 → Kafka M9.3 → M9.4 → M9.5。M9.1 至 M9.3 已完成；M9.4 广泛故障审计与 M9.5 最终工件和运维交接尚未完成。
 
 ## 15. M9.1 已实施边界
 
@@ -497,4 +497,20 @@ Kafka 3.9.2 由 Spring Boot 3.5.16 BOM 管理，测试镜像为 `apache/kafka:3.
 
 仓库外消费者验证基于上述本地安装的最终 snapshot 工件，使用标准 `@EnableAutoConfiguration` 导入 Starter metadata。Kafka-only 外部应用 3 项通过，依赖树含 Kafka Starter/Base/protocol/client 且无 RocketMQ artifact；dual-broker 外部应用 5 项通过，验证双 Starter 必须显式选择并包含两个真实客户端依赖。两套测试均 0 failure/error/skipped；这是安装件自动配置/依赖边界验证，Producer 用测试提供的实例，不替代前述真实 Broker E2E。依赖树、测试与工件哈希证据分别见 `target/evidence/m9.3-external-kafka-only-dependency-tree.log`、`m9.3-external-dual-broker-dependency-tree.log`、`m9.3-external-kafka-only-test.log`、`m9.3-external-dual-broker-test.log`、`m9.3-external-final-summary.txt` 和 `m9.3-external-final-snapshot-installed-hash-compare.txt`。10 个库 JAR 均与最终 snapshot 构件 SHA-256 相同，列表为 `target/evidence/m9.3-installed-library-jar-sha256.txt`。
 
-独立 Compose/HTTP 烟测使用 Kafka 示例自有 MySQL 端口 13307、Kafka 19092 和 HTTP 8082；实际事务登记并发布后查询到 Outbox `PUBLISHED`、`handledCount=1`、身份去重行 1 和业务效果 1。Compose 配置校验与烟测日志归档为 `target/evidence/m9.3-kafka-compose-http-smoke.log`。最终源码快照含 1,177 个非 `.git`/`target` 文件（包含文档、配置和示例），逐文件 SHA-256 无差异、无额外文件；其中用于代码审查的 Maven POM 与 `src` 文件为 190 个。完整比较清单见 `target/evidence/m9.3-source-snapshot-final-check.txt`。完整 verify 与本地 install 均仅操作隔离快照及本地 Maven 仓库；没有提交、推送或发布。测试期间保留用户原有 7 个容器和 Java 示例 PID 27372；仅关闭本阶段创建的 Testcontainers 与 Kafka 示例自己的 PID/Compose 服务。M9.4 广泛故障审计、M9.5 正式发布及 M8.6 仍待后续实施。
+独立 Compose/HTTP 烟测使用 Kafka 示例自有 MySQL 端口 13307、Kafka 19092 和 HTTP 8082；实际事务登记并发布后查询到 Outbox `PUBLISHED`、`handledCount=1`、身份去重行 1 和业务效果 1。Compose 配置校验与烟测日志归档为 `target/evidence/m9.3-kafka-compose-http-smoke.log`。最终源码快照含 1,177 个非 `.git`/`target` 文件（包含文档、配置和示例），逐文件 SHA-256 无差异、无额外文件；其中用于代码审查的 Maven POM 与 `src` 文件为 190 个。完整比较清单见 `target/evidence/m9.3-source-snapshot-final-check.txt`。完整 verify 与本地 install 均仅操作隔离快照及本地 Maven 仓库；没有提交、推送或发布。测试期间保留用户原有 7 个容器和 Java 示例 PID 27372；仅关闭本阶段创建的 Testcontainers 与 Kafka 示例自己的 PID/Compose 服务。M9.4 故障、并发、追踪与资源审计正在实施；M9.5 最终工件和运维交接及 M8.6 仍待后续实施。
+
+## 20. M9.4 故障、并发、追踪与资源审计进度
+
+M9.4 目前处于实施中。本节区分既有自动化覆盖与本阶段新补覆盖；只有最终冻结源码上的真实服务故障证据、观测规则和资源测量完成后，才更新为验收完成。M9.5“最终工件与运维交接”仍待实施，M8.6 的原阶段责任也不因本记录而转为完成。
+
+截至当前聚焦回归，Kafka 的真实 Broker 故障/资源场景 12 项聚焦 suite 已通过；固定负载 100 条仅有单次样本。另有 native Producer 上下文创建/关闭的 3-cycle 生命周期测试，不能视为三轮负载测量。RocketMQ 协议真实服务聚焦测试 12 项、示例真实消费/故障测试 9 项在 JDK 17 通过。RocketMQ 验证包含 broker 已确认后进程崩溃所致的真实重复投递、消费者按身份只产生一次业务效果和重复 span 确认成功；native 客户端线程停止后归零由 root 独立核验。Kafka 已核验真实消费身份、重复投递后的单次业务效果、确认后状态写入失败时成功发送计数与持久化计数分离，并在真实独立 JVM 上覆盖故障重试和资源行为。证据包括成功的 `target/evidence/m9.4-rocketmq-combined-jdk17-r3/maven-combined.log`、单次 Kafka 固定负载目录 `target/evidence/m9.4-kafka-crash-fixed-load-100-2026-10-04T11-58-58.995595600-fc3ef624-2f3d-46f6-bea6-213d170019e4` 及各自原始输出，以及 RocketMQ/Kafka 各自 `target/evidence` 下逐场景报告。RocketMQ `m9.4-rocketmq-final-focused-jdk17` 当前出现两个 setup error，不作为通过证据；修复后重跑仍待完成。以上是当前源码上的聚焦证据，最终 source-equal 全量回归尚未执行。
+
+公共 JDBC 状态机的已有回归覆盖候选重复抢占、候选不再到期时的抢占复核、过期 lease/错误 Owner/旧 version 栅栏、双 Worker 竞争、重试与 UNKNOWN 耗尽、多个恢复者竞争、接管后旧 Worker 成功回执被拒绝。公共调度已有测试覆盖有界队列、排队期间不抢占、停机时撤销候选、等待在途任务和 shutdown 后结束的 claim 不发送。观测已有测试覆盖成功发送后的状态 SQL 失败不增加 persisted counter、外部事务提交后才累计 persisted/dead 指标，以及状态失败和栅栏拒绝的 Span 标记。这些测试属于待在 M9.4 最终快照再次执行的公共基线，不是本阶段真实 Broker 与独立 JVM 故障证据。
+
+追踪原有测试覆盖连续重试的 Span 独立性、登记父上下文保持、缺失/无效上下文的根 Span 回退和调用线程 scope 清理。M9.4 新增 `MicrometerPublicationTracerTest.concurrentAttemptsKeepTheirTraceContextAndCloseOnlyTheirOwnScope`，令两个 attempt 在两个线程内同时持有 scope，再检查各自注入的 TraceId/SpanId、导出 Span 父身份和关闭后的当前线程上下文。聚焦命令 `mvn -o "-Dmaven.repo.local=C:\Users\20659\.m2\repository" -pl reliable-event-spring-boot-autoconfigure -Dtest=MicrometerPublicationTracerTest test` 在 JDK 17.0.12 下运行 4 项测试，0 失败、0 错误、0 跳过；Maven 输出和实际退出码保存在 `target/evidence/m9.4-public-trace-unit-jdk17.log` 与 `.exit-code.txt`。基准报告 Python 单元测试运行 4 项，0 失败，日志和退出码保存在 `target/evidence/m9.4-benchmark-python-unittest.log` 与 `.exit-code.txt`。基准运行脚本已增加 M9.4 源码材料标识、脱敏端点、源文件树摘要以及发布与消费进程分别采样的 CPU、working set、Private Bytes、线程和句柄，以及实际首末采样 epoch、窗口时长和样本数；每轮另记录 fat JAR 实际依赖列表、追踪装配、metrics snapshot sampler 属性与运行时条件；仅完成 PowerShell AST 与摘要函数本地校验，未运行容器或资源基准。以上聚焦结果不代替最终 source-equal 快照上的全 Reactor 回归。
+
+同一 RocketMQ 环境的框架拆分前后真实资源比较、Kafka 重复运行期间的实际线程/缓冲观测以及 promtool 规则验证尚未运行。本阶段运行采用专属 MySQL 和 RocketMQ Docker project，不接触既有服务及数据库；资源比较将使用 M9.0/M9.1 之前冻结的 `ac5e6cac39884b97623df201018afa63e2b43911` 与最终 M9.4 source-equal 快照作顺序比较，固定镜像 digest、JDK、JVM 参数、负载、确认、采样、队列和线程设置，计划 baseline 与最终 M9.4 各三轮、每轮 1,000 个事件。现有 benchmark 的 whole-run 窗口将如实报告，不改写成稳态 30/60/30 阶段；登记/发送/排空/SQL、CPU、进程 working set/private bytes/thread/handle 与可观察的数据库连接/行锁指标按原始采样输出记录。客户端私有缓冲不可直接读取时明确标记为不可直接观测，并结合配置上界和重复运行进程线程数作有限证据；不以配置值冒充 RSS、线程或容量实测，也不把这些短样本作为容量或 SLA 结论。实验精确命令、镜像/依赖身份、有效端点、逐轮退出码、raw timeline、Outbox 终态与消费身份及源树 SHA 清单在获得顺序窗口后写入 `target/evidence/m9.4-*`。
+
+性能基线源码已由 `git archive` 从上述 commit 独立展开，并以同一版 M9.4 测量 `run-once.ps1` 和 `report.py` 覆盖仅用于保存对照数据；JDK 17.0.12 Maven 离线 reactor package 在该快照成功构建 7 个模块，跳过测试，没有执行 `install`，未写入共享 Maven 仓库。快照 tree 为 `1ce575a79760626c8615ad084506169edb407af5`，M9.4 测量材料树 SHA-256 为 `46a40586afb830efb9babd7a27821ae44893980018d1a230a00dac4b39cd6432`，测量脚本 SHA-256 为 `88e51f975168792294800f7ae130a1010ac3d86c47b5e6c1c83911bde70d16e0`，该基线 benchmark fat JAR SHA-256 为 `41a7e98479fd6aa878c81932598035360fb5d0e115012c4361e2bf74b2e28e37`。材料身份见 `target/m9.4-verification/baseline-source-identity.txt`，构建输出见 `target/evidence/m9.4-baseline-package-escalated.log` 和 `.exit-code.txt`。采集器仅在 Git 顶层与被测根目录完全一致时写入 Git commit/status；每轮 metadata 将源码树身份与实际 fat JAR SHA 分开记录。baseline archive 与无 `.git` 的最终 snapshot 以显式 commit/materialization、文件树 SHA 及独立工件 SHA 标识，不继承父工作区身份。baseline 与现有 benchmark fat JAR 的依赖清单均含 `micrometer-core`，不含 `micrometer-tracing`、Tracing bridge 或 OpenTelemetry SDK；因此虽然 `reliable-event.tracing-enabled` 默认 true，本基准发布进程实际使用 `PublicationTracer.NOOP`，不存在可启用的 trace sampler。Publisher 模式由 benchmark 显式提供 `SimpleMeterRegistry`；`run-once.ps1` 显式传入 `tracing-enabled=true`、`metrics-snapshot-enabled=true`、`metrics-snapshot-interval=15s` 与 `scheduling-enabled=true`，且默认运行时依赖齐备，因此快照 sampler 每 15 秒查询一次，首次从启动时触发。以上配置在两版本相同，并纳入每轮 metadata；不将 tracking property 当作实际 Span 采样率。这仅证明对照工件可由该源码打包，尚无性能测量结果。
+
+在所有公共全量回归、Kafka/RocketMQ 真实故障场景、观测规则和资源证据按本节状态实际完成前，不将 M9.4 标记验收完成；M9.5 仍为待实施。

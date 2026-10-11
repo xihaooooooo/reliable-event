@@ -2,7 +2,6 @@ package dev.reliableevent.autoconfigure;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import dev.reliableevent.ReliableEventPublisher;
-import dev.reliableevent.internal.publication.EventSender;
 import dev.reliableevent.jdbc.JdbcReliableEventPublisher;
 import dev.reliableevent.jdbc.DeadEventOperations;
 import dev.reliableevent.jdbc.JdbcDeadEventOperations;

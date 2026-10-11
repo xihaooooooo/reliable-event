@@ -1,6 +1,6 @@
 package dev.reliableevent.kafka.example;
 
-import dev.reliableevent.internal.publication.EventSender;
+import dev.reliableevent.spi.EventTransport;
 import dev.reliableevent.jdbc.internal.publication.JdbcEventPublicationWorker;
 import dev.reliableevent.jdbc.internal.retry.ExponentialBackoff;
 import org.springframework.boot.builder.SpringApplicationBuilder;
@@ -36,7 +36,7 @@ public final class KafkaPublicationWorkerProcess {
             publishReady(workerId);
             awaitBarrier(Path.of(required("KAFKA_CRASH_START_BARRIER")));
             JdbcEventPublicationWorker worker = new JdbcEventPublicationWorker(context.getBean(JdbcTemplate.class),
-                    context.getBean(PlatformTransactionManager.class), context.getBean(EventSender.class),
+                    context.getBean(PlatformTransactionManager.class), context.getBean(EventTransport.class),
                     Clock.systemUTC(), 20, workerId, Duration.ofSeconds(12),
                     new ExponentialBackoff(Duration.ofMillis(1), Duration.ofMillis(1), 0, () -> 0));
             int count = worker.publishDueEvents();

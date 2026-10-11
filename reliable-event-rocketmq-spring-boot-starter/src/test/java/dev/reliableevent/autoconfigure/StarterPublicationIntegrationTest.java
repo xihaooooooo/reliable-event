@@ -1,10 +1,11 @@
 package dev.reliableevent.autoconfigure;
 
+import java.util.Optional;
 import dev.reliableevent.EventId;
 import dev.reliableevent.ReliableEvent;
 import dev.reliableevent.ReliableEventPublisher;
-import dev.reliableevent.internal.publication.EventSender;
-import dev.reliableevent.internal.publication.SendReceipt;
+import dev.reliableevent.spi.EventTransport;
+import dev.reliableevent.spi.TransportReceipt;
 import dev.reliableevent.jdbc.internal.cycle.JdbcEventPublicationCycle;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import org.apache.rocketmq.client.apis.ClientConfiguration;
@@ -316,7 +317,7 @@ class StarterPublicationIntegrationTest {
                     throw new IllegalStateException("Test sender was interrupted", exception);
                 }
             }
-            return new SendReceipt("test-" + count);
+            return new TransportReceipt(Optional.of("test-" + count), Map.of());
         };
 
         try (ConfigurableApplicationContext context = new SpringApplicationBuilder(BlockingSenderApplication.class)
@@ -404,7 +405,7 @@ class StarterPublicationIntegrationTest {
                 Thread.currentThread().interrupt();
                 throw new IllegalStateException("Active send was interrupted during graceful stop", exception);
             }
-            return new SendReceipt("first-instance");
+            return new TransportReceipt(Optional.of("first-instance"), Map.of());
         };
         String[] properties = {
                 "spring.main.web-application-type=none",
@@ -469,7 +470,7 @@ class StarterPublicationIntegrationTest {
 
             BlockingSenderApplication.sender = event -> {
                 secondInstanceSends.incrementAndGet();
-                return new SendReceipt("second-instance");
+                return new TransportReceipt(Optional.of("second-instance"), Map.of());
             };
             try (ConfigurableApplicationContext second =
                          new SpringApplicationBuilder(BlockingSenderApplication.class)
@@ -514,7 +515,7 @@ class StarterPublicationIntegrationTest {
                     // Exercise an external send that does not respond to interruption.
                 }
             }
-            return new SendReceipt("late-first-instance");
+            return new TransportReceipt(Optional.of("late-first-instance"), Map.of());
         };
         String[] properties = {
                 "spring.main.web-application-type=none",
@@ -560,7 +561,7 @@ class StarterPublicationIntegrationTest {
 
             BlockingSenderApplication.sender = event -> {
                 secondInstanceSends.incrementAndGet();
-                return new SendReceipt("recovered-by-second-instance");
+                return new TransportReceipt(Optional.of("recovered-by-second-instance"), Map.of());
             };
             try (ConfigurableApplicationContext second =
                          new SpringApplicationBuilder(BlockingSenderApplication.class)
@@ -593,7 +594,7 @@ class StarterPublicationIntegrationTest {
         ).execute(dataSource);
         AtomicInteger sendCount = new AtomicInteger();
         BlockingSenderApplication.sender = event ->
-                new SendReceipt("recovered-" + sendCount.incrementAndGet());
+                new TransportReceipt(Optional.of("recovered-" + sendCount.incrementAndGet()), Map.of());
 
         try (ConfigurableApplicationContext context = new SpringApplicationBuilder(BlockingSenderApplication.class)
                 .properties(
@@ -649,7 +650,7 @@ class StarterPublicationIntegrationTest {
         ).execute(dataSource);
         AtomicInteger sendCount = new AtomicInteger();
         BlockingSenderApplication.sender = event ->
-                new SendReceipt("instance-" + sendCount.incrementAndGet());
+                new TransportReceipt(Optional.of("instance-" + sendCount.incrementAndGet()), Map.of());
         String[] properties = {
                 "spring.main.web-application-type=none",
                 "spring.datasource.url=" + MYSQL.getJdbcUrl(),
@@ -734,10 +735,10 @@ class StarterPublicationIntegrationTest {
     @SpringBootConfiguration
     @EnableAutoConfiguration
     static class BlockingSenderApplication {
-        static volatile EventSender sender;
+        static volatile EventTransport sender;
 
         @Bean
-        EventSender testSender() {
+        EventTransport testSender() {
             return sender;
         }
     }

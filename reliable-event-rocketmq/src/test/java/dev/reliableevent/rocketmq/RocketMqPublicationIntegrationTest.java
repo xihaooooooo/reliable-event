@@ -4,9 +4,9 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import dev.reliableevent.EventId;
 import dev.reliableevent.ReliableEvent;
 import dev.reliableevent.internal.model.StoredEvent;
-import dev.reliableevent.internal.publication.EventSendException;
-import dev.reliableevent.internal.publication.EventSender;
-import dev.reliableevent.internal.publication.SendReceipt;
+import dev.reliableevent.spi.TransportException;
+import dev.reliableevent.spi.EventTransport;
+import dev.reliableevent.spi.TransportReceipt;
 import dev.reliableevent.jdbc.JdbcReliableEventPublisher;
 import dev.reliableevent.jdbc.internal.model.EventStatus;
 import dev.reliableevent.jdbc.internal.recovery.JdbcExpiredLeaseRecovery;
@@ -14,7 +14,7 @@ import dev.reliableevent.jdbc.internal.publication.JdbcEventPublicationWorker;
 import dev.reliableevent.jdbc.internal.retry.ExponentialBackoff;
 import dev.reliableevent.jdbc.internal.tracing.PublicationTracer;
 import dev.reliableevent.jdbc.internal.observation.PublicationObserver;
-import dev.reliableevent.internal.publication.EventSendFailureType;
+import dev.reliableevent.spi.TransportFailureType;
 import org.apache.rocketmq.client.apis.ClientConfiguration;
 import org.apache.rocketmq.client.apis.ClientServiceProvider;
 import org.apache.rocketmq.client.apis.consumer.FilterExpression;
@@ -84,7 +84,7 @@ class RocketMqPublicationIntegrationTest {
     private static RocketMqTestEnvironment environment;
     private static Producer producer;
     private static SimpleConsumer consumer;
-    private static RocketMqEventSender sender;
+    private static RocketMqEventTransport sender;
     private static JdbcTemplate jdbcTemplate;
     private static DataSourceTransactionManager transactionManager;
 
@@ -193,8 +193,8 @@ class RocketMqPublicationIntegrationTest {
                         OBJECT_MAPPER.writeValueAsString(headers));
                 return new PublicationTracer.Attempt() {
                     @Override public StoredEvent eventForSend() { return copy; }
-                    @Override public void sendSucceeded(SendReceipt receipt) { }
-                    @Override public void sendFailed(EventSendFailureType type, Throwable failure) { }
+                    @Override public void sendSucceeded(TransportReceipt receipt) { }
+                    @Override public void sendFailed(TransportFailureType type, Throwable failure) { }
                     @Override public void stateUpdated(String status, boolean pending) { }
                     @Override public void stateUpdateFailed(String status, Throwable failure, boolean rejected) { }
                     @Override public void close() { }
@@ -224,12 +224,7 @@ class RocketMqPublicationIntegrationTest {
     @Test
     void missingDestinationBecomesDeadWithoutCallingTheProducer() throws Exception {
         Producer unusedProducer = mock(Producer.class);
-        RocketMqEventSender missingDestinationSender = new RocketMqEventSender(
-                PROVIDER,
-                unusedProducer,
-                new MapEventDestinationResolver(Map.of()),
-                OBJECT_MAPPER
-        );
+        RocketMqEventTransport missingDestinationSender = new RocketMqEventTransport(PROVIDER, unusedProducer, new MapEventDestinationResolver(Map.of()));
         EventId eventId = publish("missing-" + System.nanoTime(), new TaskPayload(102));
 
         assertThat(worker(missingDestinationSender, Clock.systemUTC()).publishDueEvents()).isZero();
@@ -244,7 +239,7 @@ class RocketMqPublicationIntegrationTest {
     @Test
     void oversizedBodyBecomesDeadWithoutCallingTheProducer() throws Exception {
         Producer unusedProducer = mock(Producer.class);
-        RocketMqEventSender smallBodySender = sender(unusedProducer, 32);
+        RocketMqEventTransport smallBodySender = sender(unusedProducer, 32);
         EventId eventId = publish(
                 "oversized-" + System.nanoTime(),
                 new LargePayload("x".repeat(128))
@@ -291,11 +286,11 @@ class RocketMqPublicationIntegrationTest {
         EventId eventId = publish(eventKey, new TaskPayload(104));
         AtomicBoolean firstCall = new AtomicBoolean(true);
         AtomicReference<String> firstMessageId = new AtomicReference<>();
-        EventSender discardFirstReceipt = event -> {
-            SendReceipt receipt = sender.send(event);
+        EventTransport discardFirstReceipt = event -> {
+            TransportReceipt receipt = sender.send(event);
             if (firstCall.getAndSet(false)) {
-                firstMessageId.set(receipt.messageId());
-                throw EventSendException.resultUnknown(
+                firstMessageId.set(receipt.brokerMessageId().orElse(null));
+                throw new TransportException(TransportFailureType.RESULT_UNKNOWN,
                         "Test discarded a successful RocketMQ receipt"
                 );
             }
@@ -400,8 +395,8 @@ class RocketMqPublicationIntegrationTest {
         EventId eventId = publish(eventKey, new TaskPayload(109));
         CountDownLatch brokerConfirmed = new CountDownLatch(1);
         CountDownLatch releaseWorker = new CountDownLatch(1);
-        EventSender delayedRealConfirmation = event -> {
-            SendReceipt receipt = sender.send(event);
+        EventTransport delayedRealConfirmation = event -> {
+            TransportReceipt receipt = sender.send(event);
             brokerConfirmed.countDown();
             try {
                 if (!releaseWorker.await(20, TimeUnit.SECONDS)) {
@@ -471,7 +466,7 @@ class RocketMqPublicationIntegrationTest {
         MessageView first;
         PublicationObserver observer = new PublicationObserver() {
             @Override public void sendSucceeded(dev.reliableevent.jdbc.internal.model.ClaimedEvent event,
-                                                SendReceipt receipt, long elapsedNanos, Instant at) {
+                                                TransportReceipt receipt, long elapsedNanos, Instant at) {
                 sendSuccesses.incrementAndGet();
             }
             @Override public void stateUpdateFailed(String status, boolean ownershipRejected) {
@@ -765,20 +760,14 @@ class RocketMqPublicationIntegrationTest {
         return publishAt(eventKey, new TaskPayload(107), Instant.now().minusSeconds(1), maxAttempts);
     }
 
-    private static RocketMqEventSender sender(Producer targetProducer, int maxBodyBytes) {
-        return new RocketMqEventSender(
-                PROVIDER,
-                targetProducer,
-                new MapEventDestinationResolver(Map.of(
+    private static RocketMqEventTransport sender(Producer targetProducer, int maxBodyBytes) {
+        return new RocketMqEventTransport(PROVIDER, targetProducer, new MapEventDestinationResolver(Map.of(
                         "coupon-task-execute",
                         new RocketMqDestination(
                                 RocketMqTestEnvironment.TOPIC,
                                 RocketMqTestEnvironment.TAG
                         )
-                )),
-                OBJECT_MAPPER,
-                maxBodyBytes
-        );
+                )), maxBodyBytes);
     }
 
     private EventId publish(String eventKey, Object payload) {
@@ -797,7 +786,7 @@ class RocketMqPublicationIntegrationTest {
         ));
     }
 
-    private JdbcEventPublicationWorker worker(EventSender targetSender, Clock clock) {
+    private JdbcEventPublicationWorker worker(EventTransport targetSender, Clock clock) {
         return new JdbcEventPublicationWorker(
                 jdbcTemplate,
                 transactionManager,

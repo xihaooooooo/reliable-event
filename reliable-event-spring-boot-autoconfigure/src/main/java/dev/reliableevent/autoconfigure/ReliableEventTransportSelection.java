@@ -1,6 +1,5 @@
 package dev.reliableevent.autoconfigure;
 
-import dev.reliableevent.internal.publication.EventSender;
 import dev.reliableevent.spi.EventTransport;
 import dev.reliableevent.autoconfigure.spi.TransportAdapterDescriptor;
 import org.springframework.beans.factory.ListableBeanFactory;
@@ -40,27 +39,19 @@ public record ReliableEventTransportSelection(String transport) {
         Set<String> builtInRuntimeNames = runtimeBeanNames(adapters);
         validateRootProperties(environment, publicProperties, namespaces);
 
-        long customSenderCount = Arrays.stream(beans.getBeanNamesForType(EventSender.class, false, false))
-                .filter(name -> !isFrameworkBean(beans, name, builtInRuntimeNames))
-                .count();
         long customTransportCount = Arrays.stream(beans.getBeanNamesForType(EventTransport.class, false, false))
-                .filter(name -> !isFrameworkBean(beans, name, builtInRuntimeNames))
+                .filter(name -> !builtInRuntimeNames.contains(name))
                 .count();
-        boolean customSender = customSenderCount > 0;
         boolean customTransport = customTransportCount > 0;
 
-        if (customSenderCount > 1 || customTransportCount > 1) {
+        if (customTransportCount > 1) {
             throw new IllegalStateException(
-                    "Multiple custom EventSender/EventTransport beans are configured; register exactly one entry point");
-        }
-        if (customSender && customTransport) {
-            throw new IllegalStateException(
-                    "Both EventSender and EventTransport are configured; choose exactly one custom extension point");
+                    "Multiple custom EventTransport beans are configured; register exactly one entry point");
         }
 
         String selected = requested;
         if (selected == null) {
-            if (customSender || customTransport) {
+            if (customTransport) {
                 selected = "custom";
             } else if (adapters.size() == 1) {
                 selected = adapters.get(0).transportName();
@@ -72,7 +63,7 @@ public record ReliableEventTransportSelection(String transport) {
             }
         }
 
-        validateSelection(selected, requested, transportNames, customSender, customTransport);
+        validateSelection(selected, requested, transportNames, customTransport);
         logUnusedAdapterSettings(environment, adapters, selected);
         LOG.info("ReliableEvent selected transport=" + selected);
         return new ReliableEventTransportSelection(selected);
@@ -125,12 +116,11 @@ public record ReliableEventTransportSelection(String transport) {
             String selected,
             String requested,
             Set<String> installedTransports,
-            boolean customSender,
             boolean customTransport) {
         if (selected.equals("custom")) {
-            if (requested != null && !customSender && !customTransport) {
+            if (requested != null && !customTransport) {
                 throw new IllegalStateException(
-                        "reliable-event.transport=custom requires one custom EventTransport or legacy EventSender");
+                        "reliable-event.transport=custom requires one custom EventTransport");
             }
             return;
         }
@@ -138,9 +128,9 @@ public record ReliableEventTransportSelection(String transport) {
             throw new IllegalStateException(
                     "Selected transport '" + selected + "' is not installed; add its starter");
         }
-        if (customSender || customTransport) {
+        if (customTransport) {
             throw new IllegalStateException(
-                    "A custom EventSender/EventTransport conflicts with selected transport '" + selected + "'");
+                    "A custom EventTransport conflicts with selected transport '" + selected + "'");
         }
     }
 
@@ -217,22 +207,4 @@ public record ReliableEventTransportSelection(String transport) {
         return value.replaceAll("([a-z0-9])([A-Z])", "$1-$2").toLowerCase(Locale.ROOT);
     }
 
-    private static boolean isFrameworkBean(
-            ListableBeanFactory factory,
-            String name,
-            Set<String> builtInRuntimeNames) {
-        if (builtInRuntimeNames.contains(name)) {
-            return true;
-        }
-        if (factory instanceof org.springframework.beans.factory.config.ConfigurableListableBeanFactory configurable
-                && configurable.containsBeanDefinition(name)) {
-            String factoryBean = configurable.getBeanDefinition(name).getFactoryBeanName();
-            if (factoryBean == null || !configurable.containsBeanDefinition(factoryBean)) {
-                return false;
-            }
-            String owner = configurable.getBeanDefinition(factoryBean).getBeanClassName();
-            return "dev.reliableevent.autoconfigure.ReliableEventTransportBridgeAutoConfiguration".equals(owner);
-        }
-        return false;
-    }
 }

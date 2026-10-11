@@ -1,9 +1,11 @@
 package dev.reliableevent.autoconfigure;
 
+import java.util.Map;
+import java.util.Optional;
 import dev.reliableevent.EventId;
 import dev.reliableevent.internal.model.StoredEvent;
-import dev.reliableevent.internal.publication.EventSendFailureType;
-import dev.reliableevent.internal.publication.SendReceipt;
+import dev.reliableevent.spi.TransportFailureType;
+import dev.reliableevent.spi.TransportReceipt;
 import dev.reliableevent.jdbc.internal.model.ClaimedEvent;
 import dev.reliableevent.jdbc.internal.model.ExpiredLeaseCandidate;
 import dev.reliableevent.jdbc.internal.model.OutboxMetricsSnapshot;
@@ -36,8 +38,8 @@ class MicrometerPublicationObserverTest {
         ClaimedEvent event = event(availableAt);
 
         assertThat(registry.get("reliable_event.backlog").gauge().value()).isNaN();
-        observer.sendFailed(event, EventSendFailureType.RESULT_UNKNOWN, 10_000_000);
-        observer.sendSucceeded(event, new SendReceipt("message-1"), 20_000_000,
+        observer.sendFailed(event, TransportFailureType.RESULT_UNKNOWN, 10_000_000);
+        observer.sendSucceeded(event, new TransportReceipt(Optional.of("message-1"), Map.of()), 20_000_000,
                 availableAt.plusSeconds(4));
         observer.leaseRecovered(new ExpiredLeaseCandidate(new EventId(1), 1, "worker-1",
                 availableAt, 1, 2), false);
@@ -158,7 +160,7 @@ class MicrometerPublicationObserverTest {
         MicrometerPublicationObserver observer = new MicrometerPublicationObserver(
                 registry, mock(JdbcOutboxRepository.class));
 
-        observer.sendSucceeded(event(null), new SendReceipt("message-2"), 1,
+        observer.sendSucceeded(event(null), new TransportReceipt(Optional.of("message-2"), Map.of()), 1,
                 availableAt.plusSeconds(10));
 
         assertThat(registry.get("reliable_event.publish.success").counter().count()).isEqualTo(1);

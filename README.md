@@ -61,7 +61,11 @@ mvn verify
 
 M7 起，新建库的正式建表 SQL 同时创建 Outbox 和永久登记身份表。已有 Outbox 表的部署必须先按[运维指南](docs/OPERATIONS.md#建表和迁移)暂停事件登记、回填及核对身份，再切换所有应用实例；不能仅重新执行 `CREATE TABLE IF NOT EXISTS` 完成升级。
 
-RocketMQ 应用使用 `dev.reliableevent:reliable-event-rocketmq-spring-boot-starter:0.1.0-SNAPSHOT`。仅登记的实例可用 `reliable-event-spring-boot-starter-base` 并设置 `reliable-event.scheduling-enabled=false`；同一 Outbox 还需有发布实例处理事件。Base 不包含 RocketMQ 客户端类；若应用提供自定义 `EventTransport` 或旧 `EventSender`，则可保留默认调度。配置应用的数据源并创建 [Outbox 表](reliable-event-jdbc/src/main/resources/schema/reliable-event-outbox.sql)。已有 M4.4 表先执行 [M4.5 增量 SQL](reliable-event-jdbc/src/main/resources/schema/reliable-event-outbox-m4-5.sql)。RocketMQ 默认传输仍使用原配置键：
+RocketMQ 应用使用 `dev.reliableevent:reliable-event-rocketmq-spring-boot-starter:0.1.0-SNAPSHOT`。仅登记的实例可用 `reliable-event-spring-boot-starter-base` 并设置 `reliable-event.scheduling-enabled=false`；同一 Outbox 还需有发布实例处理事件。Base 不包含 RocketMQ 客户端类；若应用提供自定义 `EventTransport`，则可保留默认调度。配置应用的数据源并创建 [Outbox 表](reliable-event-jdbc/src/main/resources/schema/reliable-event-outbox.sql)。已有 M4.4 表先执行 [M4.5 增量 SQL](reliable-event-jdbc/src/main/resources/schema/reliable-event-outbox-m4-5.sql)。
+
+发送扩展统一使用 `EventTransport`，Worker 直接调用该接口，接收 `TransportReceipt`；失败统一通过 `TransportException` / `TransportFailureType` 分类。原内部 `EventSender`、`SendReceipt`、`EventSendException`、`EventSendFailureType` 以及 `RocketMqEventSender` 已移除，依赖这些类型的自定义发送实现需迁移到公共 SPI。
+
+RocketMQ 默认传输仍使用原配置键：
 
 ```yaml
 reliable-event:

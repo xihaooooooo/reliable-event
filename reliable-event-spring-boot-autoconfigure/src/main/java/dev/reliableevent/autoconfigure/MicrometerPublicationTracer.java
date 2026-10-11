@@ -5,8 +5,8 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import dev.reliableevent.internal.headers.EventHeaderConstraints;
 import dev.reliableevent.internal.model.StoredEvent;
-import dev.reliableevent.internal.publication.EventSendFailureType;
-import dev.reliableevent.internal.publication.SendReceipt;
+import dev.reliableevent.spi.TransportFailureType;
+import dev.reliableevent.spi.TransportReceipt;
 import dev.reliableevent.jdbc.internal.model.ClaimedEvent;
 import dev.reliableevent.jdbc.internal.tracing.PublicationTracer;
 import io.micrometer.tracing.Span;
@@ -58,18 +58,16 @@ final class MicrometerPublicationTracer implements PublicationTracer {
             @Override public StoredEvent eventForSend() { return sendEvent; }
 
             @Override
-            public void sendSucceeded(SendReceipt receipt) {
+            public void sendSucceeded(TransportReceipt receipt) {
                 safely(() -> {
                     span.tag("reliable_event.send.result", "success");
-                    if (receipt.messageId() != null) {
-                        span.tag("reliable_event.message_id", receipt.messageId());
-                    }
+                    receipt.brokerMessageId().ifPresent(id -> span.tag("reliable_event.message_id", id));
                     span.event("reliable_event.sender.acknowledged");
                 }, "Unable to record successful sender receipt");
             }
 
             @Override
-            public void sendFailed(EventSendFailureType type, Throwable failure) {
+            public void sendFailed(TransportFailureType type, Throwable failure) {
                 safely(() -> {
                     span.tag("reliable_event.send.result", sendResult(type));
                     span.error(failure);
@@ -203,7 +201,7 @@ final class MicrometerPublicationTracer implements PublicationTracer {
         return key != null && (key.equalsIgnoreCase(TRACEPARENT) || key.equalsIgnoreCase(TRACESTATE));
     }
 
-    private static String sendResult(EventSendFailureType type) {
+    private static String sendResult(TransportFailureType type) {
         return switch (type) {
             case RETRYABLE -> "definite_failure";
             case NON_RETRYABLE -> "definite_failure";

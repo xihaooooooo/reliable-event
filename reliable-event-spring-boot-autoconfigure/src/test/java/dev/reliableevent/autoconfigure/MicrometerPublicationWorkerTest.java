@@ -1,11 +1,13 @@
 package dev.reliableevent.autoconfigure;
 
+import java.util.Optional;
+import dev.reliableevent.spi.TransportFailureType;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import dev.reliableevent.EventId;
 import dev.reliableevent.internal.model.StoredEvent;
-import dev.reliableevent.internal.publication.EventSendException;
-import dev.reliableevent.internal.publication.EventSender;
-import dev.reliableevent.internal.publication.SendReceipt;
+import dev.reliableevent.spi.TransportException;
+import dev.reliableevent.spi.EventTransport;
+import dev.reliableevent.spi.TransportReceipt;
 import dev.reliableevent.jdbc.internal.model.ClaimedEvent;
 import dev.reliableevent.jdbc.internal.observation.PublicationObserver;
 import dev.reliableevent.jdbc.internal.persistence.StaleEventClaimException;
@@ -63,7 +65,7 @@ class MicrometerPublicationWorkerTest {
 
         JdbcTemplate successJdbc = jdbcReturning(1);
         JdbcEventPublicationWorker successWorker = worker(successJdbc, txManager(),
-                event -> new SendReceipt("success-message"), fixture.publicationTracer, metricsObserver);
+                event -> new TransportReceipt(Optional.of("success-message"), Map.of()), fixture.publicationTracer, metricsObserver);
         TransactionSynchronizationManager.setActualTransactionActive(true);
         try {
             assertThat(successWorker.publishClaimedEvent(claimed(1001, 1, parent))).isTrue();
@@ -72,12 +74,12 @@ class MicrometerPublicationWorkerTest {
         }
 
         JdbcEventPublicationWorker definiteFailureWorker = worker(jdbcReturning(1), txManager(),
-                event -> { throw EventSendException.retryable("broker rejected"); }, fixture.publicationTracer,
+                event -> { throw new TransportException(TransportFailureType.RETRYABLE, "broker rejected"); }, fixture.publicationTracer,
                 metricsObserver);
         assertThat(definiteFailureWorker.publishClaimedEvent(claimed(1002, 1, parent))).isFalse();
 
         JdbcEventPublicationWorker unknownWorker = worker(jdbcReturning(1), txManager(),
-                event -> { throw EventSendException.resultUnknown("ack lost"); }, fixture.publicationTracer,
+                event -> { throw new TransportException(TransportFailureType.RESULT_UNKNOWN, "ack lost"); }, fixture.publicationTracer,
                 metricsObserver);
         assertThat(unknownWorker.publishClaimedEvent(claimed(1003, 1, parent))).isFalse();
 
@@ -86,12 +88,12 @@ class MicrometerPublicationWorkerTest {
         JdbcTemplate failedJdbc = mock(JdbcTemplate.class);
         when(failedJdbc.update(anyString(), any(Object[].class))).thenThrow(databaseFailure);
         JdbcEventPublicationWorker failedUpdateWorker = worker(failedJdbc, txManager(),
-                event -> new SendReceipt("sent-before-db-failure"), fixture.publicationTracer, metricsObserver);
+                event -> new TransportReceipt(Optional.of("sent-before-db-failure"), Map.of()), fixture.publicationTracer, metricsObserver);
         assertThatThrownBy(() -> failedUpdateWorker.publishClaimedEvent(claimed(1004, 1, parent)))
                 .isSameAs(databaseFailure);
 
         JdbcEventPublicationWorker ownershipWorker = worker(jdbcReturning(0), txManager(),
-                event -> new SendReceipt("sent-before-ownership-reject"), fixture.publicationTracer, metricsObserver);
+                event -> new TransportReceipt(Optional.of("sent-before-ownership-reject"), Map.of()), fixture.publicationTracer, metricsObserver);
         assertThatThrownBy(() -> ownershipWorker.publishClaimedEvent(claimed(1005, 1, parent)))
                 .isInstanceOf(StaleEventClaimException.class);
 
@@ -126,8 +128,8 @@ class MicrometerPublicationWorkerTest {
         int[] closes = {0};
         PublicationTracer brokenTracer = event -> new PublicationTracer.Attempt() {
             @Override public StoredEvent eventForSend() { throw new IllegalStateException("inject failure"); }
-            @Override public void sendSucceeded(SendReceipt receipt) { throw new IllegalStateException("record failure"); }
-            @Override public void sendFailed(dev.reliableevent.internal.publication.EventSendFailureType type,
+            @Override public void sendSucceeded(TransportReceipt receipt) { throw new IllegalStateException("record failure"); }
+            @Override public void sendFailed(TransportFailureType type,
                                              Throwable failure) { throw new IllegalStateException("record failure"); }
             @Override public void stateUpdated(String status, boolean commitPending) {
                 throw new IllegalStateException("record failure");
@@ -138,21 +140,21 @@ class MicrometerPublicationWorkerTest {
             @Override public void close() { closes[0]++; throw new IllegalStateException("close failure"); }
         };
         JdbcEventPublicationWorker brokenWorker = worker(jdbcReturning(1), txManager(),
-                event -> new SendReceipt("still-published"), brokenTracer);
+                event -> new TransportReceipt(Optional.of("still-published"), Map.of()), brokenTracer);
         assertThat(brokenWorker.publishClaimedEvent(claimed(2001, 1, parent))).isTrue();
         assertThat(closes[0]).isEqualTo(1);
 
         PublicationTracer tracingOnlyFailBegin = event -> { throw new IllegalStateException("start failure"); };
         JdbcEventPublicationWorker noSpanWorker = worker(jdbcReturning(1), txManager(),
-                event -> new SendReceipt("published-with-noop"), tracingOnlyFailBegin);
+                event -> new TransportReceipt(Optional.of("published-with-noop"), Map.of()), tracingOnlyFailBegin);
         assertThat(noSpanWorker.publishClaimedEvent(claimed(2002, 1, parent))).isTrue();
 
         PublicationTracer closeCounter = event -> {
             PublicationTracer.Attempt delegate = fixture.publicationTracer.begin(event);
             return new PublicationTracer.Attempt() {
             @Override public StoredEvent eventForSend() { return delegate.eventForSend(); }
-            @Override public void sendSucceeded(SendReceipt receipt) { delegate.sendSucceeded(receipt); }
-            @Override public void sendFailed(dev.reliableevent.internal.publication.EventSendFailureType type,
+            @Override public void sendSucceeded(TransportReceipt receipt) { delegate.sendSucceeded(receipt); }
+            @Override public void sendFailed(TransportFailureType type,
                                              Throwable failure) { delegate.sendFailed(type, failure); }
             @Override public void stateUpdated(String status, boolean commitPending) {
                 delegate.stateUpdated(status, commitPending);
@@ -166,7 +168,7 @@ class MicrometerPublicationWorkerTest {
         JdbcEventPublicationWorker interruptedWorker = worker(jdbcReturning(1), txManager(),
                 event -> {
                     Thread.currentThread().interrupt();
-                    throw EventSendException.resultUnknown("interrupted send");
+                    throw new TransportException(TransportFailureType.RESULT_UNKNOWN, "interrupted send");
                 }, closeCounter);
         try {
             assertThat(interruptedWorker.publishClaimedEvent(claimed(2003, 1, parent))).isFalse();
@@ -192,12 +194,12 @@ class MicrometerPublicationWorkerTest {
     }
 
     private JdbcEventPublicationWorker worker(JdbcTemplate jdbc, PlatformTransactionManager transactionManager,
-                                              EventSender sender, PublicationTracer tracer) {
+                                              EventTransport sender, PublicationTracer tracer) {
         return worker(jdbc, transactionManager, sender, tracer, PublicationObserver.NOOP);
     }
 
     private JdbcEventPublicationWorker worker(JdbcTemplate jdbc, PlatformTransactionManager transactionManager,
-                                              EventSender sender, PublicationTracer tracer,
+                                              EventTransport sender, PublicationTracer tracer,
                                               PublicationObserver observer) {
         return new JdbcEventPublicationWorker(jdbc, transactionManager, sender, java.time.Clock.systemUTC(),
                 10, "worker-test", LEASE, new ExponentialBackoff(Duration.ofSeconds(1), Duration.ofMinutes(1), 0.2, () -> 0.0),
@@ -237,7 +239,7 @@ class MicrometerPublicationWorkerTest {
         private Map<String, String> parentHeaders() {
             var parent = tracer.nextSpan().name("registration-context").start();
             parentSpanId = parent.context().spanId();
-            java.util.Map<String, String> headers = new java.util.LinkedHashMap<>();
+            Map<String, String> headers = new java.util.LinkedHashMap<>();
             propagator.inject(parent.context(), headers, (carrier, key, value) -> carrier.put(key, value));
             parent.end();
             return headers;

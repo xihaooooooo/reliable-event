@@ -4,12 +4,11 @@ import dev.reliableevent.autoconfigure.ReliableEventAutoConfiguration;
 import dev.reliableevent.autoconfigure.ReliableEventProperties;
 import dev.reliableevent.autoconfigure.ReliableEventTransportSelection;
 import dev.reliableevent.autoconfigure.ReliableEventTransportSelectionAutoConfiguration;
-import dev.reliableevent.internal.publication.EventSender;
+import dev.reliableevent.spi.EventTransport;
 import dev.reliableevent.rocketmq.EventDestinationResolver;
 import dev.reliableevent.rocketmq.MapEventDestinationResolver;
 import dev.reliableevent.rocketmq.RocketMqDestination;
 import dev.reliableevent.rocketmq.RocketMqEventTransport;
-import dev.reliableevent.spi.EventTransport;
 import org.apache.rocketmq.client.apis.ClientConfiguration;
 import org.apache.rocketmq.client.apis.ClientConfigurationBuilder;
 import org.apache.rocketmq.client.apis.ClientException;
@@ -37,7 +36,6 @@ import java.util.Map;
         ReliableEventAutoConfiguration.class,
         ReliableEventTransportSelectionAutoConfiguration.class
 }, beforeName = {
-        "dev.reliableevent.autoconfigure.ReliableEventTransportBridgeAutoConfiguration",
         "dev.reliableevent.autoconfigure.ReliableEventPublicationAutoConfiguration"
 })
 @ConditionalOnClass(name = {
@@ -65,7 +63,7 @@ public class ReliableEventRocketMqAutoConfiguration {
             "org.springframework.transaction.PlatformTransactionManager"
     })
     @ConditionalOnSingleCandidate(type = "javax.sql.DataSource")
-    @ConditionalOnMissingBean({EventSender.class, EventTransport.class})
+    @ConditionalOnMissingBean(EventTransport.class)
     @ConditionalOnProperty(prefix = "reliable-event", name = "transport", havingValue = "rocketmq", matchIfMissing = true)
     static class SelectedRocketMqConfiguration {
 
@@ -111,7 +109,7 @@ public class ReliableEventRocketMqAutoConfiguration {
         }
 
         @Bean
-        @ConditionalOnMissingBean({Producer.class, EventSender.class, EventTransport.class})
+        @ConditionalOnMissingBean({Producer.class, EventTransport.class})
         Producer reliableEventProducer(
                 ClientServiceProvider provider,
                 ClientConfiguration configuration,
@@ -150,7 +148,7 @@ public class ReliableEventRocketMqAutoConfiguration {
         }
 
         @Bean
-        @ConditionalOnMissingBean({EventSender.class, EventTransport.class})
+        @ConditionalOnMissingBean(EventTransport.class)
         @Role(org.springframework.beans.factory.config.BeanDefinition.ROLE_INFRASTRUCTURE)
         @ConditionalOnBean(Producer.class)
         EventTransport reliableEventRocketMqTransport(

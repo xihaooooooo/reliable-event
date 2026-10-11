@@ -1,7 +1,7 @@
 package dev.reliableevent.autoconfigure;
 
-import dev.reliableevent.internal.publication.EventSendFailureType;
-import dev.reliableevent.internal.publication.SendReceipt;
+import dev.reliableevent.spi.TransportFailureType;
+import dev.reliableevent.spi.TransportReceipt;
 import dev.reliableevent.jdbc.internal.model.ClaimedEvent;
 import dev.reliableevent.jdbc.internal.model.ExpiredLeaseCandidate;
 import dev.reliableevent.jdbc.internal.model.OutboxMetricsSnapshot;
@@ -44,8 +44,8 @@ final class MicrometerPublicationObserver implements PublicationObserver, AutoCl
     private final Timer cleanupDuration;
     private final Timer successDuration;
     private final Timer lag;
-    private final EnumMap<EventSendFailureType, Timer> failedDurations =
-            new EnumMap<>(EventSendFailureType.class);
+    private final EnumMap<TransportFailureType, Timer> failedDurations =
+            new EnumMap<>(TransportFailureType.class);
     private final AtomicReference<Double> oldestEligibleAge = new AtomicReference<>(Double.NaN);
     private record PublishedSnapshot(OutboxMetricsSnapshot value, long lastSuccessEpochSeconds) { }
     private final AtomicReference<PublishedSnapshot> snapshot = new AtomicReference<>();
@@ -93,9 +93,9 @@ final class MicrometerPublicationObserver implements PublicationObserver, AutoCl
         cleanupDuration = own(Timer.builder("reliable_event.retention.duration").register(registry));
         successDuration = own(Timer.builder("reliable_event.publish.duration")
                 .tag("outcome", "success").register(registry));
-        failedDurations.put(EventSendFailureType.RETRYABLE, duration("retryable"));
-        failedDurations.put(EventSendFailureType.NON_RETRYABLE, duration("non_retryable"));
-        failedDurations.put(EventSendFailureType.RESULT_UNKNOWN, duration("unknown"));
+        failedDurations.put(TransportFailureType.RETRYABLE, duration("retryable"));
+        failedDurations.put(TransportFailureType.NON_RETRYABLE, duration("non_retryable"));
+        failedDurations.put(TransportFailureType.RESULT_UNKNOWN, duration("unknown"));
         lag = own(Timer.builder("reliable_event.publish.lag").register(registry));
         own(Gauge.builder("reliable_event.backlog", snapshot, value -> {
             var current = value.get(); return current == null ? Double.NaN : (double) current.value().backlog();
@@ -148,7 +148,7 @@ final class MicrometerPublicationObserver implements PublicationObserver, AutoCl
     }
 
     @Override
-    public void sendSucceeded(ClaimedEvent event, SendReceipt receipt, long elapsedNanos, Instant at) {
+    public void sendSucceeded(ClaimedEvent event, TransportReceipt receipt, long elapsedNanos, Instant at) {
         success.increment();
         successDuration.record(Duration.ofNanos(Math.max(0, elapsedNanos)));
         if (event.firstAvailableAt() == null) {
@@ -165,7 +165,7 @@ final class MicrometerPublicationObserver implements PublicationObserver, AutoCl
     }
 
     @Override
-    public void sendFailed(ClaimedEvent event, EventSendFailureType type, long elapsedNanos) {
+    public void sendFailed(ClaimedEvent event, TransportFailureType type, long elapsedNanos) {
         failure.increment();
         failedDurations.get(type).record(Duration.ofNanos(Math.max(0, elapsedNanos)));
     }

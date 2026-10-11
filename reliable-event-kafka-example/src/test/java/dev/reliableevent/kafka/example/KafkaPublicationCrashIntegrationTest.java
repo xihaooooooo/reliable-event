@@ -1,10 +1,10 @@
 package dev.reliableevent.kafka.example;
 
-import dev.reliableevent.internal.publication.EventSender;
+import dev.reliableevent.spi.TransportReceipt;
+import dev.reliableevent.spi.EventTransport;
 import dev.reliableevent.EventId;
 import dev.reliableevent.ReliableEvent;
 import dev.reliableevent.ReliableEventPublisher;
-import dev.reliableevent.internal.model.StoredEvent;
 import dev.reliableevent.jdbc.internal.model.EventStatus;
 import dev.reliableevent.jdbc.internal.observation.PublicationObserver;
 import dev.reliableevent.jdbc.internal.publication.JdbcEventPublicationWorker;
@@ -176,14 +176,14 @@ class KafkaPublicationCrashIntegrationTest {
         evidenceDirectory = evidenceDirectory("future-event");
         FutureOrder future = registerFutureOrder(Duration.ofSeconds(2));
         timeline("future_registered event_id=" + future.eventId().value() + " available_at=" + future.availableAt());
-        assertThat(worker(context.getBean(EventSender.class)).publishDueEvents()).isZero();
+        assertThat(worker(context.getBean(EventTransport.class)).publishDueEvents()).isZero();
         assertThat(status(future.eventId().value())).isEqualTo(EventStatus.PENDING.code());
         assertThat(readWireRecords(Duration.ofMillis(500))).isEmpty();
 
         await(() -> jdbc.queryForObject("SELECT next_attempt_at <= ? FROM reliable_event_outbox WHERE id=?",
                 Boolean.class, Timestamp.from(Clock.systemUTC().instant()), future.eventId().value()), Duration.ofSeconds(5));
         timeline("future_became_due observed_at=" + Clock.systemUTC().instant());
-        assertThat(worker(context.getBean(EventSender.class)).publishDueEvents()).isEqualTo(1);
+        assertThat(worker(context.getBean(EventTransport.class)).publishDueEvents()).isEqualTo(1);
         await(() -> status(future.eventId().value()) == EventStatus.PUBLISHED.code()
                 && committedOffset(group) >= 1 && effectCount(future.orderId()) == 1, Duration.ofSeconds(30));
         var records = readWireRecords(Duration.ofSeconds(2));
@@ -235,7 +235,7 @@ class KafkaPublicationCrashIntegrationTest {
                 + "' OR status <> 2)");
         try {
             org.assertj.core.api.Assertions.assertThatThrownBy(
-                    () -> worker(context.getBean(EventSender.class)).publishDueEvents()).isInstanceOf(RuntimeException.class);
+                    () -> worker(context.getBean(EventTransport.class)).publishDueEvents()).isInstanceOf(RuntimeException.class);
         } finally {
             jdbc.execute("ALTER TABLE reliable_event_outbox DROP CHECK " + constraintName);
         }
@@ -253,7 +253,7 @@ class KafkaPublicationCrashIntegrationTest {
                 + " wire=" + describeRecords(readWireRecords(Duration.ofSeconds(2))));
 
         expireAndRecover(created.eventId());
-        assertThat(worker(context.getBean(EventSender.class)).publishDueEvents()).isOne();
+        assertThat(worker(context.getBean(EventTransport.class)).publishDueEvents()).isOne();
         await(() -> status(created.eventId()) == EventStatus.PUBLISHED.code()
                 && committedOffset(group) >= 2 && effectCount(created.orderId()) == 1, Duration.ofSeconds(30));
         var records = readWireRecords(Duration.ofSeconds(2));
@@ -282,11 +282,11 @@ class KafkaPublicationCrashIntegrationTest {
             KAFKA.getDockerClient().pauseContainerCmd(KAFKA.getContainerId()).exec();
             brokerPaused = true;
             timeline("native_broker_paused event_id=" + created.eventId() + " max_attempts=2");
-            assertThat(worker(context.getBean(EventSender.class)).publishDueEvents()).isZero();
+            assertThat(worker(context.getBean(EventTransport.class)).publishDueEvents()).isZero();
             assertThat(status(created.eventId())).isEqualTo(EventStatus.RETRY_WAIT.code());
             await(() -> jdbc.queryForObject("SELECT next_attempt_at <= ? FROM reliable_event_outbox WHERE id=?",
                     Boolean.class, Timestamp.from(Clock.systemUTC().instant()), created.eventId()), Duration.ofSeconds(10));
-            assertThat(worker(context.getBean(EventSender.class)).publishDueEvents()).isZero();
+            assertThat(worker(context.getBean(EventTransport.class)).publishDueEvents()).isZero();
             assertThat(status(created.eventId())).isEqualTo(EventStatus.DEAD.code());
             assertThat(attemptCount(created.eventId())).isEqualTo(2);
             timeline("native_retry_exhausted event_id=" + created.eventId() + " status="
@@ -327,7 +327,7 @@ class KafkaPublicationCrashIntegrationTest {
         String clientId = nativeMetrics.keySet().stream().map(name -> name.tags().get("client-id"))
                 .filter(Objects::nonNull).findFirst().orElse("unavailable");
         String before = nativeProducerSample("before-send", producer, clientId);
-        assertThat(worker(context.getBean(EventSender.class)).publishDueEvents()).isOne();
+        assertThat(worker(context.getBean(EventTransport.class)).publishDueEvents()).isOne();
         await(() -> status(created.eventId()) == EventStatus.PUBLISHED.code(), Duration.ofSeconds(20));
         String afterSend = nativeProducerSample("after-confirmed-send", producer, clientId);
         timeline(before);
@@ -354,10 +354,10 @@ class KafkaPublicationCrashIntegrationTest {
     @Test void lateBrokerSuccessCannotOverwritePublishedStateAfterNaturalLeaseTakeover() throws Exception {
         evidenceDirectory = evidenceDirectory("late-lease-success");
         OrderService.CreatedOrder created = context.getBean(OrderService.class).create("late-lease", 1);
-        EventSender realSender = context.getBean(EventSender.class);
+        EventTransport realSender = context.getBean(EventTransport.class);
         CountDownLatch brokerAcknowledged = new CountDownLatch(1);
         CountDownLatch allowStaleDatabaseWrite = new CountDownLatch(1);
-        EventSender blockedAfterAck = event -> {
+        EventTransport blockedAfterAck = event -> {
             var receipt = realSender.send(event);
             brokerAcknowledged.countDown();
             try {
@@ -484,7 +484,7 @@ class KafkaPublicationCrashIntegrationTest {
         int sendCycles = 0;
         while (jdbc.queryForObject("SELECT COUNT(*) FROM reliable_event_outbox WHERE status=?",
                 Long.class, EventStatus.PUBLISHED.code()) < eventCount && sendCycles++ < 20) {
-            worker(context.getBean(EventSender.class)).publishDueEvents();
+            worker(context.getBean(EventTransport.class)).publishDueEvents();
         }
         long sendMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - publishStart);
         await(() -> committedOffset(group) >= eventCount
@@ -814,7 +814,7 @@ class KafkaPublicationCrashIntegrationTest {
             if (enabled && !running && schedulerStarted.getCount() == 0) schedulerStopping.countDown();
         }
         @Override public void sendSucceeded(dev.reliableevent.jdbc.internal.model.ClaimedEvent event,
-                                            dev.reliableevent.internal.publication.SendReceipt receipt,
+                                            TransportReceipt receipt,
                                             long elapsedNanos, java.time.Instant at) {
             activeEventId.set(event.event().id().value());
             brokerAcknowledged.countDown();
@@ -1020,7 +1020,7 @@ class KafkaPublicationCrashIntegrationTest {
                 ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, ByteArrayDeserializer.class);
     }
 
-    private JdbcEventPublicationWorker worker(EventSender sender) {
+    private JdbcEventPublicationWorker worker(EventTransport sender) {
         return new JdbcEventPublicationWorker(jdbc,
                 context.getBean(org.springframework.transaction.PlatformTransactionManager.class), sender,
                 Clock.systemUTC(), 10, "kafka-crash-recovery-" + UUID.randomUUID(), LEASE,

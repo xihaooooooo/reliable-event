@@ -32,5 +32,7 @@ class TransportContractTest {
         assertThatThrownBy(() -> new TransportReceipt(Optional.empty(), Map.of("password", "secret")))
                 .isInstanceOf(IllegalArgumentException.class);
         assertThatThrownBy(() -> receipt.metadata().clear()).isInstanceOf(UnsupportedOperationException.class);
+        assertThatThrownBy(() -> new TransportReceipt(Optional.of(" "), Map.of()))
+                .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("brokerMessageId");
     }
 }

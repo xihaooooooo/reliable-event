@@ -1,8 +1,9 @@
 package dev.reliableevent.benchmark;
 
-import dev.reliableevent.internal.publication.EventSender;
-import dev.reliableevent.internal.publication.EventSendException;
-import dev.reliableevent.rocketmq.RocketMqEventSender;
+import dev.reliableevent.spi.TransportFailureType;
+import dev.reliableevent.spi.EventTransport;
+import dev.reliableevent.spi.TransportException;
+import dev.reliableevent.rocketmq.RocketMqEventTransport;
 import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import org.springframework.boot.SpringApplication;
@@ -23,7 +24,7 @@ public class BenchmarkApplication {
     /** The load process registers events but never sends them itself. */
     @Bean
     @ConditionalOnProperty(prefix = "benchmark", name = "mode", havingValue = "load")
-    EventSender benchmarkLoadOnlySender() {
+    EventTransport benchmarkLoadOnlySender() {
         return event -> {
             throw new IllegalStateException("Benchmark load process must not publish events");
         };
@@ -43,13 +44,13 @@ public class BenchmarkApplication {
         return new BeanPostProcessor() {
             @Override
             public Object postProcessAfterInitialization(Object bean, String beanName) {
-                if (!(bean instanceof RocketMqEventSender sender)) {
+                if (!(bean instanceof RocketMqEventTransport sender)) {
                     return bean;
                 }
-                return (EventSender) event -> {
+                return (EventTransport) event -> {
                     var receipt = sender.send(event);
                     if (drop.compareAndSet(true, false)) {
-                        throw EventSendException.resultUnknown("Benchmark discarded one real success receipt");
+                        throw new TransportException(TransportFailureType.RESULT_UNKNOWN, "Benchmark discarded one real success receipt");
                     }
                     return receipt;
                 };

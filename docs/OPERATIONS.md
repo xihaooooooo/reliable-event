@@ -38,7 +38,7 @@ M7 写入协议要求 `reliable_event_identity` 与 Outbox 同库、同一事务
 
 ## 配置与启动
 
-RocketMQ 应用使用 `dev.reliableevent:reliable-event-rocketmq-spring-boot-starter:0.1.0-SNAPSHOT`。旧坐标 `reliable-event-spring-boot-starter` 已删除，不再提供兼容入口。仅登记的应用可使用 `dev.reliableevent:reliable-event-spring-boot-starter-base` 并设置 `reliable-event.scheduling-enabled=false`；同一 Outbox 需要另有发布实例处理事件。若 base 应用提供自定义 `EventTransport` 或旧 `EventSender`，可保留默认调度；默认调度开启但没有 Sender 时启动失败。Base 的运行时依赖不含 RocketMQ 客户端。RocketMQ 默认装配要求单一可选 `DataSource`，并要求 `JdbcTemplate`、`PlatformTransactionManager` 和 Jackson `ObjectMapper`。示例配置：
+RocketMQ 应用使用 `dev.reliableevent:reliable-event-rocketmq-spring-boot-starter:0.1.0-SNAPSHOT`。旧坐标 `reliable-event-spring-boot-starter` 已删除，不再提供兼容入口。仅登记的应用可使用 `dev.reliableevent:reliable-event-spring-boot-starter-base` 并设置 `reliable-event.scheduling-enabled=false`；同一 Outbox 需要另有发布实例处理事件。若 base 应用提供自定义 `EventTransport`，可保留默认调度；默认调度开启但没有 EventTransport 时启动失败。Base 的运行时依赖不含 RocketMQ 客户端。RocketMQ 默认装配要求单一可选 `DataSource`，并要求 `JdbcTemplate`、`PlatformTransactionManager` 和 Jackson `ObjectMapper`。示例配置：
 
 ```yaml
 reliable-event:
@@ -50,7 +50,7 @@ reliable-event:
         destination: orders-topic:created
 ```
 
-自定义 `EventTransport` 或旧 `EventSender` 时默认退让到 `custom`，不会创建默认 RocketMQ 客户端；也可显式设置 `transport: custom`。多个已安装适配器必须显式选择，缺少适配器、重复自定义发送入口和未知配置键会在启动时失败。RocketMQ 设置只在 RocketMQ 适配器加载时校验；切换到其他已注册传输且仍保留 `rocketmq.*` 配置时，日志只提示该命名空间未使用，不打印配置值。自定义 Sender 自行负责单次发送等待预算，需确保外部发送完成时间与 Outbox 租约协调。
+自定义 `EventTransport` 时默认退让到 `custom`，不会创建默认 RocketMQ 客户端；也可显式设置 `transport: custom`。多个已安装适配器必须显式选择，缺少适配器、重复自定义发送入口和未知配置键会在启动时失败。RocketMQ 设置只在 RocketMQ 适配器加载时校验；切换到其他已注册传输且仍保留 `rocketmq.*` 配置时，日志只提示该命名空间未使用，不打印配置值。自定义 EventTransport 自行负责单次发送等待预算，需确保外部发送完成时间与 Outbox 租约协调。
 
 Kafka 独立应用使用专用坐标 `dev.reliableevent:reliable-event-kafka-spring-boot-starter:0.1.0-SNAPSHOT`。仅安装 Kafka Starter 时可省略 `transport` 并选择唯一的 Kafka 内置适配器；同时安装 RocketMQ 和 Kafka Starter 时必须显式设为 `rocketmq` 或 `kafka`。Kafka 示例配置如下：
 
@@ -71,7 +71,7 @@ Kafka 生产适配器不创建 Topic。生产端使用事件业务键作为 reco
 
 Kafka 的专用预算属性为：`max-block` 默认 `1s`、`request-timeout` 默认 `3s`、`delivery-timeout` 默认 `5s`、`linger` 默认 `0`，其中 `delivery-timeout` 必须至少等于 request timeout 加 linger；`shutdown-timeout` 默认 `5s`。默认发送总预算为 `max-block + delivery-timeout + 1s` 确认余量。`max-body-bytes` 默认 4 MiB，超过上限的 Payload 在调用 Producer 前按不可重试失败处理；Kafka 默认 `max.request.size` 在该上限外额外预留 32 KiB 记录/header 开销。`producer-properties` 只用于其它合法 Kafka Producer 设置，不能覆盖 Broker 地址、序列化器、确认/幂等/重试、预算时间、事务 ID、Partitioner 或 Interceptor。
 
-该 Topic 名是示意值，部署前须创建相应 RocketMQ 资源。默认 Producer 启动时需要 Proxy 地址和至少一个映射；使用自定义 `Producer`、`EventSender` 或目标解析器时，应按自动配置的 Bean 条件核对自己的组合，不能假定默认配置仍生效。RocketMQ 凭据通过部署环境注入，不能提交到仓库。
+该 Topic 名是示意值，部署前须创建相应 RocketMQ 资源。默认 Producer 启动时需要 Proxy 地址和至少一个映射；使用自定义 `Producer`、`EventTransport` 或目标解析器时，应按自动配置的 Bean 条件核对自己的组合，不能假定默认配置仍生效。RocketMQ 凭据通过部署环境注入，不能提交到仓库。
 
 | 配置键（均在 `reliable-event` 下） | 默认值 | 含义与约束 |
 | --- | --- | --- |

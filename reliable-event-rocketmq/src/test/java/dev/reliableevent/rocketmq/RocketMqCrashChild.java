@@ -1,9 +1,8 @@
 package dev.reliableevent.rocketmq;
 
-import com.fasterxml.jackson.databind.ObjectMapper;
-import dev.reliableevent.internal.model.StoredEvent;
-import dev.reliableevent.internal.publication.EventSender;
-import dev.reliableevent.internal.publication.SendReceipt;
+import dev.reliableevent.spi.OutboundEvent;
+import dev.reliableevent.spi.EventTransport;
+import dev.reliableevent.spi.TransportReceipt;
 import dev.reliableevent.jdbc.internal.model.EventCandidate;
 import dev.reliableevent.jdbc.internal.publication.JdbcEventPublicationWorker;
 import dev.reliableevent.jdbc.internal.retry.ExponentialBackoff;
@@ -12,7 +11,6 @@ import org.apache.rocketmq.client.apis.ClientServiceProvider;
 import org.apache.rocketmq.client.apis.producer.Producer;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.datasource.DriverManagerDataSource;
-import org.springframework.transaction.support.TransactionTemplate;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -87,15 +85,12 @@ public final class RocketMqCrashChild {
                 .setTopics(RocketMqTestEnvironment.TOPIC)
                 .setMaxAttempts(1)
                 .build();
-        RocketMqEventSender rocketSender = new RocketMqEventSender(
-                provider, producer,
-                new MapEventDestinationResolver(Map.of("coupon-task-execute",
-                        new RocketMqDestination(RocketMqTestEnvironment.TOPIC, RocketMqTestEnvironment.TAG))),
-                new ObjectMapper());
-        EventSender holdAfterConfirmation = (StoredEvent event) -> {
-            SendReceipt receipt = rocketSender.send(event);
+        RocketMqEventTransport rocketSender = new RocketMqEventTransport(provider, producer, new MapEventDestinationResolver(Map.of("coupon-task-execute",
+                        new RocketMqDestination(RocketMqTestEnvironment.TOPIC, RocketMqTestEnvironment.TAG))));
+        EventTransport holdAfterConfirmation = (OutboundEvent event) -> {
+            TransportReceipt receipt = rocketSender.send(event);
             writeReady(ready, "boundary=broker-confirmed-before-db-state-commit\nmessageId="
-                    + receipt.messageId());
+                    + receipt.brokerMessageId().orElse(null));
             awaitParentKill();
             return receipt;
         };

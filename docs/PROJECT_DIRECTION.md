@@ -145,23 +145,19 @@ public record ReliableEvent<T>(
 - 调用时必须存在活动事务；
 - 同一 `eventType + eventKey` 重复发布时返回已有事件，不重复插入。
 
-### 7.2 内部发送接缝
+### 7.2 公共发送扩展接口
 
-后台发布器通过内部发送接口与消息系统交互：
+后台发布器直接通过公共 SPI 与消息系统交互：
 
 ```java
-interface EventSender {
-
-    SendReceipt send(StoredEvent event);
+public interface EventTransport {
+    TransportReceipt send(OutboundEvent event);
 }
 ```
 
-`0.1.0` 存在两个适配：
+JDBC Worker 在发送前将数据库里的 `StoredEvent` 转为 `OutboundEvent`，解析并校验 headers，保留原始 Payload JSON。适配器仅在收到 Broker 确认后返回 `TransportReceipt`，失败通过 `TransportException` 携带统一的 `TransportFailureType` 分类。
 
-- `RocketMqEventSender`：生产适配；
-- `FakeEventSender`：测试适配。
-
-发送接缝不暴露给普通业务调用方。
+当前生产适配为 `RocketMqEventTransport` 和 `KafkaEventTransport`；测试直接实现 `EventTransport`。自定义发送也只注册一个 `EventTransport` Bean，不再提供原 `EventSender` 兼容入口。普通业务代码仍通过 `ReliableEventPublisher` 登记事件。
 
 ### 7.3 存储接缝
 

@@ -1,12 +1,13 @@
 package dev.reliableevent.example;
 
+import java.util.Optional;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import dev.reliableevent.EventId;
 import dev.reliableevent.MissingActiveTransactionException;
 import dev.reliableevent.ReliableEvent;
 import dev.reliableevent.ReliableEventPublisher;
-import dev.reliableevent.internal.publication.EventSender;
-import dev.reliableevent.internal.publication.SendReceipt;
+import dev.reliableevent.spi.EventTransport;
+import dev.reliableevent.spi.TransportReceipt;
 import org.apache.rocketmq.client.apis.message.MessageView;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -186,8 +187,8 @@ class OrderExampleMysqlIntegrationTest {
     @TestConfiguration(proxyBeanMethods = false)
     static class FakeSender {
         @Bean
-        EventSender exampleFakeSender() {
-            return event -> new SendReceipt("fake-" + event.id().value());
+        EventTransport exampleFakeSender() {
+            return event -> new TransportReceipt(Optional.of("fake-" + event.id().value()), Map.of());
         }
     }
 }

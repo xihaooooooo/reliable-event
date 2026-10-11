@@ -1,15 +1,14 @@
 package dev.reliableevent.example;
 
-import com.fasterxml.jackson.databind.ObjectMapper;
-import dev.reliableevent.internal.model.StoredEvent;
-import dev.reliableevent.internal.publication.EventSender;
-import dev.reliableevent.internal.publication.SendReceipt;
+import dev.reliableevent.spi.OutboundEvent;
+import dev.reliableevent.spi.EventTransport;
+import dev.reliableevent.spi.TransportReceipt;
 import dev.reliableevent.jdbc.internal.model.EventCandidate;
 import dev.reliableevent.jdbc.internal.publication.JdbcEventPublicationWorker;
 import dev.reliableevent.jdbc.internal.retry.ExponentialBackoff;
 import dev.reliableevent.rocketmq.MapEventDestinationResolver;
 import dev.reliableevent.rocketmq.RocketMqDestination;
-import dev.reliableevent.rocketmq.RocketMqEventSender;
+import dev.reliableevent.rocketmq.RocketMqEventTransport;
 import org.apache.rocketmq.client.apis.ClientConfiguration;
 import org.apache.rocketmq.client.apis.ClientServiceProvider;
 import org.apache.rocketmq.client.apis.producer.Producer;
@@ -66,13 +65,12 @@ public final class RocketMqExampleCrashProcess {
                 .setTopics(topic)
                 .setMaxAttempts(1)
                 .build();
-        RocketMqEventSender sender = new RocketMqEventSender(provider, producer,
-                new MapEventDestinationResolver(Map.of(OrderService.EVENT_TYPE,
-                        new RocketMqDestination(topic, "created"))), new ObjectMapper());
-        EventSender holdAfterRealConfirmation = (StoredEvent event) -> {
-            SendReceipt receipt = sender.send(event);
+        RocketMqEventTransport sender = new RocketMqEventTransport(provider, producer, new MapEventDestinationResolver(Map.of(OrderService.EVENT_TYPE,
+                        new RocketMqDestination(topic, "created"))));
+        EventTransport holdAfterRealConfirmation = (OutboundEvent event) -> {
+            TransportReceipt receipt = sender.send(event);
             writeReady(readyMarker, "boundary=real-broker-confirmed-before-state-commit\n" +
-                    "eventId=" + event.id().value() + "\nmessageId=" + receipt.messageId());
+                    "eventId=" + event.id().value() + "\nmessageId=" + receipt.brokerMessageId().orElse(null));
             awaitParentKill();
             return receipt;
         };

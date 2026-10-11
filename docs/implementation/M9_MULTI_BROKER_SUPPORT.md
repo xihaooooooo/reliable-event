@@ -1,5 +1,7 @@
 # M9：多消息中间件支持实施计划
 
+> 2026-10-11 发送接口简化：当前 Worker 已直接使用公共 `EventTransport`，回执与失败分类统一为 `TransportReceipt`、`TransportException`、`TransportFailureType`；原 `EventSender` 接入、RocketMQ 兼容包装和自动配置桥接层已移除。本文下方的桥接与兼容描述记录 M9 分阶段实施时的设计。
+
 > 编写日期：2026-10-03（Asia/Shanghai）  
 > 状态：M9.1 公共发送契约、M9.2 RocketMQ 模块拆分和 M9.3 Kafka 适配均已实施并验收。M9.4 故障、并发、追踪及资源审计正在实施；M9.5“最终工件与运维交接”待进行。Kafka 已通过真实 Broker、MySQL Outbox 状态、独立示例和仓库外安装件消费验证；RabbitMQ 仍未实现。
 > 源码依据：编写时 HEAD 为 `ac5e6ca`。当前产品仍是 `0.1.0-SNAPSHOT`，已实现 RocketMQ；M8.1–M8.5 已完成，M8.6 待实施。

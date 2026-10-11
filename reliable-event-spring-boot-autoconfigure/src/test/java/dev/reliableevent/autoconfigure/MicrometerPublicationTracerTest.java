@@ -1,9 +1,11 @@
 package dev.reliableevent.autoconfigure;
 
+import java.util.Optional;
+import dev.reliableevent.spi.TransportFailureType;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import dev.reliableevent.EventId;
 import dev.reliableevent.internal.model.StoredEvent;
-import dev.reliableevent.internal.publication.SendReceipt;
+import dev.reliableevent.spi.TransportReceipt;
 import dev.reliableevent.jdbc.internal.model.ClaimedEvent;
 import dev.reliableevent.jdbc.internal.tracing.PublicationTracer;
 import dev.reliableevent.spi.EventTransport;
@@ -35,7 +37,6 @@ import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class MicrometerPublicationTracerTest {
     private final ObjectMapper objectMapper = new ObjectMapper();
@@ -53,7 +54,7 @@ class MicrometerPublicationTracerTest {
         Propagator propagator = new OtelPropagator(sdk.getPropagators(), sdk.getTracer("m9.1-test"));
         PublicationTracer.Attempt attempt = new MicrometerPublicationTracer(tracer, propagator, objectMapper)
                 .begin(claimed(storedEvent(Map.of()), 1));
-        attempt.sendSucceeded(new SendReceipt(null));
+        attempt.sendSucceeded(TransportReceipt.confirmed());
         attempt.close();
 
         assertThat(provider.forceFlush().join(10, TimeUnit.SECONDS).isSuccess()).isTrue();
@@ -75,7 +76,12 @@ class MicrometerPublicationTracerTest {
                 new OtelBaggageManager(current, List.of(), List.of()));
         Propagator propagator = new OtelPropagator(sdk.getPropagators(), sdk.getTracer("m9.1-invalid-header-test"));
         EventTransport transport = org.mockito.Mockito.mock(EventTransport.class);
-        EventTransportSenderBridge bridge = new EventTransportSenderBridge(transport, objectMapper);
+        var jdbc = org.mockito.Mockito.mock(org.springframework.jdbc.core.JdbcTemplate.class);
+        org.mockito.Mockito.when(jdbc.update(org.mockito.ArgumentMatchers.anyString(),
+                org.mockito.ArgumentMatchers.any(Object[].class))).thenReturn(1);
+        var transactions = org.mockito.Mockito.mock(org.springframework.transaction.PlatformTransactionManager.class);
+        org.mockito.Mockito.when(transactions.getTransaction(org.mockito.ArgumentMatchers.any()))
+                .thenReturn(org.mockito.Mockito.mock(org.springframework.transaction.TransactionStatus.class));
         PublicationTracer micrometerTracer = new MicrometerPublicationTracer(tracer, propagator, objectMapper);
 
         for (Map<String, String> invalidHeaders : List.of(
@@ -85,11 +91,17 @@ class MicrometerPublicationTracerTest {
             PublicationTracer.Attempt attempt = micrometerTracer.begin(claimed(original, 1));
             try {
                 assertThat(attempt.eventForSend()).isSameAs(original);
-                assertThatThrownBy(() -> bridge.send(attempt.eventForSend()))
-                        .isInstanceOf(dev.reliableevent.internal.publication.EventSendException.class)
-                        .extracting(failure -> ((dev.reliableevent.internal.publication.EventSendException) failure)
-                                .failureType())
-                        .isEqualTo(dev.reliableevent.internal.publication.EventSendFailureType.NON_RETRYABLE);
+                var observer = org.mockito.Mockito.mock(dev.reliableevent.jdbc.internal.observation.PublicationObserver.class);
+                var worker = new dev.reliableevent.jdbc.internal.publication.JdbcEventPublicationWorker(
+                        jdbc, transactions, transport, java.time.Clock.systemUTC(), 10, "worker-test",
+                        java.time.Duration.ofSeconds(30),
+                        dev.reliableevent.jdbc.internal.retry.ExponentialBackoff.defaults(), observer,
+                        ignored -> attempt);
+                var claimedEvent = claimed(original, 1);
+                assertThat(worker.publishClaimedEvent(claimedEvent)).isFalse();
+                org.mockito.Mockito.verify(observer).sendFailed(org.mockito.ArgumentMatchers.eq(claimedEvent),
+                        org.mockito.ArgumentMatchers.eq(TransportFailureType.NON_RETRYABLE),
+                        org.mockito.ArgumentMatchers.anyLong());
             } finally {
                 attempt.close();
             }
@@ -150,7 +162,7 @@ class MicrometerPublicationTracerTest {
             assertThat(copy.payloadJson()).isEqualTo(registeredEvent.payloadJson());
         });
         assertThat(registeredEvent.headersJson()).isEqualTo(registeredHeadersJson);
-        first.sendSucceeded(new SendReceipt("message-1"));
+        first.sendSucceeded(new TransportReceipt(Optional.of("message-1"), Map.of()));
         first.stateUpdated("PUBLISHED", false);
         first.close();
 
@@ -158,7 +170,7 @@ class MicrometerPublicationTracerTest {
         Map<String, String> secondHeaders = objectMapper.readValue(second.eventForSend().headersJson(),
                 objectMapper.getTypeFactory().constructMapType(Map.class, String.class, String.class));
         String secondSpanId = spanId(secondHeaders.get("traceparent"));
-        second.sendSucceeded(new SendReceipt("message-2"));
+        second.sendSucceeded(new TransportReceipt(Optional.of("message-2"), Map.of()));
         second.close();
 
         var unrelated = tracer.nextSpan().name("unrelated").start();
@@ -291,7 +303,7 @@ class MicrometerPublicationTracerTest {
             assertThat(tracer.currentSpan().context().spanId()).isEqualTo(attemptSpanId);
             bothAttemptsStarted.countDown();
             assertThat(releaseAttempts.await(5, TimeUnit.SECONDS)).isTrue();
-            attempt.sendSucceeded(new SendReceipt("message-" + eventId));
+            attempt.sendSucceeded(new TransportReceipt(Optional.of("message-" + eventId), Map.of()));
         } finally {
             attempt.close();
         }

@@ -5,15 +5,12 @@ import dev.reliableevent.autoconfigure.ReliableEventProperties;
 import dev.reliableevent.autoconfigure.ReliableEventTransportSelection;
 import dev.reliableevent.autoconfigure.ReliableEventTransportSelectionAutoConfiguration;
 import dev.reliableevent.autoconfigure.spi.TransportAdapterDescriptor;
-import dev.reliableevent.internal.publication.EventSender;
+import dev.reliableevent.spi.EventTransport;
 import dev.reliableevent.kafka.KafkaDestinationResolver;
 import dev.reliableevent.kafka.KafkaEventTransport;
 import dev.reliableevent.kafka.MapKafkaDestinationResolver;
-import dev.reliableevent.spi.EventTransport;
-import org.apache.kafka.clients.producer.KafkaProducer;
 import org.apache.kafka.clients.producer.Producer;
 import org.apache.kafka.clients.producer.ProducerConfig;
-import org.apache.kafka.common.config.ConfigDef;
 import org.apache.kafka.common.serialization.ByteArraySerializer;
 import org.apache.kafka.common.serialization.StringSerializer;
 import org.springframework.beans.factory.ObjectProvider;
@@ -37,7 +34,6 @@ import java.util.Set;
         ReliableEventAutoConfiguration.class,
         ReliableEventTransportSelectionAutoConfiguration.class
 }, beforeName = {
-        "dev.reliableevent.autoconfigure.ReliableEventTransportBridgeAutoConfiguration",
         "dev.reliableevent.autoconfigure.ReliableEventPublicationAutoConfiguration"
 })
 @ConditionalOnClass(Producer.class)
@@ -76,7 +72,7 @@ public class ReliableEventKafkaAutoConfiguration {
             "org.springframework.jdbc.core.JdbcTemplate",
             "org.springframework.transaction.PlatformTransactionManager"
     })
-    @ConditionalOnMissingBean({EventSender.class, EventTransport.class})
+    @ConditionalOnMissingBean(EventTransport.class)
     @ConditionalOnProperty(prefix = "reliable-event", name = "transport", havingValue = "kafka", matchIfMissing = true)
     @ConditionalOnClass(name = {
             "org.springframework.jdbc.core.JdbcTemplate",

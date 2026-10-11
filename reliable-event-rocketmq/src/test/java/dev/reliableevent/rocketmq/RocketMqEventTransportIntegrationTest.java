@@ -1,9 +1,8 @@
 package dev.reliableevent.rocketmq;
 
-import com.fasterxml.jackson.databind.ObjectMapper;
 import dev.reliableevent.EventId;
-import dev.reliableevent.internal.model.StoredEvent;
-import dev.reliableevent.internal.publication.SendReceipt;
+import dev.reliableevent.spi.OutboundEvent;
+import dev.reliableevent.spi.TransportReceipt;
 import org.apache.rocketmq.client.apis.ClientConfiguration;
 import org.apache.rocketmq.client.apis.ClientServiceProvider;
 import org.apache.rocketmq.client.apis.consumer.FilterExpression;
@@ -27,14 +26,14 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 @Testcontainers(disabledWithoutDocker = true)
 @Timeout(180)
-class RocketMqEventSenderIntegrationTest {
+class RocketMqEventTransportIntegrationTest {
 
     private static final ClientServiceProvider PROVIDER = ClientServiceProvider.loadService();
 
     private static RocketMqTestEnvironment environment;
     private static Producer producer;
     private static SimpleConsumer consumer;
-    private static RocketMqEventSender sender;
+    private static RocketMqEventTransport sender;
 
     @BeforeAll
     static void startRocketMq() throws Exception {
@@ -55,18 +54,13 @@ class RocketMqEventSenderIntegrationTest {
                         FilterExpression.SUB_ALL
                 ))
                 .build();
-        sender = new RocketMqEventSender(
-                PROVIDER,
-                producer,
-                new MapEventDestinationResolver(Map.of(
+        sender = new RocketMqEventTransport(PROVIDER, producer, new MapEventDestinationResolver(Map.of(
                         "coupon-task-execute",
                         new RocketMqDestination(
                                 RocketMqTestEnvironment.TOPIC,
                                 RocketMqTestEnvironment.TAG
                         )
-                )),
-                new ObjectMapper()
-        );
+                )));
     }
 
     @AfterAll
@@ -86,19 +80,19 @@ class RocketMqEventSenderIntegrationTest {
     void sendsTheMappedMessageToARealBroker() throws Exception {
         String eventKey = "task-" + UUID.randomUUID();
         String payload = "{\"taskId\":\"" + eventKey + "\"}";
-        StoredEvent event = new StoredEvent(
+        OutboundEvent event = new OutboundEvent(
                 new EventId(1001),
                 "coupon-task-execute",
                 eventKey,
                 payload,
-                "{\"traceparent\":\"00-aabbcc\"}"
+                Map.of("traceparent", "00-aabbcc")
         );
 
-        SendReceipt receipt = sender.send(event);
+        TransportReceipt receipt = sender.send(event);
         MessageView message = receiveByKey(eventKey);
 
-        assertThat(receipt.messageId()).isNotBlank();
-        assertThat(message.getMessageId().toString()).isEqualTo(receipt.messageId());
+        assertThat(receipt.brokerMessageId().orElse(null)).isNotBlank();
+        assertThat(message.getMessageId().toString()).isEqualTo(receipt.brokerMessageId().orElse(null));
         assertThat(message.getTopic()).isEqualTo(RocketMqTestEnvironment.TOPIC);
         assertThat(message.getTag()).contains(RocketMqTestEnvironment.TAG);
         assertThat(message.getKeys()).contains(eventKey);

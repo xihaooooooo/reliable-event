@@ -1,6 +1,5 @@
 package dev.reliableevent.autoconfigure;
 
-import dev.reliableevent.internal.publication.EventSender;
 import dev.reliableevent.spi.EventTransport;
 import dev.reliableevent.autoconfigure.spi.TransportAdapterDescriptor;
 import org.junit.jupiter.api.Test;
@@ -8,7 +7,6 @@ import org.springframework.beans.factory.support.StaticListableBeanFactory;
 import org.springframework.mock.env.MockEnvironment;
 
 import java.util.List;
-import java.util.Set;
 
 import static org.assertj.core.api.Assertions.*;
 
@@ -28,9 +26,9 @@ class ReliableEventTransportSelectionTest {
     }
 
     @Test
-    void customLegacySenderSuppressesTheDefaultAdapter() {
+    void customTransportSuppressesTheDefaultAdapter() {
         var beans = new StaticListableBeanFactory();
-        beans.addBean("legacy", (EventSender) event -> null);
+        beans.addBean("custom", (EventTransport) event -> null);
         var result = ReliableEventTransportSelection.resolve(
                 new MockEnvironment(), List.of(adapter("rocketmq", "rocketmq")), beans);
         assertThat(result.transport()).isEqualTo("custom");

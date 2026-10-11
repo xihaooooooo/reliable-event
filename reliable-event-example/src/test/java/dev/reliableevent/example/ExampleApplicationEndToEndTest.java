@@ -1,12 +1,14 @@
 package dev.reliableevent.example;
 
+import dev.reliableevent.spi.TransportReceipt;
+import dev.reliableevent.spi.TransportFailureType;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import dev.reliableevent.EventId;
 import dev.reliableevent.ReliableEvent;
 import dev.reliableevent.ReliableEventPublisher;
-import dev.reliableevent.internal.publication.EventSendException;
-import dev.reliableevent.internal.publication.EventSender;
+import dev.reliableevent.spi.TransportException;
+import dev.reliableevent.spi.EventTransport;
 import dev.reliableevent.jdbc.DeadEventDetails;
 import dev.reliableevent.jdbc.DeadEventLookup;
 import dev.reliableevent.jdbc.DeadEventOperations;
@@ -18,7 +20,7 @@ import dev.reliableevent.jdbc.internal.retry.ExponentialBackoff;
 import dev.reliableevent.autoconfigure.ReliableEventScheduler;
 import dev.reliableevent.jdbc.internal.observation.PublicationObserver;
 import dev.reliableevent.rocketmq.MapEventDestinationResolver;
-import dev.reliableevent.rocketmq.RocketMqEventSender;
+import dev.reliableevent.rocketmq.RocketMqEventTransport;
 import org.apache.rocketmq.client.apis.ClientConfiguration;
 import org.apache.rocketmq.client.apis.ClientServiceProvider;
 import org.apache.rocketmq.client.apis.consumer.FilterExpression;
@@ -28,7 +30,6 @@ import org.apache.rocketmq.client.apis.producer.Producer;
 import io.opentelemetry.api.common.AttributeKey;
 import io.opentelemetry.api.trace.SpanKind;
 import io.opentelemetry.sdk.common.CompletableResultCode;
-import io.opentelemetry.sdk.trace.SdkTracerProviderBuilder;
 import io.opentelemetry.sdk.trace.data.SpanData;
 import io.opentelemetry.sdk.trace.export.SimpleSpanProcessor;
 import io.opentelemetry.sdk.trace.export.SpanExporter;
@@ -340,12 +341,12 @@ class ExampleApplicationEndToEndTest {
                 .setSubscriptionExpressions(Map.of(TOPIC, FilterExpression.SUB_ALL))
                 .build()) {
             Created created = postOrder("pencil", 4);
-            EventSender realSender = context.getBean(EventSender.class);
+            EventTransport realSender = context.getBean(EventTransport.class);
             AtomicBoolean first = new AtomicBoolean(true);
-            EventSender receiptLost = event -> {
+            EventTransport receiptLost = event -> {
                 var receipt = realSender.send(event);
                 if (first.getAndSet(false)) {
-                    throw EventSendException.resultUnknown("Test discarded a successful Broker receipt");
+                    throw new TransportException(TransportFailureType.RESULT_UNKNOWN, "Test discarded a successful Broker receipt");
                 }
                 return receipt;
             };
@@ -440,7 +441,7 @@ class ExampleApplicationEndToEndTest {
                 assertThat(status(created.eventId())).isEqualTo(3);
                 jdbc.update("UPDATE reliable_event_outbox SET next_attempt_at=UTC_TIMESTAMP(3)-INTERVAL 1 SECOND WHERE id=?",
                         created.eventId());
-                assertThat(worker(context.getBean(EventSender.class), Clock.systemUTC())
+                assertThat(worker(context.getBean(EventTransport.class), Clock.systemUTC())
                         .publishDueEvents()).isOne();
                 await().atMost(Duration.ofSeconds(30)).pollInterval(Duration.ofMillis(100))
                         .untilAsserted(() -> assertThat(status(created.eventId())).isEqualTo(2));
@@ -486,7 +487,7 @@ class ExampleApplicationEndToEndTest {
         Producer producer = context.getBean(Producer.class);
         assertThat(producer).isNotNull();
         Created created = postOrder("native-close", 1);
-        assertThat(worker(context.getBean(EventSender.class), Clock.systemUTC())
+        assertThat(worker(context.getBean(EventTransport.class), Clock.systemUTC())
                 .publishDueEvents()).isOne();
         assertThat(status(created.eventId())).isEqualTo(2);
         Set<String> activeProducerThreads = liveRocketMqThreadNames();
@@ -724,9 +725,7 @@ class ExampleApplicationEndToEndTest {
         startApplication(false, true, 1);
         Created created = postOrder("eraser", 3);
         EventId eventId = new EventId(created.eventId());
-        EventSender missingDestination = new RocketMqEventSender(
-                PROVIDER, context.getBean(Producer.class),
-                new MapEventDestinationResolver(Map.of()), mapper);
+        EventTransport missingDestination = new RocketMqEventTransport(PROVIDER, context.getBean(Producer.class), new MapEventDestinationResolver(Map.of()));
         assertThat(worker(missingDestination, Clock.systemUTC()).publishDueEvents()).isZero();
         assertThat(status(created.eventId())).isEqualTo(4);
 
@@ -800,10 +799,10 @@ class ExampleApplicationEndToEndTest {
                 .setSubscriptionExpressions(Map.of(TOPIC, FilterExpression.SUB_ALL))
                 .build()) {
             Created created = postOrder("ruler", 5);
-            EventSender realSender = context.getBean(EventSender.class);
-            EventSender receiptLost = event -> {
+            EventTransport realSender = context.getBean(EventTransport.class);
+            EventTransport receiptLost = event -> {
                 realSender.send(event);
-                throw EventSendException.resultUnknown("Test discarded a successful Broker receipt");
+                throw new TransportException(TransportFailureType.RESULT_UNKNOWN, "Test discarded a successful Broker receipt");
             };
             assertThat(worker(receiptLost, Clock.systemUTC()).publishDueEvents()).isZero();
             assertThat(status(created.eventId())).isEqualTo(4);
@@ -959,7 +958,7 @@ class ExampleApplicationEndToEndTest {
                 .run(all);
     }
 
-    private JdbcEventPublicationWorker worker(EventSender sender, Clock clock) {
+    private JdbcEventPublicationWorker worker(EventTransport sender, Clock clock) {
         return new JdbcEventPublicationWorker(jdbc,
                 context.getBean(PlatformTransactionManager.class), sender, clock,
                 10, "example-test-worker", Duration.ofSeconds(30),
@@ -1163,10 +1162,10 @@ class ExampleApplicationEndToEndTest {
             return new PublicationObserver() {
                 @Override
                 public void sendSucceeded(dev.reliableevent.jdbc.internal.model.ClaimedEvent event,
-                                          dev.reliableevent.internal.publication.SendReceipt receipt,
+                                          TransportReceipt receipt,
                                           long elapsedNanos, Instant at) {
                     if (!ShutdownBarrier.enter(event.event().eventKey())) return;
-                    ShutdownBarrier.confirmedMessageId = receipt.messageId();
+                    ShutdownBarrier.confirmedMessageId = receipt.brokerMessageId().orElse(null);
                     ShutdownBarrier.entered.countDown();
                     boolean interrupted = false;
                     while (true) {

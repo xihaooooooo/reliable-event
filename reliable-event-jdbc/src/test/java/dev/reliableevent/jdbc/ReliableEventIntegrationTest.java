@@ -1,5 +1,6 @@
 package dev.reliableevent.jdbc;
 
+import dev.reliableevent.spi.OutboundEvent;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import dev.reliableevent.EventId;
 import dev.reliableevent.MissingActiveTransactionException;
@@ -17,11 +18,11 @@ import dev.reliableevent.internal.model.StoredEvent;
 import dev.reliableevent.jdbc.internal.persistence.JdbcOutboxRepository;
 import dev.reliableevent.jdbc.internal.tracing.RegistrationTracer;
 import dev.reliableevent.jdbc.internal.tracing.PublicationTracer;
-import dev.reliableevent.internal.publication.EventSendFailureType;
-import dev.reliableevent.internal.publication.EventSendException;
-import dev.reliableevent.internal.publication.EventSender;
+import dev.reliableevent.spi.TransportFailureType;
+import dev.reliableevent.spi.TransportException;
+import dev.reliableevent.spi.EventTransport;
 import dev.reliableevent.jdbc.internal.publication.JdbcEventPublicationWorker;
-import dev.reliableevent.internal.publication.SendReceipt;
+import dev.reliableevent.spi.TransportReceipt;
 import dev.reliableevent.jdbc.internal.recovery.JdbcExpiredLeaseRecovery;
 import dev.reliableevent.jdbc.internal.retry.ExponentialBackoff;
 import org.junit.jupiter.api.BeforeEach;
@@ -195,7 +196,7 @@ class ReliableEventIntegrationTest {
         EventId eventId = inTransaction(() -> publisher.publish(new ReliableEvent<>(
                 "coupon-task-execute", "m8.2-headers", new CouponTaskPayload(1023L), NOW,
                 Map.of("source", "m8.2", "traceparent", registrationTraceparent))));
-        List<StoredEvent> sentEvents = new ArrayList<>();
+        List<OutboundEvent> sentEvents = new ArrayList<>();
         List<String> traceResults = new ArrayList<>();
         int[] attemptNumber = {0};
         PublicationTracer tracing = claimed -> {
@@ -211,8 +212,8 @@ class ReliableEventIntegrationTest {
                         objectMapper.writeValueAsString(headers));
                 return new PublicationTracer.Attempt() {
                     @Override public StoredEvent eventForSend() { return copy; }
-                    @Override public void sendSucceeded(SendReceipt receipt) { traceResults.add("send:success"); }
-                    @Override public void sendFailed(EventSendFailureType type, Throwable failure) {
+                    @Override public void sendSucceeded(TransportReceipt receipt) { traceResults.add("send:success"); }
+                    @Override public void sendFailed(TransportFailureType type, Throwable failure) {
                         traceResults.add("send:" + type.name());
                     }
                     @Override public void stateUpdated(String targetStatus, boolean commitPending) {
@@ -228,10 +229,10 @@ class ReliableEventIntegrationTest {
                 throw new AssertionError(failure);
             }
         };
-        EventSender sender = sent -> {
+        EventTransport sender = sent -> {
             sentEvents.add(sent);
-            if (sentEvents.size() == 1) throw EventSendException.resultUnknown("receipt lost");
-            return new SendReceipt("m8.2-message-2");
+            if (sentEvents.size() == 1) throw new TransportException(TransportFailureType.RESULT_UNKNOWN, "receipt lost");
+            return new TransportReceipt(Optional.of("m8.2-message-2"), Map.of());
         };
         JdbcEventPublicationWorker worker = new JdbcEventPublicationWorker(jdbcTemplate,
                 transactionManager, sender, CLOCK, 10, WORKER_ID, LEASE_DURATION,
@@ -248,7 +249,7 @@ class ReliableEventIntegrationTest {
                 .isEqualTo(registrationTraceparent);
         assertThat(sentEvents).hasSize(2);
         List<String> sentSpanIds = sentEvents.stream().map(sent -> {
-            try { return objectMapper.readTree(sent.headersJson()).path("traceparent").asText().substring(36, 52); }
+            try { return sent.headers().get("traceparent").substring(36, 52); }
             catch (Exception failure) { throw new AssertionError(failure); }
         }).toList();
         assertThat(sentSpanIds).containsExactly("0000000000000001", "0000000000000002");
@@ -431,7 +432,7 @@ class ReliableEventIntegrationTest {
 
         JdbcEventPublicationWorker worker = new JdbcEventPublicationWorker(
                 jdbcTemplate, transactionManager,
-                event -> new SendReceipt("replayed-" + event.id().value()),
+                event -> new TransportReceipt(Optional.of("replayed-" + event.id().value()), Map.of()),
                 Clock.systemUTC(), 10, WORKER_ID, LEASE_DURATION);
         assertThat(worker.publishDueEvents()).isOne();
         assertThat(statusOf(id)).isEqualTo(EventStatus.PUBLISHED.code());
@@ -742,7 +743,7 @@ class ReliableEventIntegrationTest {
 
         ClaimedEvent published = claimedPublishedEvent(2200L);
         new TransactionTemplate(transactionManager).execute(status -> {
-            assertThat(worker(event -> new SendReceipt("persisted"), observer)
+            assertThat(worker(event -> new TransportReceipt(Optional.of("persisted"), Map.of()), observer)
                     .publishClaimedEvent(published)).isTrue();
             assertThat(persisted).hasValue(0);
             return null;
@@ -751,7 +752,7 @@ class ReliableEventIntegrationTest {
 
         ClaimedEvent rolledBackPublish = claimedPublishedEvent(2201L);
         new TransactionTemplate(transactionManager).execute(status -> {
-            assertThat(worker(event -> new SendReceipt("rolled-back"), observer)
+            assertThat(worker(event -> new TransportReceipt(Optional.of("rolled-back"), Map.of()), observer)
                     .publishClaimedEvent(rolledBackPublish)).isTrue();
             status.setRollbackOnly();
             return null;
@@ -761,7 +762,7 @@ class ReliableEventIntegrationTest {
 
         ClaimedEvent deadEvent = claimedPublishedEvent(2202L);
         new TransactionTemplate(transactionManager).execute(status -> {
-            assertThat(worker(event -> { throw EventSendException.nonRetryable("invalid"); }, observer)
+            assertThat(worker(event -> { throw new TransportException(TransportFailureType.NON_RETRYABLE, "invalid"); }, observer)
                     .publishClaimedEvent(deadEvent)).isFalse();
             assertThat(dead).hasValue(0);
             return null;
@@ -770,7 +771,7 @@ class ReliableEventIntegrationTest {
 
         ClaimedEvent rolledBackDead = claimedPublishedEvent(2203L);
         new TransactionTemplate(transactionManager).execute(status -> {
-            assertThat(worker(event -> { throw EventSendException.nonRetryable("invalid"); }, observer)
+            assertThat(worker(event -> { throw new TransportException(TransportFailureType.NON_RETRYABLE, "invalid"); }, observer)
                     .publishClaimedEvent(rolledBackDead)).isFalse();
             status.setRollbackOnly();
             return null;
@@ -806,13 +807,13 @@ class ReliableEventIntegrationTest {
                 NOW.minusSeconds(1), Map.of("token", "header-sentinel"))));
         PublicationObserver broken = new PublicationObserver() {
             @Override
-            public void sendSucceeded(ClaimedEvent event, SendReceipt receipt,
+            public void sendSucceeded(ClaimedEvent event, TransportReceipt receipt,
                                       long elapsedNanos, Instant at) {
                 throw new IllegalStateException("observer-sentinel");
             }
         };
         JdbcEventPublicationWorker observedWorker = new JdbcEventPublicationWorker(
-                jdbcTemplate, transactionManager, event -> new SendReceipt("message-safe"),
+                jdbcTemplate, transactionManager, event -> new TransportReceipt(Optional.of("message-safe"), Map.of()),
                 CLOCK, 50, WORKER_ID, LEASE_DURATION, deterministicBackoff(), broken);
 
         assertThat(observedWorker.publishDueEvents()).isOne();
@@ -830,7 +831,7 @@ class ReliableEventIntegrationTest {
         EventId id = inTransaction(() -> publisher.publish(new ReliableEvent<>(
                 "safe-type", "no-broker-id", Map.of("orderId", 7), NOW.minusSeconds(1), Map.of())));
         JdbcEventPublicationWorker worker = new JdbcEventPublicationWorker(
-                jdbcTemplate, transactionManager, event -> new SendReceipt(null),
+                jdbcTemplate, transactionManager, event -> TransportReceipt.confirmed(),
                 CLOCK, 50, WORKER_ID, LEASE_DURATION, deterministicBackoff());
 
         assertThat(worker.publishDueEvents()).isOne();
@@ -1055,7 +1056,7 @@ class ReliableEventIntegrationTest {
                     claimedEvent,
                     NOW,
                     NOW.plusSeconds(1),
-                    "java.lang.IllegalStateException: broker unavailable"
+                    "dev.reliableevent.spi.TransportException: broker unavailable"
             );
             return null;
         }))
@@ -1083,7 +1084,7 @@ class ReliableEventIntegrationTest {
             repository.markDead(
                     claimedEvent,
                     NOW,
-                    EventSendException.class.getName() + ": missing destination"
+                    TransportException.class.getName() + ": missing destination"
             );
             return null;
         }))
@@ -1123,7 +1124,7 @@ class ReliableEventIntegrationTest {
     void workerPublishesOnlyEventsWhoseAvailableTimeHasArrived() {
         EventId dueEvent = inTransaction(() -> publisher.publish(event(201L, NOW.minusSeconds(1))));
         EventId futureEvent = inTransaction(() -> publisher.publish(event(202L, NOW.plusSeconds(60))));
-        FakeEventSender sender = new FakeEventSender();
+        FakeEventTransport sender = new FakeEventTransport();
         JdbcEventPublicationWorker worker = new JdbcEventPublicationWorker(
                 jdbcTemplate,
                 transactionManager,
@@ -1138,7 +1139,7 @@ class ReliableEventIntegrationTest {
 
         assertThat(publishedCount).isOne();
         assertThat(sender.sentEvents)
-                .extracting(StoredEvent::eventKey)
+                .extracting(OutboundEvent::eventKey)
                 .containsExactly("201");
         assertThat(statusOf(dueEvent)).isEqualTo(EventStatus.PUBLISHED.code());
         assertThat(statusOf(futureEvent)).isEqualTo(EventStatus.PENDING.code());
@@ -1159,7 +1160,7 @@ class ReliableEventIntegrationTest {
                 () -> publisher.publish(event(203L, NOW.minusSeconds(1)))
         );
         EventCandidate candidate = repository.findDueEventCandidates(NOW, 50).get(0);
-        ConcurrentFakeEventSender sender = new ConcurrentFakeEventSender();
+        ConcurrentFakeEventTransport sender = new ConcurrentFakeEventTransport();
         JdbcEventPublicationWorker firstWorker = worker(sender, WORKER_ID);
         JdbcEventPublicationWorker secondWorker = worker(sender, SECOND_WORKER_ID);
         CountDownLatch ready = new CountDownLatch(2);
@@ -1195,10 +1196,10 @@ class ReliableEventIntegrationTest {
                 .containsExactlyInAnyOrder(0, 1);
         assertThat(sender.sendCount()).isOne();
         assertThat(sender.sentEvents())
-                .extracting(StoredEvent::id)
+                .extracting(OutboundEvent::id)
                 .containsExactly(eventId);
         assertThat(sender.sentEvents())
-                .extracting(StoredEvent::eventKey)
+                .extracting(OutboundEvent::eventKey)
                 .containsExactly("203");
         assertThat(outboxRowCount()).isOne();
         assertThat(statusOf(eventId)).isEqualTo(EventStatus.PUBLISHED.code());
@@ -1213,7 +1214,7 @@ class ReliableEventIntegrationTest {
         EventId eventId = inTransaction(
                 () -> twoAttemptPublisher.publish(event(204L, NOW.minusSeconds(1)))
         );
-        FailOnceEventSender sender = new FailOnceEventSender();
+        FailOnceEventTransport sender = new FailOnceEventTransport();
         ExponentialBackoff backoff = deterministicBackoff();
 
         int firstPublished = worker(sender, CLOCK, backoff).publishDueEvents();
@@ -1227,7 +1228,7 @@ class ReliableEventIntegrationTest {
         assertThat(leaseOwnerOf(eventId)).isNull();
         assertThat(leaseUntilOf(eventId)).isNull();
         assertThat(lastErrorOf(eventId))
-                .isEqualTo("java.lang.IllegalStateException: broker unavailable");
+                .isEqualTo("dev.reliableevent.spi.TransportException: broker unavailable");
         assertThat(publishedAtOf(eventId)).isNull();
 
         Clock beforeRetry = Clock.fixed(NOW.plusMillis(999), ZoneOffset.UTC);
@@ -1249,7 +1250,7 @@ class ReliableEventIntegrationTest {
         assertThat(versionOf(eventId)).isEqualTo(4L);
         assertThat(publishedAtOf(eventId)).isEqualTo(NOW.plusSeconds(1));
         assertThat(lastErrorOf(eventId))
-                .isEqualTo("java.lang.IllegalStateException: broker unavailable");
+                .isEqualTo("dev.reliableevent.spi.TransportException: broker unavailable");
     }
 
     @Test
@@ -1260,7 +1261,7 @@ class ReliableEventIntegrationTest {
         EventId publishedEvent = inTransaction(
                 () -> publisher.publish(event(206L, NOW.minusSeconds(1)))
         );
-        SelectiveFailureEventSender sender = new SelectiveFailureEventSender("205");
+        SelectiveFailureEventTransport sender = new SelectiveFailureEventTransport("205");
 
         int publishedCount = worker(sender, CLOCK, deterministicBackoff()).publishDueEvents();
 
@@ -1280,7 +1281,7 @@ class ReliableEventIntegrationTest {
         EventId eventId = inTransaction(
                 () -> twoAttemptPublisher.publish(event(207L, NOW.minusSeconds(1)))
         );
-        AlwaysFailingEventSender sender = new AlwaysFailingEventSender();
+        AlwaysFailingEventTransport sender = new AlwaysFailingEventTransport();
         ExponentialBackoff backoff = deterministicBackoff();
 
         assertThat(worker(sender, CLOCK, backoff).publishDueEvents()).isZero();
@@ -1298,7 +1299,7 @@ class ReliableEventIntegrationTest {
         assertThat(versionOf(eventId)).isEqualTo(4L);
         assertThat(nextAttemptAtOf(eventId)).isEqualTo(NOW.plusSeconds(1));
         assertThat(lastErrorOf(eventId))
-                .isEqualTo("java.lang.IllegalStateException: temporary failure 2");
+                .isEqualTo("dev.reliableevent.spi.TransportException: temporary failure 2");
         assertThat(publishedAtOf(eventId)).isNull();
 
         Clock longAfterRetry = Clock.fixed(NOW.plusSeconds(3_600), ZoneOffset.UTC);
@@ -1315,7 +1316,7 @@ class ReliableEventIntegrationTest {
         EventId eventId = inTransaction(
                 () -> twoAttemptPublisher.publish(event(218L, NOW.minusSeconds(1)))
         );
-        ResultUnknownEventSender sender = new ResultUnknownEventSender();
+        ResultUnknownEventTransport sender = new ResultUnknownEventTransport();
         ExponentialBackoff backoff = deterministicBackoff();
 
         assertThat(worker(sender, CLOCK, backoff).publishDueEvents()).isZero();
@@ -1331,7 +1332,7 @@ class ReliableEventIntegrationTest {
         assertThat(attemptCountOf(eventId)).isEqualTo(2);
         assertThat(versionOf(eventId)).isEqualTo(4L);
         assertThat(lastErrorOf(eventId))
-                .isEqualTo(EventSendException.class.getName() + ": RocketMQ response lost");
+                .isEqualTo(TransportException.class.getName() + ": RocketMQ response lost");
     }
 
     @Test
@@ -1339,7 +1340,7 @@ class ReliableEventIntegrationTest {
         EventId eventId = inTransaction(
                 () -> publisher.publish(event(208L, NOW.minusSeconds(1)))
         );
-        NonRetryableEventSender sender = new NonRetryableEventSender();
+        NonRetryableEventTransport sender = new NonRetryableEventTransport();
         AtomicInteger randomCalls = new AtomicInteger();
         ExponentialBackoff backoff = new ExponentialBackoff(
                 Duration.ofSeconds(1),
@@ -1359,7 +1360,7 @@ class ReliableEventIntegrationTest {
         assertThat(attemptCountOf(eventId)).isOne();
         assertThat(versionOf(eventId)).isEqualTo(2L);
         assertThat(lastErrorOf(eventId))
-                .isEqualTo(EventSendException.class.getName() + ": missing destination");
+                .isEqualTo(TransportException.class.getName() + ": missing destination");
         assertThat(publishedAtOf(eventId)).isNull();
         assertThat(leaseOwnerOf(eventId)).isNull();
         assertThat(leaseUntilOf(eventId)).isNull();
@@ -1367,7 +1368,7 @@ class ReliableEventIntegrationTest {
 
     @Test
     void workerRejectsInvalidLeaseConfiguration() {
-        FakeEventSender sender = new FakeEventSender();
+        FakeEventTransport sender = new FakeEventTransport();
 
         assertThatThrownBy(() -> new JdbcEventPublicationWorker(
                 jdbcTemplate,
@@ -1662,7 +1663,7 @@ class ReliableEventIntegrationTest {
         EventId dueEvent = inTransaction(
                 () -> publisher.publish(event(316L, NOW.minusSeconds(1)))
         );
-        FakeEventSender sender = new FakeEventSender();
+        FakeEventTransport sender = new FakeEventTransport();
         JdbcEventPublicationCycle cycle = new JdbcEventPublicationCycle(
                 recovery(50, deterministicBackoff()),
                 worker(sender, SECOND_WORKER_ID)
@@ -1682,7 +1683,7 @@ class ReliableEventIntegrationTest {
         );
         assertThat(statusOf(dueEvent)).isEqualTo(EventStatus.PUBLISHED.code());
         assertThat(sender.sentEvents)
-                .extracting(StoredEvent::id)
+                .extracting(OutboundEvent::id)
                 .containsExactly(dueEvent);
     }
 
@@ -1808,7 +1809,7 @@ class ReliableEventIntegrationTest {
         EventId eventId = inTransaction(
                 () -> twoAttemptPublisher.publish(event(319L, NOW.minusSeconds(1)))
         );
-        BlockingEventSender oldSender = new BlockingEventSender();
+        BlockingEventTransport oldSender = new BlockingEventTransport();
         ExecutorService executor = Executors.newSingleThreadExecutor();
         Future<Integer> oldResult = null;
 
@@ -1862,8 +1863,8 @@ class ReliableEventIntegrationTest {
         EventId eventId = inTransaction(
                 () -> twoAttemptPublisher.publish(event(320L, NOW.minusSeconds(1)))
         );
-        BlockingEventSender oldSender = new BlockingEventSender();
-        BlockingEventSender newSender = new BlockingEventSender();
+        BlockingEventTransport oldSender = new BlockingEventTransport();
+        BlockingEventTransport newSender = new BlockingEventTransport();
         ExecutorService executor = Executors.newFixedThreadPool(2);
         Future<Integer> oldResult = null;
         Future<Integer> newResult = null;
@@ -1943,8 +1944,8 @@ class ReliableEventIntegrationTest {
         EventId publishedEvent = inTransaction(
                 () -> publisher.publish(event(210L, NOW.minusSeconds(1)))
         );
-        SelectiveNonRetryableEventSender sender =
-                new SelectiveNonRetryableEventSender("209");
+        SelectiveNonRetryableEventTransport sender =
+                new SelectiveNonRetryableEventTransport("209");
 
         int publishedCount = worker(sender, CLOCK, deterministicBackoff()).publishDueEvents();
 
@@ -1958,17 +1959,17 @@ class ReliableEventIntegrationTest {
         assertThat(versionOf(publishedEvent)).isEqualTo(2L);
     }
 
-    private JdbcEventPublicationWorker worker(EventSender sender) {
+    private JdbcEventPublicationWorker worker(EventTransport sender) {
         return worker(sender, WORKER_ID);
     }
 
-    private JdbcEventPublicationWorker worker(EventSender sender, PublicationObserver observer) {
+    private JdbcEventPublicationWorker worker(EventTransport sender, PublicationObserver observer) {
         return new JdbcEventPublicationWorker(
                 jdbcTemplate, transactionManager, sender, CLOCK, 50, WORKER_ID,
                 LEASE_DURATION, deterministicBackoff(), observer, PublicationTracer.NOOP);
     }
 
-    private JdbcEventPublicationWorker worker(EventSender sender, String workerId) {
+    private JdbcEventPublicationWorker worker(EventTransport sender, String workerId) {
         return new JdbcEventPublicationWorker(
                 jdbcTemplate,
                 transactionManager,
@@ -1981,7 +1982,7 @@ class ReliableEventIntegrationTest {
     }
 
     private JdbcEventPublicationWorker worker(
-            EventSender sender,
+            EventTransport sender,
             Clock clock,
             ExponentialBackoff backoff
     ) {
@@ -1989,7 +1990,7 @@ class ReliableEventIntegrationTest {
     }
 
     private JdbcEventPublicationWorker worker(
-            EventSender sender,
+            EventTransport sender,
             Clock clock,
             ExponentialBackoff backoff,
             String workerId
@@ -2272,49 +2273,49 @@ class ReliableEventIntegrationTest {
     private record CouponTaskPayload(long taskId) {
     }
 
-    private static final class FakeEventSender implements EventSender {
+    private static final class FakeEventTransport implements EventTransport {
 
-        private final List<StoredEvent> sentEvents = new ArrayList<>();
+        private final List<OutboundEvent> sentEvents = new ArrayList<>();
         private boolean transactionActiveDuringSend;
 
         @Override
-        public SendReceipt send(StoredEvent event) {
+        public TransportReceipt send(OutboundEvent event) {
             transactionActiveDuringSend =
                     TransactionSynchronizationManager.isActualTransactionActive();
             sentEvents.add(event);
-            return new SendReceipt("fake-" + event.id().value());
+            return new TransportReceipt(Optional.of("fake-" + event.id().value()), Map.of());
         }
     }
 
-    private static final class ConcurrentFakeEventSender implements EventSender {
+    private static final class ConcurrentFakeEventTransport implements EventTransport {
 
         private final AtomicInteger sendCount = new AtomicInteger();
-        private final ConcurrentLinkedQueue<StoredEvent> sentEvents = new ConcurrentLinkedQueue<>();
+        private final ConcurrentLinkedQueue<OutboundEvent> sentEvents = new ConcurrentLinkedQueue<>();
 
         @Override
-        public SendReceipt send(StoredEvent event) {
+        public TransportReceipt send(OutboundEvent event) {
             sentEvents.add(event);
             sendCount.incrementAndGet();
-            return new SendReceipt("concurrent-fake-" + event.id().value());
+            return new TransportReceipt(Optional.of("concurrent-fake-" + event.id().value()), Map.of());
         }
 
         int sendCount() {
             return sendCount.get();
         }
 
-        List<StoredEvent> sentEvents() {
+        List<OutboundEvent> sentEvents() {
             return List.copyOf(sentEvents);
         }
     }
 
-    private static final class BlockingEventSender implements EventSender {
+    private static final class BlockingEventTransport implements EventTransport {
 
         private final CountDownLatch sendStarted = new CountDownLatch(1);
         private final CountDownLatch releaseSend = new CountDownLatch(1);
         private final AtomicInteger sendCount = new AtomicInteger();
 
         @Override
-        public SendReceipt send(StoredEvent event) {
+        public TransportReceipt send(OutboundEvent event) {
             sendCount.incrementAndGet();
             sendStarted.countDown();
             try {
@@ -2325,7 +2326,7 @@ class ReliableEventIntegrationTest {
                 Thread.currentThread().interrupt();
                 throw new IllegalStateException("Interrupted while waiting to release sender", exception);
             }
-            return new SendReceipt("blocking-fake-" + event.id().value());
+            return new TransportReceipt(Optional.of("blocking-fake-" + event.id().value()), Map.of());
         }
 
         boolean awaitSend(long timeout, TimeUnit unit) throws InterruptedException {
@@ -2341,17 +2342,17 @@ class ReliableEventIntegrationTest {
         }
     }
 
-    private static final class FailOnceEventSender implements EventSender {
+    private static final class FailOnceEventTransport implements EventTransport {
 
         private int sendCount;
 
         @Override
-        public SendReceipt send(StoredEvent event) {
+        public TransportReceipt send(OutboundEvent event) {
             sendCount++;
             if (sendCount == 1) {
-                throw new IllegalStateException("broker unavailable");
+                throw new TransportException(TransportFailureType.RETRYABLE, "broker unavailable");
             }
-            return new SendReceipt("retry-fake-" + event.id().value());
+            return new TransportReceipt(Optional.of("retry-fake-" + event.id().value()), Map.of());
         }
 
         int sendCount() {
@@ -2359,22 +2360,22 @@ class ReliableEventIntegrationTest {
         }
     }
 
-    private static final class SelectiveFailureEventSender implements EventSender {
+    private static final class SelectiveFailureEventTransport implements EventTransport {
 
         private final String failingEventKey;
         private final List<String> attemptedEventKeys = new ArrayList<>();
 
-        private SelectiveFailureEventSender(String failingEventKey) {
+        private SelectiveFailureEventTransport(String failingEventKey) {
             this.failingEventKey = failingEventKey;
         }
 
         @Override
-        public SendReceipt send(StoredEvent event) {
+        public TransportReceipt send(OutboundEvent event) {
             attemptedEventKeys.add(event.eventKey());
             if (event.eventKey().equals(failingEventKey)) {
-                throw new IllegalStateException("broker unavailable for " + event.eventKey());
+                throw new TransportException(TransportFailureType.RETRYABLE, "broker unavailable for " + event.eventKey());
             }
-            return new SendReceipt("selective-fake-" + event.id().value());
+            return new TransportReceipt(Optional.of("selective-fake-" + event.id().value()), Map.of());
         }
 
         List<String> attemptedEventKeys() {
@@ -2382,14 +2383,14 @@ class ReliableEventIntegrationTest {
         }
     }
 
-    private static final class AlwaysFailingEventSender implements EventSender {
+    private static final class AlwaysFailingEventTransport implements EventTransport {
 
         private int sendCount;
 
         @Override
-        public SendReceipt send(StoredEvent event) {
+        public TransportReceipt send(OutboundEvent event) {
             sendCount++;
-            throw new IllegalStateException("temporary failure " + sendCount);
+            throw new TransportException(TransportFailureType.RETRYABLE, "temporary failure " + sendCount);
         }
 
         int sendCount() {
@@ -2397,14 +2398,14 @@ class ReliableEventIntegrationTest {
         }
     }
 
-    private static final class ResultUnknownEventSender implements EventSender {
+    private static final class ResultUnknownEventTransport implements EventTransport {
 
         private int sendCount;
 
         @Override
-        public SendReceipt send(StoredEvent event) {
+        public TransportReceipt send(OutboundEvent event) {
             sendCount++;
-            throw EventSendException.resultUnknown("RocketMQ response lost");
+            throw new TransportException(TransportFailureType.RESULT_UNKNOWN, "RocketMQ response lost");
         }
 
         int sendCount() {
@@ -2412,14 +2413,14 @@ class ReliableEventIntegrationTest {
         }
     }
 
-    private static final class NonRetryableEventSender implements EventSender {
+    private static final class NonRetryableEventTransport implements EventTransport {
 
         private int sendCount;
 
         @Override
-        public SendReceipt send(StoredEvent event) {
+        public TransportReceipt send(OutboundEvent event) {
             sendCount++;
-            throw EventSendException.nonRetryable("missing destination");
+            throw new TransportException(TransportFailureType.NON_RETRYABLE, "missing destination");
         }
 
         int sendCount() {
@@ -2427,22 +2428,22 @@ class ReliableEventIntegrationTest {
         }
     }
 
-    private static final class SelectiveNonRetryableEventSender implements EventSender {
+    private static final class SelectiveNonRetryableEventTransport implements EventTransport {
 
         private final String failingEventKey;
         private final List<String> attemptedEventKeys = new ArrayList<>();
 
-        private SelectiveNonRetryableEventSender(String failingEventKey) {
+        private SelectiveNonRetryableEventTransport(String failingEventKey) {
             this.failingEventKey = failingEventKey;
         }
 
         @Override
-        public SendReceipt send(StoredEvent event) {
+        public TransportReceipt send(OutboundEvent event) {
             attemptedEventKeys.add(event.eventKey());
             if (event.eventKey().equals(failingEventKey)) {
-                throw EventSendException.nonRetryable("missing destination");
+                throw new TransportException(TransportFailureType.NON_RETRYABLE, "missing destination");
             }
-            return new SendReceipt("terminal-selective-fake-" + event.id().value());
+            return new TransportReceipt(Optional.of("terminal-selective-fake-" + event.id().value()), Map.of());
         }
 
         List<String> attemptedEventKeys() {

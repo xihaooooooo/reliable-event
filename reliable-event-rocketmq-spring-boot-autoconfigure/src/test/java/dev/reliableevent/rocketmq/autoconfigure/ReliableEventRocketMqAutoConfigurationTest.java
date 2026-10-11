@@ -1,15 +1,13 @@
 package dev.reliableevent.rocketmq.autoconfigure;
 
+import dev.reliableevent.spi.OutboundEvent;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import dev.reliableevent.EventId;
-import dev.reliableevent.ReliableEvent;
 import dev.reliableevent.autoconfigure.*;
-import dev.reliableevent.internal.model.StoredEvent;
-import dev.reliableevent.internal.publication.EventSender;
+import dev.reliableevent.spi.EventTransport;
 import dev.reliableevent.jdbc.internal.publication.JdbcEventPublicationWorker;
 import dev.reliableevent.rocketmq.EventDestinationResolver;
 import dev.reliableevent.rocketmq.RocketMqDestination;
-import dev.reliableevent.spi.EventTransport;
 import dev.reliableevent.autoconfigure.spi.TransportAdapterDescriptor;
 import dev.reliableevent.spi.TransportReceipt;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
@@ -31,7 +29,6 @@ import javax.sql.DataSource;
 import java.util.Map;
 import java.util.Set;
 import java.nio.charset.StandardCharsets;
-import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -43,7 +40,7 @@ class ReliableEventRocketMqAutoConfigurationTest {
                     ReliableEventAutoConfiguration.class,
                     ReliableEventTransportSelectionAutoConfiguration.class,
                     ReliableEventRocketMqAutoConfiguration.class,
-                    ReliableEventTransportBridgeAutoConfiguration.class,
+
                     ReliableEventPublicationAutoConfiguration.class,
                     ReliableEventMetricsSnapshotAutoConfiguration.class,
                     ReliableEventTracingAutoConfiguration.class));
@@ -71,7 +68,7 @@ class ReliableEventRocketMqAutoConfigurationTest {
                 .run(context -> {
                     assertThat(context).hasNotFailed();
                     assertThat(context).hasSingleBean(EventTransport.class);
-                    assertThat(context).hasSingleBean(EventSender.class);
+                    assertThat(context).hasSingleBean(EventTransport.class);
                     assertThat(context).hasSingleBean(JdbcEventPublicationWorker.class);
                     assertThat(context).hasBean("reliableEventMetricsSnapshotSampler");
                 });
@@ -170,7 +167,7 @@ class ReliableEventRocketMqAutoConfigurationTest {
                 .run(context -> {
                     assertThat(context).hasNotFailed();
                     assertThat(context).doesNotHaveBean(Producer.class);
-                    assertThat(context).hasSingleBean(EventSender.class);
+                    assertThat(context).hasSingleBean(EventTransport.class);
                 });
         verify(provider, never()).newProducerBuilder();
     }
@@ -204,8 +201,8 @@ class ReliableEventRocketMqAutoConfigurationTest {
                 .run(context -> {
                     assertThat(context).hasNotFailed();
                     assertThat(context).hasSingleBean(JdbcEventPublicationWorker.class);
-                    context.getBean(EventSender.class).send(
-                            new StoredEvent(new EventId(1), "OrderCreated", "key", "{}", "{}"));
+                    context.getBean(EventTransport.class).send(
+                            new OutboundEvent(new EventId(1), "OrderCreated", "key", "{}", Map.of()));
                     assertThat(sentType).hasValue("OrderCreated");
                 });
     }
@@ -217,7 +214,7 @@ class ReliableEventRocketMqAutoConfigurationTest {
                         definition -> definition.setPrimary(true))
                 .withPropertyValues("reliable-event.transport=custom", "reliable-event.scheduling-enabled=false")
                 .run(context -> assertThat(context).hasFailed()
-                        .getFailure().hasMessageContaining("Multiple custom EventSender/EventTransport"));
+                        .getFailure().hasMessageContaining("Multiple custom EventTransport"));
     }
 
     @Test

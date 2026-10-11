@@ -1,6 +1,6 @@
 package dev.reliableevent.autoconfigure;
 
-import dev.reliableevent.internal.publication.EventSender;
+import dev.reliableevent.spi.EventTransport;
 import dev.reliableevent.jdbc.internal.cycle.JdbcEventPublicationCycle;
 import dev.reliableevent.jdbc.internal.publication.JdbcEventPublicationWorker;
 import dev.reliableevent.jdbc.internal.observation.PublicationObserver;
@@ -30,8 +30,8 @@ import java.util.UUID;
         "org.springframework.boot.actuate.autoconfigure.metrics.export.simple.SimpleMetricsExportAutoConfiguration"
 })
 @ConditionalOnProperty(prefix = "reliable-event", name = "enabled", havingValue = "true", matchIfMissing = true)
-@ConditionalOnClass({JdbcEventPublicationWorker.class, JdbcTemplate.class, EventSender.class})
-@ConditionalOnBean({JdbcTemplate.class, EventSender.class, JdbcExpiredLeaseRecovery.class,
+@ConditionalOnClass({JdbcEventPublicationWorker.class, JdbcTemplate.class, EventTransport.class})
+@ConditionalOnBean({JdbcTemplate.class, EventTransport.class, JdbcExpiredLeaseRecovery.class,
         PlatformTransactionManager.class})
 @ConditionalOnSingleCandidate(DataSource.class)
 public class ReliableEventPublicationAutoConfiguration {
@@ -41,7 +41,7 @@ public class ReliableEventPublicationAutoConfiguration {
     JdbcEventPublicationWorker reliableEventWorker(
             JdbcTemplate jdbcTemplate,
             PlatformTransactionManager transactionManager,
-            EventSender sender,
+            EventTransport transport,
             ExponentialBackoff backoff,
             ReliableEventProperties properties,
             ObjectProvider<PublicationObserver> observers,
@@ -51,7 +51,7 @@ public class ReliableEventPublicationAutoConfiguration {
         return new JdbcEventPublicationWorker(
                 jdbcTemplate,
                 transactionManager,
-                sender,
+                transport,
                 Clock.systemUTC(),
                 properties.getClaimBatchSize(),
                 "reliable-event-" + UUID.randomUUID(),

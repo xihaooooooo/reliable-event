@@ -8,10 +8,10 @@ import dev.reliableevent.jdbc.internal.persistence.StaleEventClaimException;
 import dev.reliableevent.jdbc.internal.retry.ExponentialBackoff;
 import dev.reliableevent.jdbc.internal.tracing.PublicationTracer;
 import dev.reliableevent.internal.model.StoredEvent;
-import dev.reliableevent.internal.publication.EventSender;
-import dev.reliableevent.internal.publication.EventSendFailureType;
-import dev.reliableevent.internal.publication.EventSendException;
-import dev.reliableevent.internal.publication.SendReceipt;
+import dev.reliableevent.spi.EventTransport;
+import dev.reliableevent.spi.TransportFailureType;
+import dev.reliableevent.spi.TransportException;
+import dev.reliableevent.spi.TransportReceipt;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.slf4j.spi.LoggingEventBuilder;
@@ -33,7 +33,7 @@ public final class JdbcEventPublicationWorker {
     private static final int MAX_WORKER_ID_LENGTH = 128;
 
     private final JdbcOutboxRepository repository;
-    private final EventSender sender;
+    private final EventTransport transport;
     private final TransactionTemplate transaction;
     private final Clock clock;
     private final int batchSize;
@@ -46,7 +46,7 @@ public final class JdbcEventPublicationWorker {
     public JdbcEventPublicationWorker(
             JdbcTemplate jdbcTemplate,
             PlatformTransactionManager transactionManager,
-            EventSender sender,
+            EventTransport transport,
             Clock clock,
             int batchSize,
             String workerId,
@@ -55,7 +55,7 @@ public final class JdbcEventPublicationWorker {
         this(
                 jdbcTemplate,
                 transactionManager,
-                sender,
+                transport,
                 clock,
                 batchSize,
                 workerId,
@@ -67,21 +67,21 @@ public final class JdbcEventPublicationWorker {
     public JdbcEventPublicationWorker(
             JdbcTemplate jdbcTemplate,
             PlatformTransactionManager transactionManager,
-            EventSender sender,
+            EventTransport transport,
             Clock clock,
             int batchSize,
             String workerId,
             Duration leaseDuration,
             ExponentialBackoff backoff
     ) {
-        this(jdbcTemplate, transactionManager, sender, clock, batchSize, workerId,
+        this(jdbcTemplate, transactionManager, transport, clock, batchSize, workerId,
                 leaseDuration, backoff, PublicationObserver.NOOP, PublicationTracer.NOOP);
     }
 
     public JdbcEventPublicationWorker(
             JdbcTemplate jdbcTemplate,
             PlatformTransactionManager transactionManager,
-            EventSender sender,
+            EventTransport transport,
             Clock clock,
             int batchSize,
             String workerId,
@@ -89,14 +89,14 @@ public final class JdbcEventPublicationWorker {
             ExponentialBackoff backoff,
             PublicationObserver observer
     ) {
-        this(jdbcTemplate, transactionManager, sender, clock, batchSize, workerId,
+        this(jdbcTemplate, transactionManager, transport, clock, batchSize, workerId,
                 leaseDuration, backoff, observer, PublicationTracer.NOOP);
     }
 
     public JdbcEventPublicationWorker(
             JdbcTemplate jdbcTemplate,
             PlatformTransactionManager transactionManager,
-            EventSender sender,
+            EventTransport transport,
             Clock clock,
             int batchSize,
             String workerId,
@@ -121,7 +121,7 @@ public final class JdbcEventPublicationWorker {
         Math.multiplyExact(leaseDuration.toMillis(), 1_000L);
         this.repository = new JdbcOutboxRepository(Objects.requireNonNull(jdbcTemplate));
         this.transaction = new TransactionTemplate(Objects.requireNonNull(transactionManager));
-        this.sender = Objects.requireNonNull(sender);
+        this.transport = Objects.requireNonNull(transport);
         this.clock = Objects.requireNonNull(clock);
         this.batchSize = batchSize;
         this.workerId = workerId;
@@ -200,18 +200,22 @@ public final class JdbcEventPublicationWorker {
     private boolean publish(ClaimedEvent claimedEvent, PublicationTracer.Attempt tracing) {
         StoredEvent sendEvent = eventForSend(tracing, claimedEvent.event());
         long started = System.nanoTime();
-        SendReceipt receipt;
+        TransportReceipt receipt;
         try {
-            receipt = sender.send(sendEvent);
+            receipt = transport.send(OutboundEventMapper.map(sendEvent));
             if (receipt == null) {
-                throw EventSendException.resultUnknown("Event sender returned without a receipt");
+                throw new TransportException(TransportFailureType.RESULT_UNKNOWN, "Event transport returned without a receipt");
             }
-        } catch (RuntimeException sendFailure) {
+        } catch (RuntimeException failure) {
+            TransportException sendFailure = failure instanceof TransportException classified
+                    ? classified
+                    : new TransportException(TransportFailureType.RESULT_UNKNOWN,
+                            "Transport failed with an unclassified exception", failure);
             long elapsed = System.nanoTime() - started;
-            EventSendFailureType type = EventSendFailureClassifier.classify(sendFailure);
+            TransportFailureType type = sendFailure.failureType();
             safelyTrace(() -> tracing.sendFailed(type, sendFailure));
             observe(() -> observer.sendFailed(claimedEvent, type, elapsed));
-            boolean dead = type == EventSendFailureType.NON_RETRYABLE || !claimedEvent.canRetry();
+            boolean dead = type == TransportFailureType.NON_RETRYABLE || !claimedEvent.canRetry();
             eventLog(LOG.atWarn(), claimedEvent)
                     .addKeyValue("event", "reliable_event.publish.failed")
                     .addKeyValue("failureType", type)
@@ -233,21 +237,22 @@ public final class JdbcEventPublicationWorker {
 
         long elapsed = System.nanoTime() - started;
         Instant acknowledgedAt = clock.instant();
-        SendReceipt acknowledged = receipt;
+        TransportReceipt acknowledged = receipt;
         safelyTrace(() -> tracing.sendSucceeded(acknowledged));
         observe(() -> observer.sendSucceeded(claimedEvent, acknowledged, elapsed, acknowledgedAt));
+        String messageId = receipt.brokerMessageId().orElse(null);
         var sendSuccessLog = eventLog(LOG.atInfo(), claimedEvent)
                 .addKeyValue("event", "reliable_event.send.succeeded");
-        if (receipt.messageId() == null) {
+        if (messageId == null) {
             sendSuccessLog.log("event=reliable_event.send.succeeded eventId={} eventType={} eventKey={} attemptCount={} leaseOwner={}",
                     claimedEvent.event().id().value(), claimedEvent.event().eventType(),
                     claimedEvent.event().eventKey(), claimedEvent.attemptCount(), claimedEvent.leaseOwner());
         } else {
-            sendSuccessLog.addKeyValue("messageId", receipt.messageId())
+            sendSuccessLog.addKeyValue("messageId", messageId)
                     .log("event=reliable_event.send.succeeded eventId={} eventType={} eventKey={} attemptCount={} leaseOwner={} messageId={}",
                             claimedEvent.event().id().value(), claimedEvent.event().eventType(),
                             claimedEvent.event().eventKey(), claimedEvent.attemptCount(),
-                            claimedEvent.leaseOwner(), receipt.messageId());
+                            claimedEvent.leaseOwner(), messageId);
         }
         boolean outerTransaction = TransactionSynchronizationManager.isActualTransactionActive();
         try {
@@ -262,16 +267,16 @@ public final class JdbcEventPublicationWorker {
             var persistedLog = eventLog(LOG.atInfo(), claimedEvent)
                     .addKeyValue("event", "reliable_event.publish.persisted")
                     .addKeyValue("status", "PUBLISHED");
-            if (receipt.messageId() == null) {
+            if (messageId == null) {
                 persistedLog.log("event=reliable_event.publish.persisted eventId={} eventType={} eventKey={} attemptCount={} leaseOwner={} status=PUBLISHED",
                         claimedEvent.event().id().value(), claimedEvent.event().eventType(),
                         claimedEvent.event().eventKey(), claimedEvent.attemptCount(), claimedEvent.leaseOwner());
             } else {
-                persistedLog.addKeyValue("messageId", receipt.messageId())
+                persistedLog.addKeyValue("messageId", messageId)
                         .log("event=reliable_event.publish.persisted eventId={} eventType={} eventKey={} attemptCount={} leaseOwner={} messageId={} status=PUBLISHED",
                                 claimedEvent.event().id().value(), claimedEvent.event().eventType(),
                                 claimedEvent.event().eventKey(), claimedEvent.attemptCount(),
-                                claimedEvent.leaseOwner(), receipt.messageId());
+                                claimedEvent.leaseOwner(), messageId);
             }
         } catch (RuntimeException stateFailure) {
             observe(() -> observer.stateUpdateFailed("PUBLISHED",
@@ -285,12 +290,12 @@ public final class JdbcEventPublicationWorker {
     }
 
     private void markFailed(ClaimedEvent claimedEvent, RuntimeException sendFailure,
-                            EventSendFailureType failureType, PublicationTracer.Attempt tracing) {
+                            TransportFailureType failureType, PublicationTracer.Attempt tracing) {
         Instant failedAt = clock.instant();
         String lastError = EventFailureSummary.from(sendFailure);
         boolean outerTransaction = TransactionSynchronizationManager.isActualTransactionActive();
 
-        if (failureType == EventSendFailureType.NON_RETRYABLE || !claimedEvent.canRetry()) {
+        if (failureType == TransportFailureType.NON_RETRYABLE || !claimedEvent.canRetry()) {
             try {
                 transaction.executeWithoutResult(status -> {
                     repository.markDead(claimedEvent, failedAt, lastError);

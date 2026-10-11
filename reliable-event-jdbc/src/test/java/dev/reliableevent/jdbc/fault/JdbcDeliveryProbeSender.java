@@ -1,8 +1,10 @@
 package dev.reliableevent.jdbc.fault;
 
-import dev.reliableevent.internal.model.StoredEvent;
-import dev.reliableevent.internal.publication.EventSender;
-import dev.reliableevent.internal.publication.SendReceipt;
+import java.util.Map;
+import java.util.Optional;
+import dev.reliableevent.spi.OutboundEvent;
+import dev.reliableevent.spi.EventTransport;
+import dev.reliableevent.spi.TransportReceipt;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 
@@ -10,7 +12,7 @@ import javax.sql.DataSource;
 import java.util.Objects;
 import java.util.UUID;
 
-final class JdbcDeliveryProbeSender implements EventSender {
+final class JdbcDeliveryProbeSender implements EventTransport {
 
     private final JdbcTemplate jdbcTemplate;
     private final String workerId;
@@ -24,7 +26,7 @@ final class JdbcDeliveryProbeSender implements EventSender {
     }
 
     @Override
-    public SendReceipt send(StoredEvent event) {
+    public TransportReceipt send(OutboundEvent event) {
         Objects.requireNonNull(event, "event must not be null");
         if (TransactionSynchronizationManager.isActualTransactionActive()) {
             throw new IllegalStateException("delivery probe must run outside an active transaction");
@@ -49,6 +51,6 @@ final class JdbcDeliveryProbeSender implements EventSender {
         if (inserted != 1) {
             throw new IllegalStateException("delivery probe did not insert exactly one row");
         }
-        return new SendReceipt(messageId);
+        return new TransportReceipt(Optional.ofNullable(messageId), Map.of());
     }
 }

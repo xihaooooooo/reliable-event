@@ -1,10 +1,11 @@
 package dev.reliableevent.jdbc.fault;
 
+import dev.reliableevent.spi.OutboundEvent;
 import dev.reliableevent.EventId;
 import dev.reliableevent.jdbc.internal.model.ClaimedEvent;
 import dev.reliableevent.jdbc.internal.model.EventCandidate;
 import dev.reliableevent.jdbc.internal.persistence.JdbcOutboxRepository;
-import dev.reliableevent.internal.publication.SendReceipt;
+import dev.reliableevent.spi.TransportReceipt;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.datasource.DataSourceTransactionManager;
 import org.springframework.jdbc.datasource.DriverManagerDataSource;
@@ -84,15 +85,17 @@ public final class PublicationCrashProcess {
                     config.workerId()
             );
         } else {
-            SendReceipt receipt = new JdbcDeliveryProbeSender(
+            TransportReceipt receipt = new JdbcDeliveryProbeSender(
                     dataSource,
                     config.workerId()
-            ).send(claimedEvent.event());
+            ).send(new OutboundEvent(claimedEvent.event().id(),
+                    claimedEvent.event().eventType(), claimedEvent.event().eventKey(),
+                    claimedEvent.event().payloadJson(), Map.of()));
             signal = PublicationReadySignal.delivered(
                     eventId,
                     claimedEvent.claimVersion(),
                     config.workerId(),
-                    receipt.messageId()
+                    receipt.brokerMessageId().orElse(null)
             );
         }
 

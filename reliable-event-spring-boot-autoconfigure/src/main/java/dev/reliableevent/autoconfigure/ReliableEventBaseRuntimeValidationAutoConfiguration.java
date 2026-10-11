@@ -1,26 +1,29 @@
 package dev.reliableevent.autoconfigure;
 
-import dev.reliableevent.internal.publication.EventSender;
+import dev.reliableevent.spi.EventTransport;
 import org.springframework.beans.factory.ListableBeanFactory;
 import org.springframework.beans.factory.SmartInitializingSingleton;
 import org.springframework.boot.autoconfigure.AutoConfiguration;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.context.annotation.Bean;
 
-@AutoConfiguration(after = ReliableEventTransportBridgeAutoConfiguration.class)
+@AutoConfiguration(after = ReliableEventPublicationAutoConfiguration.class)
 @ConditionalOnProperty(prefix = "reliable-event", name = "enabled", havingValue = "true", matchIfMissing = true)
 public class ReliableEventBaseRuntimeValidationAutoConfiguration {
 
     @Bean
-    SmartInitializingSingleton reliableEventBaseSenderRequirement(
+    SmartInitializingSingleton reliableEventBaseTransportRequirement(
             ReliableEventProperties properties,
             ListableBeanFactory beans) {
         return () -> {
-            if (properties.isSchedulingEnabled()
-                    && beans.getBeanNamesForType(EventSender.class).length == 0) {
+            int transportCount = beans.getBeanNamesForType(EventTransport.class).length;
+            if (transportCount > 1) {
+                throw new IllegalStateException("Exactly one EventTransport bean is required; found " + transportCount);
+            }
+            if (properties.isSchedulingEnabled() && transportCount == 0) {
                 throw new IllegalStateException(
-                        "ReliableEvent scheduling is enabled but no EventSender or EventTransport is configured; "
-                                + "install a transport starter, provide a custom sender, or set "
+                        "ReliableEvent scheduling is enabled but no EventTransport is configured; "
+                                + "install a transport starter, provide a custom EventTransport, or set "
                                 + "reliable-event.scheduling-enabled=false for an ingress-only instance");
             }
         };

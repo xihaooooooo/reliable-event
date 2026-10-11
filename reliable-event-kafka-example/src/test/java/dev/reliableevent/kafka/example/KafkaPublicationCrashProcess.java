@@ -1,6 +1,6 @@
 package dev.reliableevent.kafka.example;
 
-import dev.reliableevent.internal.publication.EventSender;
+import dev.reliableevent.spi.EventTransport;
 import dev.reliableevent.jdbc.internal.publication.JdbcEventPublicationWorker;
 import dev.reliableevent.jdbc.internal.retry.ExponentialBackoff;
 import org.springframework.boot.builder.SpringApplicationBuilder;
@@ -37,8 +37,8 @@ public final class KafkaPublicationCrashProcess {
                         "--example.consumer.enabled=false",
                         "--reliable-event.scheduling-enabled=false")) {
             JdbcTemplate jdbc = context.getBean(JdbcTemplate.class);
-            EventSender actualProducer = context.getBean(EventSender.class);
-            EventSender gatedProducer = event -> {
+            EventTransport actualProducer = context.getBean(EventTransport.class);
+            EventTransport gatedProducer = event -> {
                 if (mode == KafkaCrashMode.AFTER_CLAIM_BEFORE_SEND) {
                     ready(mode, event.id().value(), workerId);
                     waitUntilKilled();

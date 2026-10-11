@@ -1,7 +1,7 @@
 package dev.reliableevent.jdbc.internal.observation;
 
-import dev.reliableevent.internal.publication.EventSendFailureType;
-import dev.reliableevent.internal.publication.SendReceipt;
+import dev.reliableevent.spi.TransportFailureType;
+import dev.reliableevent.spi.TransportReceipt;
 import dev.reliableevent.jdbc.internal.model.ClaimedEvent;
 import dev.reliableevent.jdbc.internal.model.ExpiredLeaseCandidate;
 import dev.reliableevent.jdbc.PublishedRetentionResult;
@@ -13,9 +13,9 @@ public interface PublicationObserver {
 
     PublicationObserver NOOP = new PublicationObserver() { };
 
-    default void sendSucceeded(ClaimedEvent event, SendReceipt receipt, long elapsedNanos, Instant at) { }
+    default void sendSucceeded(ClaimedEvent event, TransportReceipt receipt, long elapsedNanos, Instant at) { }
 
-    default void sendFailed(ClaimedEvent event, EventSendFailureType type, long elapsedNanos) { }
+    default void sendFailed(ClaimedEvent event, TransportFailureType type, long elapsedNanos) { }
 
     default void leaseRecovered(ExpiredLeaseCandidate candidate, boolean dead) { }
 

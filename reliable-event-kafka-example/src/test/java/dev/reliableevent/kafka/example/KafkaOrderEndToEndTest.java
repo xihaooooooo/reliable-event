@@ -1,5 +1,6 @@
 package dev.reliableevent.kafka.example;
 
+import dev.reliableevent.spi.TransportFailureType;
 import org.apache.kafka.clients.admin.AdminClient;
 import org.apache.kafka.clients.admin.Config;
 import org.apache.kafka.clients.admin.ConfigEntry;
@@ -18,8 +19,8 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.TestInfo;
-import dev.reliableevent.internal.publication.EventSendException;
-import dev.reliableevent.internal.publication.EventSender;
+import dev.reliableevent.spi.TransportException;
+import dev.reliableevent.spi.EventTransport;
 import dev.reliableevent.jdbc.internal.publication.JdbcEventPublicationWorker;
 import dev.reliableevent.jdbc.internal.retry.ExponentialBackoff;
 import org.springframework.boot.builder.SpringApplicationBuilder;
@@ -230,14 +231,14 @@ class KafkaOrderEndToEndTest {
         consumerLoops.add(exampleConsumer);
         exampleConsumer.start();
         OrderService.CreatedOrder created = context.getBean(OrderService.class).create("book", 3);
-        EventSender broker = context.getBean(EventSender.class);
+        EventTransport broker = context.getBean(EventTransport.class);
         AtomicInteger sends = new AtomicInteger();
         java.util.List<Long> eventIds = new java.util.concurrent.CopyOnWriteArrayList<>();
-        EventSender dropFirstAcknowledgement = event -> {
+        EventTransport dropFirstAcknowledgement = event -> {
             eventIds.add(event.id().value());
             var receipt = broker.send(event); // both attempts send to the real Kafka broker
             if (sends.getAndIncrement() == 0) {
-                throw EventSendException.resultUnknown("Injected lost producer confirmation");
+                throw new TransportException(TransportFailureType.RESULT_UNKNOWN, "Injected lost producer confirmation");
             }
             return receipt;
         };
@@ -272,7 +273,7 @@ class KafkaOrderEndToEndTest {
     @Test
     void missingTopicRetriesToPublishedAfterTopicProvisioning() throws Exception {
         OrderService.CreatedOrder created = context.getBean(OrderService.class).create("cup", 5);
-        JdbcEventPublicationWorker worker = worker(context.getBean(EventSender.class));
+        JdbcEventPublicationWorker worker = worker(context.getBean(EventTransport.class));
 
         assertThat(worker.publishDueEvents()).isZero();
         assertThat(status(created.eventId())).isEqualTo(3);
@@ -293,7 +294,7 @@ class KafkaOrderEndToEndTest {
         try {
             DockerClientFactory.instance().client().pauseContainerCmd(KAFKA.getContainerId()).exec();
             paused = true;
-            assertThat(worker(context.getBean(EventSender.class)).publishDueEvents()).isZero();
+            assertThat(worker(context.getBean(EventTransport.class)).publishDueEvents()).isZero();
             assertThat(status(created.eventId())).isEqualTo(3);
         } finally {
             if (paused) {
@@ -303,7 +304,7 @@ class KafkaOrderEndToEndTest {
 
         awaitKafkaAvailable();
         await(() -> isDue(created.eventId()), Duration.ofSeconds(5));
-        assertThat(worker(context.getBean(EventSender.class)).publishDueEvents()).isEqualTo(1);
+        assertThat(worker(context.getBean(EventTransport.class)).publishDueEvents()).isEqualTo(1);
         assertThat(status(created.eventId())).isEqualTo(2);
     }
 
@@ -312,7 +313,7 @@ class KafkaOrderEndToEndTest {
         setMaxMessageBytes(1);
         OrderService.CreatedOrder created = context.getBean(OrderService.class).create("pen", 2);
 
-        assertThat(worker(context.getBean(EventSender.class)).publishDueEvents()).isZero();
+        assertThat(worker(context.getBean(EventTransport.class)).publishDueEvents()).isZero();
         assertThat(status(created.eventId())).isEqualTo(4);
         assertThat(jdbc.queryForObject("SELECT attempt_count FROM reliable_event_outbox WHERE id = ?",
                 Integer.class, created.eventId())).isEqualTo(1);
@@ -355,7 +356,7 @@ class KafkaOrderEndToEndTest {
                 ProducerConfig.ACKS_CONFIG, "all"));
     }
 
-    private JdbcEventPublicationWorker worker(EventSender sender) {
+    private JdbcEventPublicationWorker worker(EventTransport sender) {
         return new JdbcEventPublicationWorker(jdbc,
                 context.getBean(org.springframework.transaction.PlatformTransactionManager.class), sender,
                 java.time.Clock.systemUTC(), 10, "kafka-example-state-test", Duration.ofSeconds(30),
@@ -365,7 +366,7 @@ class KafkaOrderEndToEndTest {
     }
 
     private int publishPending() {
-        return worker(context.getBean(EventSender.class)).publishDueEvents();
+        return worker(context.getBean(EventTransport.class)).publishDueEvents();
     }
 
     private void createTopic() throws Exception {

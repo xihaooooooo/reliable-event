@@ -6,8 +6,6 @@ import dev.reliableevent.EventId;
 import dev.reliableevent.MissingActiveTransactionException;
 import dev.reliableevent.ReliableEvent;
 import dev.reliableevent.ReliableEventPublisher;
-import dev.reliableevent.jdbc.internal.cycle.JdbcEventPublicationCycle;
-import dev.reliableevent.jdbc.internal.cycle.PublicationCycleResult;
 import dev.reliableevent.jdbc.internal.model.ClaimedEvent;
 import dev.reliableevent.jdbc.internal.model.EventCandidate;
 import dev.reliableevent.jdbc.internal.model.EventStatus;
@@ -16,6 +14,7 @@ import dev.reliableevent.jdbc.internal.model.OutboxMetricsSnapshot;
 import dev.reliableevent.jdbc.internal.observation.PublicationObserver;
 import dev.reliableevent.internal.model.StoredEvent;
 import dev.reliableevent.jdbc.internal.persistence.JdbcOutboxRepository;
+import dev.reliableevent.jdbc.internal.persistence.JdbcPublicationStore;
 import dev.reliableevent.jdbc.internal.tracing.RegistrationTracer;
 import dev.reliableevent.jdbc.internal.tracing.PublicationTracer;
 import dev.reliableevent.spi.TransportFailureType;
@@ -39,6 +38,7 @@ import org.springframework.boot.autoconfigure.EnableAutoConfiguration;
 import org.springframework.boot.test.autoconfigure.jdbc.AutoConfigureTestDatabase;
 import org.springframework.boot.test.autoconfigure.jdbc.JdbcTest;
 import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.jdbc.datasource.DriverManagerDataSource;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
@@ -140,6 +140,7 @@ class ReliableEventIntegrationTest {
 
         assertThat(businessRowCount()).isZero();
         assertThat(outboxRowCount()).isZero();
+        assertThat(jdbcTemplate.queryForObject("SELECT COUNT(*) FROM reliable_event_identity", Integer.class)).isZero();
     }
 
     @Test
@@ -234,14 +235,14 @@ class ReliableEventIntegrationTest {
             if (sentEvents.size() == 1) throw new TransportException(TransportFailureType.RESULT_UNKNOWN, "receipt lost");
             return new TransportReceipt(Optional.of("m8.2-message-2"), Map.of());
         };
-        JdbcEventPublicationWorker worker = new JdbcEventPublicationWorker(jdbcTemplate,
-                transactionManager, sender, CLOCK, 10, WORKER_ID, LEASE_DURATION,
+        JdbcEventPublicationWorker worker = new JdbcEventPublicationWorker(
+                publicationStore(CLOCK, WORKER_ID, PublicationObserver.NOOP), sender, CLOCK,
                 deterministicBackoff(), PublicationObserver.NOOP, tracing);
 
-        assertThat(worker.publishDueEvents()).isZero();
+        assertThat(publishPending(worker, CLOCK)).isZero();
         jdbcTemplate.update("UPDATE reliable_event_outbox SET next_attempt_at = ? WHERE id = ?",
                 Timestamp.from(NOW.minusSeconds(1)), eventId.value());
-        assertThat(worker.publishDueEvents()).isOne();
+        assertThat(publishPending(worker, CLOCK)).isOne();
 
         String persistedHeaders = jdbcTemplate.queryForObject(
                 "SELECT headers FROM reliable_event_outbox WHERE id = ?", String.class, eventId.value());
@@ -257,7 +258,8 @@ class ReliableEventIntegrationTest {
         assertThat(attemptNumber[0]).isEqualTo(2);
 
         EventCandidate staleCandidate = new EventCandidate(eventId, 0);
-        assertThat(worker.publishCandidate(staleCandidate)).isFalse();
+        assertThat(publicationStore(CLOCK, WORKER_ID, PublicationObserver.NOOP)
+                .claimCandidate(staleCandidate)).isEmpty();
         assertThat(attemptNumber[0]).isEqualTo(2);
     }
 
@@ -297,6 +299,53 @@ class ReliableEventIntegrationTest {
                 .hasMessageContaining("active database transaction");
 
         assertThat(outboxRowCount()).isZero();
+    }
+
+    @Test
+    void publishRejectsReadOnlyTransactionWithoutLeavingEventRows() {
+        TransactionTemplate readOnlyTransaction = new TransactionTemplate(transactionManager);
+        readOnlyTransaction.setReadOnly(true);
+        readOnlyTransaction.executeWithoutResult(status ->
+                assertThatThrownBy(() -> publisher.publish(event(1031L, NOW)))
+                        .isInstanceOf(IllegalStateException.class).hasMessageContaining("read-only"));
+        assertNoEventRows();
+    }
+
+    @Test
+    void publishRejectsDataSourceOutsideTheBusinessTransaction() {
+        JdbcTemplate otherJdbc = independentJdbcTemplate();
+        JdbcReliableEventPublisher otherPublisher = new JdbcReliableEventPublisher(otherJdbc, objectMapper);
+        inTransaction(() -> {
+            assertThatThrownBy(() -> otherPublisher.publish(event(1032L, NOW)))
+                    .isInstanceOf(IllegalStateException.class).hasMessageContaining("Outbox DataSource");
+            return null;
+        });
+        assertNoEventRows();
+    }
+
+    @Test
+    void publishRejectsUnrelatedAutoCommitConnectionEvenWhenAlreadyBound() {
+        JdbcTemplate otherJdbc = independentJdbcTemplate();
+        JdbcReliableEventPublisher otherPublisher = new JdbcReliableEventPublisher(otherJdbc, objectMapper);
+        inTransaction(() -> {
+            assertThat(otherJdbc.queryForObject("SELECT 1", Integer.class)).isOne();
+            assertThat(TransactionSynchronizationManager.hasResource(otherJdbc.getDataSource())).isTrue();
+            assertThatThrownBy(() -> otherPublisher.publish(event(1033L, NOW)))
+                    .isInstanceOf(IllegalStateException.class).hasMessageContaining("auto-commit");
+            return null;
+        });
+        assertNoEventRows();
+    }
+
+    private JdbcTemplate independentJdbcTemplate() {
+        // Same database, but a different DataSource and connection from the business transaction.
+        return new JdbcTemplate(new DriverManagerDataSource(
+                MYSQL.getJdbcUrl(), MYSQL.getUsername(), MYSQL.getPassword()));
+    }
+
+    private void assertNoEventRows() {
+        assertThat(outboxRowCount()).isZero();
+        assertThat(jdbcTemplate.queryForObject("SELECT COUNT(*) FROM reliable_event_identity", Integer.class)).isZero();
     }
 
     @Test
@@ -430,11 +479,12 @@ class ReliableEventIntegrationTest {
         assertThat(repository.findDueEventCandidates(Instant.now().plusSeconds(1), 10))
                 .contains(new EventCandidate(id, 8));
 
+        Clock replayClock = Clock.systemUTC();
         JdbcEventPublicationWorker worker = new JdbcEventPublicationWorker(
-                jdbcTemplate, transactionManager,
+                publicationStore(replayClock, WORKER_ID, PublicationObserver.NOOP),
                 event -> new TransportReceipt(Optional.of("replayed-" + event.id().value()), Map.of()),
-                Clock.systemUTC(), 10, WORKER_ID, LEASE_DURATION);
-        assertThat(worker.publishDueEvents()).isOne();
+                replayClock, deterministicBackoff(), PublicationObserver.NOOP, PublicationTracer.NOOP);
+        assertThat(publishPending(worker, replayClock)).isOne();
         assertThat(statusOf(id)).isEqualTo(EventStatus.PUBLISHED.code());
         assertThat(attemptCountOf(id)).isOne();
         assertThat(outboxRowCount()).isOne();
@@ -813,10 +863,11 @@ class ReliableEventIntegrationTest {
             }
         };
         JdbcEventPublicationWorker observedWorker = new JdbcEventPublicationWorker(
-                jdbcTemplate, transactionManager, event -> new TransportReceipt(Optional.of("message-safe"), Map.of()),
-                CLOCK, 50, WORKER_ID, LEASE_DURATION, deterministicBackoff(), broken);
+                publicationStore(CLOCK, WORKER_ID, broken),
+                event -> new TransportReceipt(Optional.of("message-safe"), Map.of()),
+                CLOCK, deterministicBackoff(), broken, PublicationTracer.NOOP);
 
-        assertThat(observedWorker.publishDueEvents()).isOne();
+        assertThat(publishPending(observedWorker, CLOCK)).isOne();
         assertThat(statusOf(id)).isEqualTo(EventStatus.PUBLISHED.code());
         assertThat(output.getOut()).contains("event=reliable_event.send.succeeded",
                 "eventId=" + id.value(), "eventType=safe-type", "eventKey=safe-key",
@@ -831,10 +882,11 @@ class ReliableEventIntegrationTest {
         EventId id = inTransaction(() -> publisher.publish(new ReliableEvent<>(
                 "safe-type", "no-broker-id", Map.of("orderId", 7), NOW.minusSeconds(1), Map.of())));
         JdbcEventPublicationWorker worker = new JdbcEventPublicationWorker(
-                jdbcTemplate, transactionManager, event -> TransportReceipt.confirmed(),
-                CLOCK, 50, WORKER_ID, LEASE_DURATION, deterministicBackoff());
+                publicationStore(CLOCK, WORKER_ID, PublicationObserver.NOOP),
+                event -> TransportReceipt.confirmed(), CLOCK, deterministicBackoff(),
+                PublicationObserver.NOOP, PublicationTracer.NOOP);
 
-        assertThat(worker.publishDueEvents()).isOne();
+        assertThat(publishPending(worker, CLOCK)).isOne();
         assertThat(statusOf(id)).isEqualTo(EventStatus.PUBLISHED.code());
         assertThat(output.getOut()).contains("event=reliable_event.send.succeeded", "status=PUBLISHED")
                 .doesNotContain("messageId=null", "messageId=");
@@ -1125,17 +1177,9 @@ class ReliableEventIntegrationTest {
         EventId dueEvent = inTransaction(() -> publisher.publish(event(201L, NOW.minusSeconds(1))));
         EventId futureEvent = inTransaction(() -> publisher.publish(event(202L, NOW.plusSeconds(60))));
         FakeEventTransport sender = new FakeEventTransport();
-        JdbcEventPublicationWorker worker = new JdbcEventPublicationWorker(
-                jdbcTemplate,
-                transactionManager,
-                sender,
-                CLOCK,
-                50,
-                WORKER_ID,
-                LEASE_DURATION
-        );
+        JdbcEventPublicationWorker worker = worker(sender, CLOCK, deterministicBackoff());
 
-        int publishedCount = worker.publishDueEvents();
+        int publishedCount = publishPending(worker, CLOCK);
 
         assertThat(publishedCount).isOne();
         assertThat(sender.sentEvents)
@@ -1171,10 +1215,10 @@ class ReliableEventIntegrationTest {
         int secondPublished;
         try {
             Future<Integer> firstResult = executor.submit(
-                    () -> publishAfterSignal(firstWorker, candidate, ready, start)
+                    () -> publishAfterSignal(firstWorker, candidate, WORKER_ID, ready, start)
             );
             Future<Integer> secondResult = executor.submit(
-                    () -> publishAfterSignal(secondWorker, candidate, ready, start)
+                    () -> publishAfterSignal(secondWorker, candidate, SECOND_WORKER_ID, ready, start)
             );
 
             assertThat(ready.await(5, TimeUnit.SECONDS))
@@ -1217,7 +1261,7 @@ class ReliableEventIntegrationTest {
         FailOnceEventTransport sender = new FailOnceEventTransport();
         ExponentialBackoff backoff = deterministicBackoff();
 
-        int firstPublished = worker(sender, CLOCK, backoff).publishDueEvents();
+        int firstPublished = publishPending(worker(sender, CLOCK, backoff), CLOCK);
 
         assertThat(firstPublished).isZero();
         assertThat(sender.sendCount()).isOne();
@@ -1232,7 +1276,7 @@ class ReliableEventIntegrationTest {
         assertThat(publishedAtOf(eventId)).isNull();
 
         Clock beforeRetry = Clock.fixed(NOW.plusMillis(999), ZoneOffset.UTC);
-        int earlyPublished = worker(sender, beforeRetry, backoff).publishDueEvents();
+        int earlyPublished = publishPending(worker(sender, beforeRetry, backoff), beforeRetry);
 
         assertThat(earlyPublished).isZero();
         assertThat(sender.sendCount()).isOne();
@@ -1241,7 +1285,7 @@ class ReliableEventIntegrationTest {
         assertThat(versionOf(eventId)).isEqualTo(2L);
 
         Clock atRetry = Clock.fixed(NOW.plusSeconds(1), ZoneOffset.UTC);
-        int retryPublished = worker(sender, atRetry, backoff).publishDueEvents();
+        int retryPublished = publishPending(worker(sender, atRetry, backoff), atRetry);
 
         assertThat(retryPublished).isOne();
         assertThat(sender.sendCount()).isEqualTo(2);
@@ -1263,7 +1307,7 @@ class ReliableEventIntegrationTest {
         );
         SelectiveFailureEventTransport sender = new SelectiveFailureEventTransport("205");
 
-        int publishedCount = worker(sender, CLOCK, deterministicBackoff()).publishDueEvents();
+        int publishedCount = publishPending(worker(sender, CLOCK, deterministicBackoff()), CLOCK);
 
         assertThat(publishedCount).isOne();
         assertThat(sender.attemptedEventKeys()).containsExactly("205", "206");
@@ -1284,14 +1328,14 @@ class ReliableEventIntegrationTest {
         AlwaysFailingEventTransport sender = new AlwaysFailingEventTransport();
         ExponentialBackoff backoff = deterministicBackoff();
 
-        assertThat(worker(sender, CLOCK, backoff).publishDueEvents()).isZero();
+        assertThat(publishPending(worker(sender, CLOCK, backoff), CLOCK)).isZero();
         assertThat(statusOf(eventId)).isEqualTo(EventStatus.RETRY_WAIT.code());
         assertThat(attemptCountOf(eventId)).isOne();
         assertThat(versionOf(eventId)).isEqualTo(2L);
         assertThat(nextAttemptAtOf(eventId)).isEqualTo(NOW.plusSeconds(1));
 
         Clock atRetry = Clock.fixed(NOW.plusSeconds(1), ZoneOffset.UTC);
-        assertThat(worker(sender, atRetry, backoff).publishDueEvents()).isZero();
+        assertThat(publishPending(worker(sender, atRetry, backoff), atRetry)).isZero();
 
         assertThat(sender.sendCount()).isEqualTo(2);
         assertThat(statusOf(eventId)).isEqualTo(EventStatus.DEAD.code());
@@ -1303,7 +1347,7 @@ class ReliableEventIntegrationTest {
         assertThat(publishedAtOf(eventId)).isNull();
 
         Clock longAfterRetry = Clock.fixed(NOW.plusSeconds(3_600), ZoneOffset.UTC);
-        assertThat(worker(sender, longAfterRetry, backoff).publishDueEvents()).isZero();
+        assertThat(publishPending(worker(sender, longAfterRetry, backoff), longAfterRetry)).isZero();
         assertThat(sender.sendCount()).isEqualTo(2);
         assertThat(statusOf(eventId)).isEqualTo(EventStatus.DEAD.code());
         assertThat(attemptCountOf(eventId)).isEqualTo(2);
@@ -1319,13 +1363,13 @@ class ReliableEventIntegrationTest {
         ResultUnknownEventTransport sender = new ResultUnknownEventTransport();
         ExponentialBackoff backoff = deterministicBackoff();
 
-        assertThat(worker(sender, CLOCK, backoff).publishDueEvents()).isZero();
+        assertThat(publishPending(worker(sender, CLOCK, backoff), CLOCK)).isZero();
         assertThat(statusOf(eventId)).isEqualTo(EventStatus.RETRY_WAIT.code());
         assertThat(attemptCountOf(eventId)).isOne();
         assertThat(nextAttemptAtOf(eventId)).isEqualTo(NOW.plusSeconds(1));
 
         Clock atRetry = Clock.fixed(NOW.plusSeconds(1), ZoneOffset.UTC);
-        assertThat(worker(sender, atRetry, backoff).publishDueEvents()).isZero();
+        assertThat(publishPending(worker(sender, atRetry, backoff), atRetry)).isZero();
 
         assertThat(sender.sendCount()).isEqualTo(2);
         assertThat(statusOf(eventId)).isEqualTo(EventStatus.DEAD.code());
@@ -1341,21 +1385,13 @@ class ReliableEventIntegrationTest {
                 () -> publisher.publish(event(208L, NOW.minusSeconds(1)))
         );
         NonRetryableEventTransport sender = new NonRetryableEventTransport();
-        AtomicInteger randomCalls = new AtomicInteger();
-        ExponentialBackoff backoff = new ExponentialBackoff(
-                Duration.ofSeconds(1),
-                Duration.ofMinutes(5),
-                0.2,
-                () -> {
-                    randomCalls.incrementAndGet();
-                    return 0.0;
-                }
-        );
 
-        assertThat(worker(sender, CLOCK, backoff).publishDueEvents()).isZero();
+        ExponentialBackoff backoff = org.mockito.Mockito.mock(ExponentialBackoff.class);
+
+        assertThat(publishPending(worker(sender, CLOCK, backoff), CLOCK)).isZero();
 
         assertThat(sender.sendCount()).isOne();
-        assertThat(randomCalls).hasValue(0);
+        org.mockito.Mockito.verifyNoInteractions(backoff);
         assertThat(statusOf(eventId)).isEqualTo(EventStatus.DEAD.code());
         assertThat(attemptCountOf(eventId)).isOne();
         assertThat(versionOf(eventId)).isEqualTo(2L);
@@ -1367,58 +1403,22 @@ class ReliableEventIntegrationTest {
     }
 
     @Test
-    void workerRejectsInvalidLeaseConfiguration() {
-        FakeEventTransport sender = new FakeEventTransport();
-
-        assertThatThrownBy(() -> new JdbcEventPublicationWorker(
-                jdbcTemplate,
-                transactionManager,
-                sender,
-                CLOCK,
-                50,
-                " ",
-                LEASE_DURATION
-        )).isInstanceOf(IllegalArgumentException.class)
+    void storeRejectsInvalidLeaseConfiguration() {
+        assertThatThrownBy(() -> publicationStore(CLOCK, " ", PublicationObserver.NOOP))
+                .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("workerId");
-        assertThatThrownBy(() -> new JdbcEventPublicationWorker(
-                jdbcTemplate,
-                transactionManager,
-                sender,
-                CLOCK,
-                50,
-                "x".repeat(129),
-                LEASE_DURATION
-        )).isInstanceOf(IllegalArgumentException.class)
+        assertThatThrownBy(() -> publicationStore(CLOCK, "x".repeat(129), PublicationObserver.NOOP))
+                .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("128");
-        assertThatThrownBy(() -> new JdbcEventPublicationWorker(
-                jdbcTemplate,
-                transactionManager,
-                sender,
-                CLOCK,
-                50,
-                WORKER_ID,
-                Duration.ZERO
-        )).isInstanceOf(IllegalArgumentException.class)
+        assertThatThrownBy(() -> new JdbcPublicationStore(jdbcTemplate, transactionManager, CLOCK,
+                WORKER_ID, Duration.ZERO, PublicationObserver.NOOP)).isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("leaseDuration");
-        assertThatThrownBy(() -> new JdbcEventPublicationWorker(
-                jdbcTemplate,
-                transactionManager,
-                sender,
-                CLOCK,
-                50,
-                WORKER_ID,
-                Duration.ofMillis(-1)
-        )).isInstanceOf(IllegalArgumentException.class)
+        assertThatThrownBy(() -> new JdbcPublicationStore(jdbcTemplate, transactionManager, CLOCK,
+                WORKER_ID, Duration.ofMillis(-1), PublicationObserver.NOOP))
+                .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("leaseDuration");
-        assertThatThrownBy(() -> new JdbcEventPublicationWorker(
-                jdbcTemplate,
-                transactionManager,
-                sender,
-                CLOCK,
-                50,
-                WORKER_ID,
-                null
-        )).isInstanceOf(NullPointerException.class)
+        assertThatThrownBy(() -> new JdbcPublicationStore(jdbcTemplate, transactionManager, CLOCK,
+                WORKER_ID, null, PublicationObserver.NOOP)).isInstanceOf(NullPointerException.class)
                 .hasMessageContaining("leaseDuration");
     }
 
@@ -1513,21 +1513,13 @@ class ReliableEventIntegrationTest {
         EventCandidate candidate = repository.findDueEventCandidates(NOW, 50).get(0);
         inTransaction(() -> claim(candidate, WORKER_ID).orElseThrow());
         expireLease(eventId, 1);
-        AtomicInteger randomCalls = new AtomicInteger();
-        ExponentialBackoff backoff = new ExponentialBackoff(
-                Duration.ofSeconds(1),
-                Duration.ofMinutes(5),
-                0.2,
-                () -> {
-                    randomCalls.incrementAndGet();
-                    return 0.0;
-                }
-        );
+
+        ExponentialBackoff backoff = org.mockito.Mockito.mock(ExponentialBackoff.class);
 
         int recoveredCount = recovery(50, backoff).recoverExpiredLeases();
 
         assertThat(recoveredCount).isOne();
-        assertThat(randomCalls).hasValue(0);
+        org.mockito.Mockito.verifyNoInteractions(backoff);
         assertThat(statusOf(eventId)).isEqualTo(EventStatus.DEAD.code());
         assertThat(attemptCountOf(eventId)).isOne();
         assertThat(versionOf(eventId)).isEqualTo(2L);
@@ -1652,42 +1644,6 @@ class ReliableEventIntegrationTest {
     }
 
     @Test
-    void publicationCycleRecoversExpiredLeasesBeforePublishingDueEvents() {
-        ReliableEventPublisher twoAttemptPublisher = publisherWithMaxAttempts(2);
-        EventId expiredEvent = inTransaction(
-                () -> twoAttemptPublisher.publish(event(315L, NOW.minusSeconds(1)))
-        );
-        EventCandidate expiredCandidate = repository.findDueEventCandidates(NOW, 50).get(0);
-        inTransaction(() -> claim(expiredCandidate, WORKER_ID).orElseThrow());
-        expireLease(expiredEvent, 1);
-        EventId dueEvent = inTransaction(
-                () -> publisher.publish(event(316L, NOW.minusSeconds(1)))
-        );
-        FakeEventTransport sender = new FakeEventTransport();
-        JdbcEventPublicationCycle cycle = new JdbcEventPublicationCycle(
-                recovery(50, deterministicBackoff()),
-                worker(sender, SECOND_WORKER_ID)
-        );
-
-        Instant databaseTimeBeforeCycle = databaseNow();
-        PublicationCycleResult result = cycle.runOnce();
-        Instant databaseTimeAfterCycle = databaseNow();
-
-        assertThat(result).isEqualTo(new PublicationCycleResult(1, 1));
-        assertThat(statusOf(expiredEvent)).isEqualTo(EventStatus.RETRY_WAIT.code());
-        assertThat(attemptCountOf(expiredEvent)).isOne();
-        assertThat(versionOf(expiredEvent)).isEqualTo(2L);
-        assertThat(nextAttemptAtOf(expiredEvent)).isBetween(
-                databaseTimeBeforeCycle.plusSeconds(1),
-                databaseTimeAfterCycle.plusSeconds(1)
-        );
-        assertThat(statusOf(dueEvent)).isEqualTo(EventStatus.PUBLISHED.code());
-        assertThat(sender.sentEvents)
-                .extracting(OutboundEvent::id)
-                .containsExactly(dueEvent);
-    }
-
-    @Test
     void twoRecoverersCompetingForTheSameRetryableSnapshotRecoverOnlyOnce()
             throws Exception {
         ReliableEventPublisher twoAttemptPublisher = publisherWithMaxAttempts(2);
@@ -1704,11 +1660,11 @@ class ReliableEventIntegrationTest {
         CyclicBarrier transactionStart = new CyclicBarrier(2);
         JdbcExpiredLeaseRecovery firstRecovery = recovery(
                 50,
-                backoffWaitingAt(transactionStart)
+                deterministicBackoff()
         );
         JdbcExpiredLeaseRecovery secondRecovery = recovery(
                 50,
-                backoffWaitingAt(transactionStart)
+                deterministicBackoff()
         );
         ExecutorService executor = Executors.newFixedThreadPool(2);
 
@@ -1716,10 +1672,16 @@ class ReliableEventIntegrationTest {
         int secondRecovered;
         try {
             Future<Integer> firstResult = executor.submit(
-                    () -> firstRecovery.recoverCandidates(snapshot)
+                    () -> {
+                        transactionStart.await(5, TimeUnit.SECONDS);
+                        return firstRecovery.recoverCandidates(snapshot);
+                    }
             );
             Future<Integer> secondResult = executor.submit(
-                    () -> secondRecovery.recoverCandidates(snapshot)
+                    () -> {
+                        transactionStart.await(5, TimeUnit.SECONDS);
+                        return secondRecovery.recoverCandidates(snapshot);
+                    }
             );
 
             firstRecovered = firstResult.get(10, TimeUnit.SECONDS);
@@ -1757,16 +1719,8 @@ class ReliableEventIntegrationTest {
         assertThat(snapshot).hasSize(1);
         CountDownLatch ready = new CountDownLatch(2);
         CountDownLatch start = new CountDownLatch(1);
-        AtomicInteger randomCalls = new AtomicInteger();
-        ExponentialBackoff backoff = new ExponentialBackoff(
-                Duration.ofSeconds(1),
-                Duration.ofMinutes(5),
-                0.2,
-                () -> {
-                    randomCalls.incrementAndGet();
-                    return 0.0;
-                }
-        );
+
+        ExponentialBackoff backoff = org.mockito.Mockito.mock(ExponentialBackoff.class);
         ExecutorService executor = Executors.newFixedThreadPool(2);
 
         int firstRecovered;
@@ -1795,7 +1749,7 @@ class ReliableEventIntegrationTest {
 
         assertThat(List.of(firstRecovered, secondRecovered))
                 .containsExactlyInAnyOrder(0, 1);
-        assertThat(randomCalls).hasValue(0);
+        org.mockito.Mockito.verifyNoInteractions(backoff);
         assertThat(statusOf(eventId)).isEqualTo(EventStatus.DEAD.code());
         assertThat(attemptCountOf(eventId)).isOne();
         assertThat(versionOf(eventId)).isEqualTo(2L);
@@ -1815,7 +1769,7 @@ class ReliableEventIntegrationTest {
 
         try {
             oldResult = executor.submit(
-                    () -> worker(oldSender, WORKER_ID).publishDueEvents()
+                    () -> publishPending(worker(oldSender, WORKER_ID), CLOCK)
             );
             assertThat(oldSender.awaitSend(5, TimeUnit.SECONDS))
                     .as("old worker entered the sender")
@@ -1871,7 +1825,7 @@ class ReliableEventIntegrationTest {
 
         try {
             oldResult = executor.submit(
-                    () -> worker(oldSender, WORKER_ID).publishDueEvents()
+                    () -> publishPending(worker(oldSender, WORKER_ID), CLOCK)
             );
             assertThat(oldSender.awaitSend(5, TimeUnit.SECONDS))
                     .as("old worker entered the sender")
@@ -1887,7 +1841,8 @@ class ReliableEventIntegrationTest {
                     deterministicBackoff(),
                     SECOND_WORKER_ID
             );
-            newResult = executor.submit(newWorker::publishDueEvents);
+            Clock newWorkerClock = Clock.fixed(nextAttemptAt, ZoneOffset.UTC);
+            newResult = executor.submit(() -> publishPending(newWorker, newWorkerClock, SECOND_WORKER_ID));
             assertThat(newSender.awaitSend(5, TimeUnit.SECONDS))
                     .as("new worker entered the sender")
                     .isTrue();
@@ -1947,7 +1902,7 @@ class ReliableEventIntegrationTest {
         SelectiveNonRetryableEventTransport sender =
                 new SelectiveNonRetryableEventTransport("209");
 
-        int publishedCount = worker(sender, CLOCK, deterministicBackoff()).publishDueEvents();
+        int publishedCount = publishPending(worker(sender, CLOCK, deterministicBackoff()), CLOCK);
 
         assertThat(publishedCount).isOne();
         assertThat(sender.attemptedEventKeys()).containsExactly("209", "210");
@@ -1963,22 +1918,41 @@ class ReliableEventIntegrationTest {
         return worker(sender, WORKER_ID);
     }
 
+    private JdbcPublicationStore publicationStore(Clock clock, String workerId, PublicationObserver observer) {
+        return new JdbcPublicationStore(jdbcTemplate, transactionManager, clock, workerId,
+                LEASE_DURATION, observer);
+    }
+
+    private int publishPending(JdbcEventPublicationWorker worker, Clock clock) {
+        return publishPending(worker, clock, WORKER_ID);
+    }
+
+    private int publishPending(JdbcEventPublicationWorker worker, Clock clock, String workerId) {
+        JdbcPublicationStore store = publicationStore(clock, workerId, PublicationObserver.NOOP);
+        int published = 0;
+        for (EventCandidate candidate : store.findDueEventCandidates(50)) {
+            var claimed = store.claimCandidate(candidate);
+            if (claimed.isPresent() && worker.publishClaimedEvent(claimed.get())) {
+                published++;
+            }
+        }
+        return published;
+    }
+
+    private boolean publishCandidate(JdbcEventPublicationWorker worker, EventCandidate candidate,
+                                     Clock clock, String workerId) {
+        return publicationStore(clock, workerId, PublicationObserver.NOOP).claimCandidate(candidate)
+                .map(worker::publishClaimedEvent).orElse(false);
+    }
+
     private JdbcEventPublicationWorker worker(EventTransport sender, PublicationObserver observer) {
-        return new JdbcEventPublicationWorker(
-                jdbcTemplate, transactionManager, sender, CLOCK, 50, WORKER_ID,
-                LEASE_DURATION, deterministicBackoff(), observer, PublicationTracer.NOOP);
+        return new JdbcEventPublicationWorker(publicationStore(CLOCK, WORKER_ID, observer), sender, CLOCK,
+                deterministicBackoff(), observer, PublicationTracer.NOOP);
     }
 
     private JdbcEventPublicationWorker worker(EventTransport sender, String workerId) {
-        return new JdbcEventPublicationWorker(
-                jdbcTemplate,
-                transactionManager,
-                sender,
-                CLOCK,
-                50,
-                workerId,
-                LEASE_DURATION
-        );
+        return new JdbcEventPublicationWorker(publicationStore(CLOCK, workerId, PublicationObserver.NOOP),
+                sender, CLOCK, new ExponentialBackoff(java.time.Duration.ofSeconds(1), java.time.Duration.ofMinutes(5), 0.2), PublicationObserver.NOOP, PublicationTracer.NOOP);
     }
 
     private JdbcEventPublicationWorker worker(
@@ -1995,16 +1969,8 @@ class ReliableEventIntegrationTest {
             ExponentialBackoff backoff,
             String workerId
     ) {
-        return new JdbcEventPublicationWorker(
-                jdbcTemplate,
-                transactionManager,
-                sender,
-                clock,
-                50,
-                workerId,
-                LEASE_DURATION,
-                backoff
-        );
+        return new JdbcEventPublicationWorker(publicationStore(clock, workerId, PublicationObserver.NOOP),
+                sender, clock, backoff, PublicationObserver.NOOP, PublicationTracer.NOOP);
     }
 
     private JdbcExpiredLeaseRecovery recovery(
@@ -2081,9 +2047,7 @@ class ReliableEventIntegrationTest {
         return new ExponentialBackoff(
                 Duration.ofSeconds(1),
                 Duration.ofMinutes(5),
-                0.2,
-                () -> 0.0
-        );
+                0.0);
     }
 
     private ReliableEventPublisher publisherWithMaxAttempts(int maxAttempts) {
@@ -2093,6 +2057,7 @@ class ReliableEventIntegrationTest {
     private int publishAfterSignal(
             JdbcEventPublicationWorker worker,
             EventCandidate candidate,
+            String workerId,
             CountDownLatch ready,
             CountDownLatch start
     ) throws InterruptedException {
@@ -2100,7 +2065,7 @@ class ReliableEventIntegrationTest {
         if (!start.await(5, TimeUnit.SECONDS)) {
             throw new IllegalStateException("Timed out waiting for concurrent start signal");
         }
-        return worker.publishCandidates(List.of(candidate));
+        return publishCandidate(worker, candidate, CLOCK, workerId) ? 1 : 0;
     }
 
     private int recoverAfterSignal(
@@ -2114,25 +2079,6 @@ class ReliableEventIntegrationTest {
             throw new IllegalStateException("Timed out waiting for concurrent recovery signal");
         }
         return recovery.recoverCandidates(candidates);
-    }
-
-    private ExponentialBackoff backoffWaitingAt(CyclicBarrier barrier) {
-        return new ExponentialBackoff(
-                Duration.ofSeconds(1),
-                Duration.ofMinutes(5),
-                0.2,
-                () -> {
-                    try {
-                        barrier.await(5, TimeUnit.SECONDS);
-                        return 0.0;
-                    } catch (Exception exception) {
-                        throw new IllegalStateException(
-                                "Timed out waiting for concurrent recovery transaction",
-                                exception
-                        );
-                    }
-                }
-        );
     }
 
     private ReliableEvent<CouponTaskPayload> event(long taskId, Instant availableAt) {

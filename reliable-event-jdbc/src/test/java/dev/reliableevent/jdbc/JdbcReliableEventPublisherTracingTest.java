@@ -7,27 +7,42 @@ import dev.reliableevent.ReliableEvent;
 import dev.reliableevent.ReliableEventSerializationException;
 import dev.reliableevent.jdbc.internal.tracing.RegistrationTracer;
 import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.dao.DataAccessResourceFailureException;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.core.PreparedStatementCreator;
+import org.springframework.jdbc.datasource.ConnectionHolder;
 import org.springframework.jdbc.support.KeyHolder;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 
 import java.time.Instant;
+import java.sql.Connection;
 import java.util.Map;
+import javax.sql.DataSource;
 
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
 class JdbcReliableEventPublisherTracingTest {
     private final JdbcTemplate jdbcTemplate = mock(JdbcTemplate.class);
+    private final DataSource dataSource = mock(DataSource.class);
+
+    @BeforeEach
+    void bindTransactionConnection() throws Exception {
+        Connection connection = mock(Connection.class);
+        when(connection.getAutoCommit()).thenReturn(false);
+        when(jdbcTemplate.getDataSource()).thenReturn(dataSource);
+        TransactionSynchronizationManager.bindResource(dataSource, new ConnectionHolder(connection));
+    }
 
     @AfterEach
     void clearTransactionFlag() {
         TransactionSynchronizationManager.setActualTransactionActive(false);
+        TransactionSynchronizationManager.unbindResource(dataSource);
     }
 
     @Test

@@ -11,6 +11,7 @@ import dev.reliableevent.jdbc.JdbcReliableEventPublisher;
 import dev.reliableevent.jdbc.internal.model.EventStatus;
 import dev.reliableevent.jdbc.internal.recovery.JdbcExpiredLeaseRecovery;
 import dev.reliableevent.jdbc.internal.publication.JdbcEventPublicationWorker;
+import dev.reliableevent.jdbc.internal.persistence.JdbcPublicationStore;
 import dev.reliableevent.jdbc.internal.retry.ExponentialBackoff;
 import dev.reliableevent.jdbc.internal.tracing.PublicationTracer;
 import dev.reliableevent.jdbc.internal.observation.PublicationObserver;
@@ -151,7 +152,7 @@ class RocketMqPublicationIntegrationTest {
         String eventKey = "normal-" + System.nanoTime();
         EventId eventId = publish(eventKey, new TaskPayload(101));
 
-        assertThat(worker(sender, Clock.systemUTC()).publishDueEvents()).isOne();
+        assertThat(publishPending(worker(sender, Clock.systemUTC()), Clock.systemUTC())).isOne();
 
         MessageView message = receiveMessages(eventKey, 1).get(0);
         assertThat(statusOf(eventId)).isEqualTo(EventStatus.PUBLISHED.code());
@@ -203,12 +204,14 @@ class RocketMqPublicationIntegrationTest {
                 throw new AssertionError(failure);
             }
         };
-        JdbcEventPublicationWorker tracedWorker = new JdbcEventPublicationWorker(jdbcTemplate,
-                transactionManager, sender, Clock.systemUTC(), 10, "rocketmq-trace-worker", LEASE_DURATION,
-                new ExponentialBackoff(Duration.ofSeconds(1), Duration.ofSeconds(30), 0.0, () -> 0.0),
-                dev.reliableevent.jdbc.internal.observation.PublicationObserver.NOOP, tracer);
+        Clock traceClock = Clock.systemUTC();
+        JdbcPublicationStore traceStore = publicationStore(traceClock, "rocketmq-trace-worker",
+                PublicationObserver.NOOP);
+        JdbcEventPublicationWorker tracedWorker = new JdbcEventPublicationWorker(traceStore,
+                sender, traceClock, new ExponentialBackoff(Duration.ofSeconds(1), Duration.ofSeconds(30),
+                0.0), PublicationObserver.NOOP, tracer);
 
-        assertThat(tracedWorker.publishDueEvents()).isOne();
+        assertThat(publishPending(tracedWorker, Clock.systemUTC(), "rocketmq-trace-worker")).isOne();
         MessageView message = receiveMessages(eventKey, 1).get(0);
         assertThat(message.getProperties())
                 .containsEntry("traceparent", attemptTraceparent)
@@ -227,7 +230,7 @@ class RocketMqPublicationIntegrationTest {
         RocketMqEventTransport missingDestinationSender = new RocketMqEventTransport(PROVIDER, unusedProducer, new MapEventDestinationResolver(Map.of()));
         EventId eventId = publish("missing-" + System.nanoTime(), new TaskPayload(102));
 
-        assertThat(worker(missingDestinationSender, Clock.systemUTC()).publishDueEvents()).isZero();
+        assertThat(publishPending(worker(missingDestinationSender, Clock.systemUTC()), Clock.systemUTC())).isZero();
 
         assertThat(statusOf(eventId)).isEqualTo(EventStatus.DEAD.code());
         assertThat(attemptCountOf(eventId)).isOne();
@@ -245,7 +248,7 @@ class RocketMqPublicationIntegrationTest {
                 new LargePayload("x".repeat(128))
         );
 
-        assertThat(worker(smallBodySender, Clock.systemUTC()).publishDueEvents()).isZero();
+        assertThat(publishPending(worker(smallBodySender, Clock.systemUTC()), Clock.systemUTC())).isZero();
 
         assertThat(statusOf(eventId)).isEqualTo(EventStatus.DEAD.code());
         assertThat(attemptCountOf(eventId)).isOne();
@@ -261,7 +264,7 @@ class RocketMqPublicationIntegrationTest {
 
         environment.pauseBroker();
         try {
-            assertThat(worker(sender, Clock.systemUTC()).publishDueEvents()).isZero();
+            assertThat(publishPending(worker(sender, Clock.systemUTC()), Clock.systemUTC())).isZero();
         } finally {
             environment.unpauseBroker();
         }
@@ -271,8 +274,8 @@ class RocketMqPublicationIntegrationTest {
         assertThat(attemptCountOf(eventId)).isOne();
         assertThat(nextAttemptAt).isAfter(Instant.now().minusSeconds(1));
 
-        assertThat(worker(sender, Clock.fixed(nextAttemptAt, ZoneOffset.UTC))
-                .publishDueEvents()).isOne();
+        Clock retryClock = Clock.fixed(nextAttemptAt, ZoneOffset.UTC);
+        assertThat(publishPending(worker(sender, retryClock), retryClock)).isOne();
 
         MessageView message = receiveMessages(eventKey, 1).get(0);
         assertThat(statusOf(eventId)).isEqualTo(EventStatus.PUBLISHED.code());
@@ -297,15 +300,15 @@ class RocketMqPublicationIntegrationTest {
             return receipt;
         };
 
-        assertThat(worker(discardFirstReceipt, Clock.systemUTC()).publishDueEvents()).isZero();
+        assertThat(publishPending(worker(discardFirstReceipt, Clock.systemUTC()), Clock.systemUTC())).isZero();
 
         Instant nextAttemptAt = nextAttemptAtOf(eventId);
         assertThat(firstMessageId.get()).isNotBlank();
         assertThat(statusOf(eventId)).isEqualTo(EventStatus.RETRY_WAIT.code());
         assertThat(attemptCountOf(eventId)).isOne();
 
-        assertThat(worker(sender, Clock.fixed(nextAttemptAt, ZoneOffset.UTC))
-                .publishDueEvents()).isOne();
+        Clock retryClock = Clock.fixed(nextAttemptAt, ZoneOffset.UTC);
+        assertThat(publishPending(worker(sender, retryClock), retryClock)).isOne();
 
         List<MessageView> messages = receiveMessages(eventKey, 2);
         Set<String> messageIds = new HashSet<>();
@@ -334,14 +337,14 @@ class RocketMqPublicationIntegrationTest {
         Instant availableAt = Instant.now().plusSeconds(2);
         EventId eventId = publishAt(eventKey, new TaskPayload(105), availableAt, 3);
 
-        assertThat(worker(sender, Clock.systemUTC()).publishDueEvents()).isZero();
+        assertThat(publishPending(worker(sender, Clock.systemUTC()), Clock.systemUTC())).isZero();
         assertThat(statusOf(eventId)).isEqualTo(EventStatus.PENDING.code());
         assertThat(attemptCountOf(eventId)).isZero();
         assertThat(countMessages(eventKey)).isZero();
 
         await().atMost(Duration.ofSeconds(5))
                 .until(() -> !Instant.now().isBefore(availableAt));
-        assertThat(worker(sender, Clock.systemUTC()).publishDueEvents()).isOne();
+        assertThat(publishPending(worker(sender, Clock.systemUTC()), Clock.systemUTC())).isOne();
         MessageView message = receiveMessages(eventKey, 1).get(0);
         assertThat(statusOf(eventId)).isEqualTo(EventStatus.PUBLISHED.code());
         assertThat(message.getProperties()).containsEntry(
@@ -359,12 +362,12 @@ class RocketMqPublicationIntegrationTest {
         environment.pauseBroker();
         int firstAttempt = 0;
         try {
-            assertThat(worker(sender, Clock.systemUTC()).publishDueEvents()).isZero();
+            assertThat(publishPending(worker(sender, Clock.systemUTC()), Clock.systemUTC())).isZero();
             assertThat(statusOf(eventId)).isEqualTo(EventStatus.RETRY_WAIT.code());
             firstAttempt = attemptCountOf(eventId);
             jdbcTemplate.update("UPDATE reliable_event_outbox SET next_attempt_at=UTC_TIMESTAMP(3)-INTERVAL 1 SECOND WHERE id=?",
                     eventId.value());
-            assertThat(worker(sender, Clock.systemUTC()).publishDueEvents()).isZero();
+            assertThat(publishPending(worker(sender, Clock.systemUTC()), Clock.systemUTC())).isZero();
 
             assertThat(statusOf(eventId)).isEqualTo(EventStatus.DEAD.code());
             assertThat(attemptCountOf(eventId)).isEqualTo(2);
@@ -413,7 +416,7 @@ class RocketMqPublicationIntegrationTest {
         Files.createDirectories(evidence);
         try {
             JdbcEventPublicationWorker delayedWorker = worker(delayedRealConfirmation, Clock.systemUTC());
-            Future<Integer> result = executor.submit(delayedWorker::publishDueEvents);
+            Future<Integer> result = executor.submit(() -> publishPending(delayedWorker, Clock.systemUTC()));
             assertThat(brokerConfirmed.await(30, TimeUnit.SECONDS)).isTrue();
             MessageView first = receiveMessages(eventKey, 1).get(0);
             assertThat(first.getProperties()).containsEntry(
@@ -424,7 +427,7 @@ class RocketMqPublicationIntegrationTest {
                     eventId.value());
             JdbcExpiredLeaseRecovery recovery = new JdbcExpiredLeaseRecovery(jdbcTemplate,
                     transactionManager, 8,
-                    new ExponentialBackoff(Duration.ofMillis(1), Duration.ofMillis(1), 0.0, () -> 0.0));
+                    new ExponentialBackoff(Duration.ofMillis(1), Duration.ofMillis(1), 0.0));
             assertThat(recovery.recoverExpiredLeases()).isOne();
             assertThat(statusOf(eventId)).isEqualTo(EventStatus.RETRY_WAIT.code());
             releaseWorker.countDown();
@@ -434,7 +437,7 @@ class RocketMqPublicationIntegrationTest {
 
             jdbcTemplate.update("UPDATE reliable_event_outbox SET next_attempt_at=UTC_TIMESTAMP(3)-INTERVAL 1 SECOND WHERE id=?",
                     eventId.value());
-            assertThat(worker(sender, Clock.systemUTC()).publishDueEvents()).isOne();
+            assertThat(publishPending(worker(sender, Clock.systemUTC()), Clock.systemUTC())).isOne();
             MessageView retried = receiveMessages(eventKey, 1).get(0);
             assertThat(retried.getProperties()).containsEntry(
                     RocketMqMessageFactory.EVENT_ID_PROPERTY, Long.toString(eventId.value()));
@@ -479,12 +482,15 @@ class RocketMqPublicationIntegrationTest {
         jdbcTemplate.execute("ALTER TABLE reliable_event_outbox ADD CONSTRAINT " + constraint +
                 " CHECK (event_key <> '" + eventKey + "' OR status <> 2)");
         try {
-            JdbcEventPublicationWorker failingStateWorker = new JdbcEventPublicationWorker(
-                    jdbcTemplate, transactionManager, sender, Clock.systemUTC(), 8,
-                    "rocketmq-state-reject-worker", LEASE_DURATION,
-                    new ExponentialBackoff(Duration.ofMillis(1), Duration.ofMillis(1), 0.0, () -> 0.0),
-                    observer);
-            assertThatThrownBy(failingStateWorker::publishDueEvents)
+            Clock failedStateClock = Clock.systemUTC();
+            JdbcPublicationStore failedStateStore = publicationStore(failedStateClock,
+                    "rocketmq-state-reject-worker", observer);
+            JdbcEventPublicationWorker failingStateWorker = new JdbcEventPublicationWorker(failedStateStore,
+                    sender, failedStateClock,
+                    new ExponentialBackoff(Duration.ofMillis(1), Duration.ofMillis(1), 0.0),
+                    observer, PublicationTracer.NOOP);
+            assertThatThrownBy(() -> publishPending(failingStateWorker, failedStateClock,
+                    "rocketmq-state-reject-worker"))
                     .isInstanceOf(RuntimeException.class);
             assertThat(sendSuccesses).hasValue(1);
             assertThat(stateFailures).hasValue(1);
@@ -503,11 +509,11 @@ class RocketMqPublicationIntegrationTest {
                 eventId.value());
         JdbcExpiredLeaseRecovery recovery = new JdbcExpiredLeaseRecovery(jdbcTemplate,
                 transactionManager, 8,
-                new ExponentialBackoff(Duration.ofMillis(1), Duration.ofMillis(1), 0.0, () -> 0.0));
+                new ExponentialBackoff(Duration.ofMillis(1), Duration.ofMillis(1), 0.0));
         assertThat(recovery.recoverExpiredLeases()).isOne();
         jdbcTemplate.update("UPDATE reliable_event_outbox SET next_attempt_at=UTC_TIMESTAMP(3)-INTERVAL 1 SECOND WHERE id=?",
                 eventId.value());
-        assertThat(worker(sender, Clock.systemUTC()).publishDueEvents()).isOne();
+        assertThat(publishPending(worker(sender, Clock.systemUTC()), Clock.systemUTC())).isOne();
         MessageView second = receiveMessages(eventKey, 1).get(0);
         assertThat(second.getProperties()).containsEntry(
                 RocketMqMessageFactory.EVENT_ID_PROPERTY, Long.toString(eventId.value()));
@@ -575,11 +581,11 @@ class RocketMqPublicationIntegrationTest {
                     eventId.value());
             JdbcExpiredLeaseRecovery recovery = new JdbcExpiredLeaseRecovery(jdbcTemplate,
                     transactionManager, 8,
-                    new ExponentialBackoff(Duration.ofMillis(1), Duration.ofMillis(1), 0.0, () -> 0.0));
+                    new ExponentialBackoff(Duration.ofMillis(1), Duration.ofMillis(1), 0.0));
             assertThat(recovery.recoverExpiredLeases()).isOne();
             jdbcTemplate.update("UPDATE reliable_event_outbox SET next_attempt_at=UTC_TIMESTAMP(3)-INTERVAL 1 SECOND WHERE id=?",
                     eventId.value());
-            assertThat(worker(sender, Clock.systemUTC()).publishDueEvents()).isOne();
+            assertThat(publishPending(worker(sender, Clock.systemUTC()), Clock.systemUTC())).isOne();
             MessageView message = receiveMessages(eventKey, 1).get(0);
             consumer.ack(message);
             assertThat(statusOf(eventId)).isEqualTo(EventStatus.PUBLISHED.code());
@@ -681,12 +687,12 @@ class RocketMqPublicationIntegrationTest {
                     eventId.value());
             JdbcExpiredLeaseRecovery recovery = new JdbcExpiredLeaseRecovery(
                     jdbcTemplate, transactionManager, 16,
-                    new ExponentialBackoff(Duration.ofMillis(1), Duration.ofMillis(1), 0.0, () -> 0.0));
+                    new ExponentialBackoff(Duration.ofMillis(1), Duration.ofMillis(1), 0.0));
             assertThat(recovery.recoverExpiredLeases()).isOne();
             assertThat(statusOf(eventId)).isEqualTo(EventStatus.RETRY_WAIT.code());
             jdbcTemplate.update("UPDATE reliable_event_outbox SET next_attempt_at=UTC_TIMESTAMP(3)-INTERVAL 1 SECOND WHERE id=?",
                     eventId.value());
-            assertThat(worker(sender, Clock.systemUTC()).publishDueEvents()).isOne();
+            assertThat(publishPending(worker(sender, Clock.systemUTC()), Clock.systemUTC())).isOne();
 
             List<MessageView> messages = receiveMessages(eventKey, expectedMessages - priorRealMessages);
             Set<String> stableEventIds = new HashSet<>();
@@ -787,21 +793,31 @@ class RocketMqPublicationIntegrationTest {
     }
 
     private JdbcEventPublicationWorker worker(EventTransport targetSender, Clock clock) {
-        return new JdbcEventPublicationWorker(
-                jdbcTemplate,
-                transactionManager,
-                targetSender,
-                clock,
-                10,
-                "rocketmq-publication-worker",
-                LEASE_DURATION,
+        return new JdbcEventPublicationWorker(publicationStore(clock, "rocketmq-publication-worker",
+                PublicationObserver.NOOP), targetSender, clock,
                 new ExponentialBackoff(
                         Duration.ofSeconds(1),
                         Duration.ofSeconds(30),
-                        0.0,
-                        () -> 0.0
-                )
-        );
+                        0.0), PublicationObserver.NOOP, PublicationTracer.NOOP);
+    }
+
+    private JdbcPublicationStore publicationStore(Clock clock, String workerId, PublicationObserver observer) {
+        return new JdbcPublicationStore(jdbcTemplate, transactionManager, clock, workerId,
+                LEASE_DURATION, observer);
+    }
+
+    private int publishPending(JdbcEventPublicationWorker worker, Clock clock) {
+        return publishPending(worker, clock, "rocketmq-publication-worker");
+    }
+
+    private int publishPending(JdbcEventPublicationWorker worker, Clock clock, String workerId) {
+        JdbcPublicationStore store = publicationStore(clock, workerId, PublicationObserver.NOOP);
+        int published = 0;
+        for (var candidate : store.findDueEventCandidates(10)) {
+            var claim = store.claimCandidate(candidate);
+            if (claim.isPresent() && worker.publishClaimedEvent(claim.get())) published++;
+        }
+        return published;
     }
 
     private List<MessageView> receiveMessages(String eventKey, int expectedCount) throws Exception {

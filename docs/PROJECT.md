@@ -45,7 +45,7 @@ ReliableEvent 是一个面向 Spring Boot 的事务 Outbox 发布库。业务服
 - `3 RETRY_WAIT`：可重试失败或租约超时，等待 `next_attempt_at`。
 - `4 DEAD`：永久拒绝、超过最大尝试次数或最终租约恢复失败。
 
-尝试次数在每次抢占时递增，而不是每次 sender 调用一定只增一次；`attempt_count` 代表领取尝试。默认最多 8 次。默认退避基数为 1 秒，每次指数翻倍，指数基数封顶 5 分钟后再增加 0–20% 随机抖动，因此最终延迟最高可到 6 分钟。到达最大次数后，下一次发送失败或租约恢复会将事件置为 `DEAD`。最后错误只保存最多 1024 个 Unicode 字符的异常类型和消息；应用应避免让异常消息携带凭证、payload 或个人数据。
+尝试次数在每次抢占时递增，而不是每次 sender 调用一定只增一次；`attempt_count` 代表领取尝试。默认最多 8 次。退避初始时间、基础时间上限和抖动比例必须显式配置。基础时间每次指数翻倍，达到配置上限后停止增长，再按配置比例增加随机抖动；最终等待时间可以超过基础时间上限。到达最大次数后，下一次发送失败或租约恢复会将事件置为 `DEAD`。最后错误只保存最多 1024 个 Unicode 字符的异常类型和消息；应用应避免让异常消息携带凭证、payload 或个人数据。
 
 ## 消费端与 Broker 行为
 
@@ -116,6 +116,9 @@ spring:
     password: ${DB_PASSWORD}
 
 reliable-event:
+  initial-retry-delay: 1s
+  max-retry-delay: 5m
+  retry-jitter-ratio: 0.2
   transport: rocketmq
   rocketmq:
     endpoints: localhost:8081
@@ -134,6 +137,9 @@ spring:
     password: ${DB_PASSWORD}
 
 reliable-event:
+  initial-retry-delay: 1s
+  max-retry-delay: 5m
+  retry-jitter-ratio: 0.2
   transport: kafka
   kafka:
     bootstrap-servers: localhost:9092
@@ -159,7 +165,7 @@ reliable-event:
 - `worker-threads=8`、`worker-queue-capacity=200`：有界工作池，容量总计为二者之和；队列中候选尚未占有租约。
 - `shutdown-timeout=20s`：关闭阶段等待时长。
 - `lease-duration=30s`：必须长于发送器受控请求预算；Kafka 还要求严格大于发送预算加 1 秒数据库状态更新预留。
-- `max-attempts=8`、`initial-retry-delay=1s`、`max-retry-delay=5m`。退避随机抖动固定为最高 20%，不单独暴露配置项。
+- `max-attempts=8`。`initial-retry-delay`、`max-retry-delay`、`retry-jitter-ratio` 无默认值，启用 ReliableEvent 时必须显式配置；缺失会导致启动失败。两个等待时间至少为 1ms，最大基础等待时间不得短于初始时间；抖动比例为 0–0.2 的有限数，0 表示关闭抖动。`max-retry-delay` 限制的是叠加抖动之前的基础等待时间。
 - `metrics-snapshot-enabled=true`、`metrics-snapshot-interval=15s`、`metrics-snapshot-query-timeout=2s`、`metrics-snapshot-timeout=5s`、`metrics-snapshot-shutdown-timeout=2s`。指标需应用提供 `MeterRegistry`；快照查询超时后以 NaN/缺失呈现，而非阻塞发布器。
 
 RocketMQ 属性（`reliable-event.rocketmq`，未知属性会报错）：

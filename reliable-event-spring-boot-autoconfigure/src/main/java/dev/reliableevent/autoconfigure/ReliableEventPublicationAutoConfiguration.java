@@ -1,9 +1,9 @@
 package dev.reliableevent.autoconfigure;
 
 import dev.reliableevent.spi.EventTransport;
-import dev.reliableevent.jdbc.internal.cycle.JdbcEventPublicationCycle;
 import dev.reliableevent.jdbc.internal.publication.JdbcEventPublicationWorker;
 import dev.reliableevent.jdbc.internal.observation.PublicationObserver;
+import dev.reliableevent.jdbc.internal.persistence.JdbcPublicationStore;
 import dev.reliableevent.jdbc.internal.recovery.JdbcExpiredLeaseRecovery;
 import dev.reliableevent.jdbc.internal.retry.ExponentialBackoff;
 import dev.reliableevent.jdbc.internal.tracing.PublicationTracer;
@@ -37,10 +37,23 @@ import java.util.UUID;
 public class ReliableEventPublicationAutoConfiguration {
 
     @Bean
-    @ConditionalOnMissingBean(JdbcEventPublicationWorker.class)
-    JdbcEventPublicationWorker reliableEventWorker(
+    @ConditionalOnMissingBean(JdbcPublicationStore.class)
+    JdbcPublicationStore reliableEventPublicationStore(
             JdbcTemplate jdbcTemplate,
             PlatformTransactionManager transactionManager,
+            ReliableEventProperties properties,
+            ObjectProvider<PublicationObserver> observers
+    ) {
+        properties.validateCore();
+        return new JdbcPublicationStore(jdbcTemplate, transactionManager, Clock.systemUTC(),
+                "reliable-event-" + UUID.randomUUID(), properties.getLeaseDuration(),
+                observers.getIfAvailable(() -> PublicationObserver.NOOP));
+    }
+
+    @Bean
+    @ConditionalOnMissingBean(JdbcEventPublicationWorker.class)
+    JdbcEventPublicationWorker reliableEventWorker(
+            JdbcPublicationStore store,
             EventTransport transport,
             ExponentialBackoff backoff,
             ReliableEventProperties properties,
@@ -48,29 +61,11 @@ public class ReliableEventPublicationAutoConfiguration {
             ObjectProvider<PublicationTracer> tracers
     ) {
         properties.validateCore();
-        return new JdbcEventPublicationWorker(
-                jdbcTemplate,
-                transactionManager,
-                transport,
-                Clock.systemUTC(),
-                properties.getClaimBatchSize(),
-                "reliable-event-" + UUID.randomUUID(),
-                properties.getLeaseDuration(),
-                backoff,
+        return new JdbcEventPublicationWorker(store, transport, Clock.systemUTC(), backoff,
                 observers.getIfAvailable(() -> PublicationObserver.NOOP),
                 properties.isTracingEnabled()
                         ? tracers.getIfAvailable(() -> PublicationTracer.NOOP)
-                        : PublicationTracer.NOOP
-        );
-    }
-
-    @Bean
-    @ConditionalOnMissingBean(JdbcEventPublicationCycle.class)
-    JdbcEventPublicationCycle reliableEventPublicationCycle(
-            JdbcExpiredLeaseRecovery recovery,
-            JdbcEventPublicationWorker worker
-    ) {
-        return new JdbcEventPublicationCycle(recovery, worker);
+                        : PublicationTracer.NOOP);
     }
 
     @Bean
@@ -79,13 +74,14 @@ public class ReliableEventPublicationAutoConfiguration {
     @ConditionalOnMissingBean(ReliableEventScheduler.class)
     ReliableEventScheduler reliableEventScheduler(
             JdbcExpiredLeaseRecovery recovery,
+            JdbcPublicationStore store,
             JdbcEventPublicationWorker worker,
             ReliableEventProperties properties,
             ObjectProvider<PublicationObserver> observers
     ) {
         properties.validateCore();
         return new ReliableEventScheduler(
-                recovery, worker, properties.getClaimBatchSize(),
+                recovery, store, worker, properties.getClaimBatchSize(),
                 properties.getWorkerThreads(), properties.getWorkerQueueCapacity(),
                 properties.getPollInterval(), properties.getShutdownTimeout(),
                 properties.isAdaptivePollingEnabled(), properties.getActivePollInterval(),

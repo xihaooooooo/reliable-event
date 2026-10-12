@@ -1,9 +1,8 @@
 package dev.reliableevent.jdbc.internal.publication;
 
 import dev.reliableevent.jdbc.internal.model.ClaimedEvent;
-import dev.reliableevent.jdbc.internal.model.EventCandidate;
 import dev.reliableevent.jdbc.internal.observation.PublicationObserver;
-import dev.reliableevent.jdbc.internal.persistence.JdbcOutboxRepository;
+import dev.reliableevent.jdbc.internal.persistence.JdbcPublicationStore;
 import dev.reliableevent.jdbc.internal.persistence.StaleEventClaimException;
 import dev.reliableevent.jdbc.internal.retry.ExponentialBackoff;
 import dev.reliableevent.jdbc.internal.tracing.PublicationTracer;
@@ -15,171 +14,36 @@ import dev.reliableevent.spi.TransportReceipt;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.slf4j.spi.LoggingEventBuilder;
-import org.springframework.jdbc.core.JdbcTemplate;
-import org.springframework.transaction.PlatformTransactionManager;
-import org.springframework.transaction.support.TransactionTemplate;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 
 import java.time.Clock;
-import java.time.Duration;
 import java.time.Instant;
-import java.util.List;
 import java.util.Objects;
-import java.util.Optional;
 
 public final class JdbcEventPublicationWorker {
 
     private static final Logger LOG = LoggerFactory.getLogger(JdbcEventPublicationWorker.class);
-    private static final int MAX_WORKER_ID_LENGTH = 128;
-
-    private final JdbcOutboxRepository repository;
+    private final JdbcPublicationStore store;
     private final EventTransport transport;
-    private final TransactionTemplate transaction;
     private final Clock clock;
-    private final int batchSize;
     private final ExponentialBackoff backoff;
-    private final String workerId;
-    private final Duration leaseDuration;
     private final PublicationObserver observer;
     private final PublicationTracer publicationTracer;
 
     public JdbcEventPublicationWorker(
-            JdbcTemplate jdbcTemplate,
-            PlatformTransactionManager transactionManager,
+            JdbcPublicationStore store,
             EventTransport transport,
             Clock clock,
-            int batchSize,
-            String workerId,
-            Duration leaseDuration
-    ) {
-        this(
-                jdbcTemplate,
-                transactionManager,
-                transport,
-                clock,
-                batchSize,
-                workerId,
-                leaseDuration,
-                ExponentialBackoff.defaults()
-        );
-    }
-
-    public JdbcEventPublicationWorker(
-            JdbcTemplate jdbcTemplate,
-            PlatformTransactionManager transactionManager,
-            EventTransport transport,
-            Clock clock,
-            int batchSize,
-            String workerId,
-            Duration leaseDuration,
-            ExponentialBackoff backoff
-    ) {
-        this(jdbcTemplate, transactionManager, transport, clock, batchSize, workerId,
-                leaseDuration, backoff, PublicationObserver.NOOP, PublicationTracer.NOOP);
-    }
-
-    public JdbcEventPublicationWorker(
-            JdbcTemplate jdbcTemplate,
-            PlatformTransactionManager transactionManager,
-            EventTransport transport,
-            Clock clock,
-            int batchSize,
-            String workerId,
-            Duration leaseDuration,
-            ExponentialBackoff backoff,
-            PublicationObserver observer
-    ) {
-        this(jdbcTemplate, transactionManager, transport, clock, batchSize, workerId,
-                leaseDuration, backoff, observer, PublicationTracer.NOOP);
-    }
-
-    public JdbcEventPublicationWorker(
-            JdbcTemplate jdbcTemplate,
-            PlatformTransactionManager transactionManager,
-            EventTransport transport,
-            Clock clock,
-            int batchSize,
-            String workerId,
-            Duration leaseDuration,
             ExponentialBackoff backoff,
             PublicationObserver observer,
             PublicationTracer publicationTracer
     ) {
-        if (batchSize <= 0) {
-            throw new IllegalArgumentException("batchSize must be positive");
-        }
-        if (workerId == null || workerId.isBlank()) {
-            throw new IllegalArgumentException("workerId must not be blank");
-        }
-        if (workerId.codePointCount(0, workerId.length()) > MAX_WORKER_ID_LENGTH) {
-            throw new IllegalArgumentException("workerId must not exceed 128 characters");
-        }
-        Objects.requireNonNull(leaseDuration, "leaseDuration must not be null");
-        if (leaseDuration.toMillis() <= 0) {
-            throw new IllegalArgumentException("leaseDuration must be at least one millisecond");
-        }
-        Math.multiplyExact(leaseDuration.toMillis(), 1_000L);
-        this.repository = new JdbcOutboxRepository(Objects.requireNonNull(jdbcTemplate));
-        this.transaction = new TransactionTemplate(Objects.requireNonNull(transactionManager));
+        this.store = Objects.requireNonNull(store);
         this.transport = Objects.requireNonNull(transport);
         this.clock = Objects.requireNonNull(clock);
-        this.batchSize = batchSize;
-        this.workerId = workerId;
-        this.leaseDuration = leaseDuration;
         this.backoff = Objects.requireNonNull(backoff);
         this.observer = Objects.requireNonNull(observer);
         this.publicationTracer = Objects.requireNonNull(publicationTracer);
-    }
-
-    public int publishDueEvents() {
-        List<EventCandidate> candidates;
-        try {
-            candidates = findDueEventCandidates(batchSize);
-        } catch (RuntimeException failure) {
-            observe(() -> observer.schedulerCycleFailed(false, "candidate_scan"));
-            throw failure;
-        }
-        try {
-            return publishCandidates(candidates);
-        } catch (RuntimeException failure) {
-            observe(() -> observer.schedulerCycleFailed(false, "dispatch"));
-            throw failure;
-        }
-    }
-
-    public List<EventCandidate> findDueEventCandidates(int limit) {
-        if (limit <= 0) {
-            throw new IllegalArgumentException("limit must be positive");
-        }
-        return repository.findDueEventCandidates(clock.instant(), limit);
-    }
-
-    public int publishCandidates(List<EventCandidate> candidates) {
-        Objects.requireNonNull(candidates, "candidates must not be null");
-        int publishedCount = 0;
-        for (EventCandidate candidate : candidates) {
-            if (publishCandidate(candidate)) {
-                publishedCount++;
-            }
-        }
-        return publishedCount;
-    }
-
-    public boolean publishCandidate(EventCandidate candidate) {
-        return claimCandidate(candidate).map(this::publishClaimedEvent).orElse(false);
-    }
-
-    public Optional<ClaimedEvent> claimCandidate(EventCandidate candidate) {
-        Objects.requireNonNull(candidate, "candidate must not be null");
-        Instant now = clock.instant();
-        return transaction.execute(
-                status -> repository.claim(
-                        candidate,
-                        now,
-                        workerId,
-                        leaseDuration
-                )
-        );
     }
 
     public boolean publishClaimedEvent(ClaimedEvent claimedEvent) {
@@ -256,13 +120,7 @@ public final class JdbcEventPublicationWorker {
         }
         boolean outerTransaction = TransactionSynchronizationManager.isActualTransactionActive();
         try {
-            transaction.executeWithoutResult(
-                    status -> {
-                        repository.markPublished(claimedEvent, clock.instant());
-                        afterCommit("PUBLISHED");
-                    }
-            );
-            observe(() -> observer.stateUpdated("PUBLISHED", outerTransaction));
+            store.markPublished(claimedEvent);
             safelyTrace(() -> tracing.stateUpdated("PUBLISHED", outerTransaction));
             var persistedLog = eventLog(LOG.atInfo(), claimedEvent)
                     .addKeyValue("event", "reliable_event.publish.persisted")
@@ -279,8 +137,6 @@ public final class JdbcEventPublicationWorker {
                                 claimedEvent.leaseOwner(), messageId);
             }
         } catch (RuntimeException stateFailure) {
-            observe(() -> observer.stateUpdateFailed("PUBLISHED",
-                    stateFailure instanceof StaleEventClaimException));
             safelyTrace(() -> tracing.stateUpdateFailed("PUBLISHED", stateFailure,
                     stateFailure instanceof StaleEventClaimException));
             logStateFailure(claimedEvent, stateFailure);
@@ -297,15 +153,9 @@ public final class JdbcEventPublicationWorker {
 
         if (failureType == TransportFailureType.NON_RETRYABLE || !claimedEvent.canRetry()) {
             try {
-                transaction.executeWithoutResult(status -> {
-                    repository.markDead(claimedEvent, failedAt, lastError);
-                    afterCommit("DEAD");
-                });
-                observe(() -> observer.stateUpdated("DEAD", outerTransaction));
+                store.markDead(claimedEvent, failedAt, lastError);
                 safelyTrace(() -> tracing.stateUpdated("DEAD", outerTransaction));
             } catch (RuntimeException stateFailure) {
-                observe(() -> observer.stateUpdateFailed("DEAD",
-                        stateFailure instanceof StaleEventClaimException));
                 safelyTrace(() -> tracing.stateUpdateFailed("DEAD", stateFailure,
                         stateFailure instanceof StaleEventClaimException));
                 throw stateFailure;
@@ -315,13 +165,9 @@ public final class JdbcEventPublicationWorker {
 
         Instant nextAttemptAt = failedAt.plus(backoff.nextDelay(claimedEvent.attemptCount()));
         try {
-            transaction.executeWithoutResult(status -> repository.markRetryWait(
-                    claimedEvent, failedAt, nextAttemptAt, lastError));
-            observe(() -> observer.stateUpdated("RETRY_WAIT", outerTransaction));
+            store.markRetryWait(claimedEvent, failedAt, nextAttemptAt, lastError);
             safelyTrace(() -> tracing.stateUpdated("RETRY_WAIT", outerTransaction));
         } catch (RuntimeException stateFailure) {
-            observe(() -> observer.stateUpdateFailed("RETRY_WAIT",
-                    stateFailure instanceof StaleEventClaimException));
             safelyTrace(() -> tracing.stateUpdateFailed("RETRY_WAIT", stateFailure,
                     stateFailure instanceof StaleEventClaimException));
             throw stateFailure;
@@ -380,14 +226,4 @@ public final class JdbcEventPublicationWorker {
         }
     }
 
-    private void afterCommit(String status) {
-        if (TransactionSynchronizationManager.isSynchronizationActive()) {
-            TransactionSynchronizationManager.registerSynchronization(
-                    new org.springframework.transaction.support.TransactionSynchronization() {
-                        @Override public void afterCommit() {
-                            observe(() -> observer.stateTransitionCommitted(status));
-                        }
-                    });
-        }
-    }
 }

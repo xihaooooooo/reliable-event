@@ -123,9 +123,11 @@ class MetricsSnapshotSamplerTest {
         });
         dev.reliableevent.jdbc.internal.publication.JdbcEventPublicationWorker worker =
                 mock(dev.reliableevent.jdbc.internal.publication.JdbcEventPublicationWorker.class);
+        dev.reliableevent.jdbc.internal.persistence.JdbcPublicationStore store =
+                mock(dev.reliableevent.jdbc.internal.persistence.JdbcPublicationStore.class);
         MetricsSnapshotSampler firstSampler = new MetricsSnapshotSampler(firstObserver, true,
                 Duration.ofMillis(10), Duration.ofMillis(80), Duration.ofMillis(250));
-        ReliableEventScheduler scheduler = new ReliableEventScheduler(recovery, worker, 1, 1, 0,
+        ReliableEventScheduler scheduler = new ReliableEventScheduler(recovery, store, worker, 1, 1, 0,
                 Duration.ofSeconds(10), Duration.ofMillis(250), false, Duration.ofMillis(1), firstObserver);
         RecordingLifecycle recordedSampler = new RecordingLifecycle(firstSampler);
         RecordingLifecycle recordedScheduler = new RecordingLifecycle(scheduler);

@@ -4,7 +4,11 @@ import dev.reliableevent.spi.OutboundEvent;
 import dev.reliableevent.spi.EventTransport;
 import dev.reliableevent.spi.TransportReceipt;
 import dev.reliableevent.jdbc.internal.model.EventCandidate;
+import dev.reliableevent.jdbc.internal.model.ClaimedEvent;
 import dev.reliableevent.jdbc.internal.publication.JdbcEventPublicationWorker;
+import dev.reliableevent.jdbc.internal.persistence.JdbcPublicationStore;
+import dev.reliableevent.jdbc.internal.observation.PublicationObserver;
+import dev.reliableevent.jdbc.internal.tracing.PublicationTracer;
 import dev.reliableevent.jdbc.internal.retry.ExponentialBackoff;
 import dev.reliableevent.rocketmq.MapEventDestinationResolver;
 import dev.reliableevent.rocketmq.RocketMqDestination;
@@ -45,12 +49,11 @@ public final class RocketMqExampleCrashProcess {
         dataSource.setPassword(password);
         JdbcTemplate jdbc = new JdbcTemplate(dataSource);
         DataSourceTransactionManager transactions = new DataSourceTransactionManager(dataSource);
-        JdbcEventPublicationWorker uninitializedWorker = new JdbcEventPublicationWorker(
-                jdbc, transactions, event -> { throw new IllegalStateException("sender not initialized"); },
-                Clock.systemUTC(), 8, "rocket-example-child-" + ProcessHandle.current().pid(),
-                Duration.ofSeconds(15),
-                new ExponentialBackoff(Duration.ofMillis(1), Duration.ofMillis(1), 0.0, () -> 0.0));
-        EventCandidate candidate = uninitializedWorker.findDueEventCandidates(32).stream()
+        String workerId = "rocket-example-child-" + ProcessHandle.current().pid();
+        Clock clock = Clock.systemUTC();
+        JdbcPublicationStore store = new JdbcPublicationStore(jdbc, transactions, clock, workerId,
+                Duration.ofSeconds(15), PublicationObserver.NOOP);
+        EventCandidate candidate = store.findDueEventCandidates(32).stream()
                 .filter(item -> item.id().value() == eventId)
                 .findFirst().orElseThrow(() -> new IllegalStateException("event candidate not found"));
 
@@ -74,11 +77,11 @@ public final class RocketMqExampleCrashProcess {
             awaitParentKill();
             return receipt;
         };
-        JdbcEventPublicationWorker worker = new JdbcEventPublicationWorker(
-                jdbc, transactions, holdAfterRealConfirmation, Clock.systemUTC(), 8,
-                "rocket-example-child-" + ProcessHandle.current().pid(), Duration.ofSeconds(15),
-                new ExponentialBackoff(Duration.ofMillis(1), Duration.ofMillis(1), 0.0, () -> 0.0));
-        worker.publishCandidate(candidate);
+        ClaimedEvent claimed = store.claimCandidate(candidate).orElseThrow();
+        JdbcEventPublicationWorker worker = new JdbcEventPublicationWorker(store, holdAfterRealConfirmation,
+                clock, new ExponentialBackoff(Duration.ofMillis(1), Duration.ofMillis(1), 0.0),
+                PublicationObserver.NOOP, PublicationTracer.NOOP);
+        worker.publishClaimedEvent(claimed);
     }
 
     private static void writeReady(Path marker, String contents) {

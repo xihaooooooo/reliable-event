@@ -23,6 +23,9 @@ example:
     consumer-group: ${EXAMPLE_ROCKETMQ_GROUP:reliable-event-example-consumer}
 
 reliable-event:
+  initial-retry-delay: 1s
+  max-retry-delay: 5m
+  retry-jitter-ratio: 0.2
   poll-interval: 200ms
   rocketmq:
     endpoints: ${EXAMPLE_ROCKETMQ_ENDPOINT:localhost:8081}

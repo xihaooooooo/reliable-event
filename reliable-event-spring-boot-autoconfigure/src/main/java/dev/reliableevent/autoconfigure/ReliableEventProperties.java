@@ -1,6 +1,7 @@
 package dev.reliableevent.autoconfigure;
 
 import dev.reliableevent.jdbc.JdbcPublishedEventRetention;
+import dev.reliableevent.jdbc.internal.retry.ExponentialBackoff;
 import org.springframework.boot.context.properties.ConfigurationProperties;
 
 import java.time.Duration;
@@ -36,8 +37,9 @@ public class ReliableEventProperties {
     private Duration metricsSnapshotShutdownTimeout = Duration.ofSeconds(2);
     private Duration leaseDuration = Duration.ofSeconds(30);
     private int maxAttempts = 8;
-    private Duration initialRetryDelay = Duration.ofSeconds(1);
-    private Duration maxRetryDelay = Duration.ofMinutes(5);
+    private Duration initialRetryDelay;
+    private Duration maxRetryDelay;
+    private Double retryJitterRatio;
 
     private String transport;
     public String getTransport() { return transport; }
@@ -106,6 +108,8 @@ public class ReliableEventProperties {
     public void setInitialRetryDelay(Duration initialRetryDelay) { this.initialRetryDelay = initialRetryDelay; }
     public Duration getMaxRetryDelay() { return maxRetryDelay; }
     public void setMaxRetryDelay(Duration maxRetryDelay) { this.maxRetryDelay = maxRetryDelay; }
+    public Double getRetryJitterRatio() { return retryJitterRatio; }
+    public void setRetryJitterRatio(Double retryJitterRatio) { this.retryJitterRatio = retryJitterRatio; }
 
     public void validateCore() {
         positive(claimBatchSize, "claim-batch-size");
@@ -132,10 +136,28 @@ public class ReliableEventProperties {
         } catch (ArithmeticException exception) {
             throw invalid("lease-duration", "is too large");
         }
+        validateRetry();
+    }
+
+    public void validateRetry() {
+        if (initialRetryDelay == null) {
+            throw invalid("initial-retry-delay", "must be configured");
+        }
+        if (maxRetryDelay == null) {
+            throw invalid("max-retry-delay", "must be configured");
+        }
+        if (retryJitterRatio == null) {
+            throw invalid("retry-jitter-ratio", "must be configured");
+        }
         long initial = positiveMillis(initialRetryDelay, "initial-retry-delay");
         long maximum = positiveMillis(maxRetryDelay, "max-retry-delay");
         if (maximum < initial) {
             throw invalid("max-retry-delay", "must be at least initial-retry-delay");
+        }
+        if (!Double.isFinite(retryJitterRatio)
+                || retryJitterRatio < 0.0
+                || retryJitterRatio > ExponentialBackoff.MAX_JITTER_RATIO) {
+            throw invalid("retry-jitter-ratio", "must be between 0.0 and 0.2");
         }
     }
 

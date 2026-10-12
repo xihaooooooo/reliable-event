@@ -5,6 +5,7 @@ import dev.reliableevent.internal.model.StoredEvent;
 import dev.reliableevent.jdbc.internal.model.ClaimedEvent;
 import dev.reliableevent.jdbc.internal.model.EventStatus;
 import dev.reliableevent.jdbc.internal.observation.PublicationObserver;
+import dev.reliableevent.jdbc.internal.persistence.JdbcPublicationStore;
 import dev.reliableevent.jdbc.internal.retry.ExponentialBackoff;
 import dev.reliableevent.spi.EventTransport;
 import dev.reliableevent.spi.OutboundEvent;
@@ -49,8 +50,10 @@ class JdbcEventPublicationWorkerTest {
             updates.add(java.util.Arrays.toString(invocation.getArguments()));
             return 1;
         });
-        return new JdbcEventPublicationWorker(jdbc, transactions, transport, Clock.systemUTC(),
-                10, "worker-test", Duration.ofSeconds(30), ExponentialBackoff.defaults(), observer);
+        JdbcPublicationStore store = new JdbcPublicationStore(jdbc, transactions, Clock.systemUTC(),
+                "worker-test", Duration.ofSeconds(30), observer);
+        return new JdbcEventPublicationWorker(store, transport, Clock.systemUTC(),
+                new ExponentialBackoff(java.time.Duration.ofSeconds(1), java.time.Duration.ofMinutes(5), 0.2), observer, dev.reliableevent.jdbc.internal.tracing.PublicationTracer.NOOP);
     }
 
     @Test

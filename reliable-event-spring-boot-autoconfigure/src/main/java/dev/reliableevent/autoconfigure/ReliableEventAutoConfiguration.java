@@ -25,7 +25,6 @@ import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.transaction.PlatformTransactionManager;
 
 import javax.sql.DataSource;
-import java.util.concurrent.ThreadLocalRandom;
 
 @AutoConfiguration(afterName = {
         "org.springframework.boot.autoconfigure.jdbc.DataSourceAutoConfiguration",
@@ -36,6 +35,11 @@ import java.util.concurrent.ThreadLocalRandom;
 @ConditionalOnProperty(prefix = "reliable-event", name = "enabled", havingValue = "true", matchIfMissing = true)
 @EnableConfigurationProperties(ReliableEventProperties.class)
 public class ReliableEventAutoConfiguration {
+
+    @Bean
+    InitializingBean reliableEventRetryPropertiesValidation(ReliableEventProperties properties) {
+        return properties::validateRetry;
+    }
 
     @Bean
     InitializingBean reliableEventRetentionPropertiesValidation(ReliableEventProperties properties) {
@@ -71,8 +75,7 @@ public class ReliableEventAutoConfiguration {
             return new ExponentialBackoff(
                     properties.getInitialRetryDelay(),
                     properties.getMaxRetryDelay(),
-                    0.2,
-                    () -> ThreadLocalRandom.current().nextDouble()
+                    properties.getRetryJitterRatio()
             );
         }
 

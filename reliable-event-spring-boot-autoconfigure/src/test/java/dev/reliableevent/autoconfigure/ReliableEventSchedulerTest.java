@@ -4,6 +4,7 @@ import dev.reliableevent.EventId;
 import dev.reliableevent.jdbc.internal.model.EventCandidate;
 import dev.reliableevent.jdbc.internal.model.ClaimedEvent;
 import dev.reliableevent.jdbc.internal.publication.JdbcEventPublicationWorker;
+import dev.reliableevent.jdbc.internal.persistence.JdbcPublicationStore;
 import dev.reliableevent.jdbc.internal.recovery.JdbcExpiredLeaseRecovery;
 import org.junit.jupiter.api.Test;
 
@@ -21,7 +22,9 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.awaitility.Awaitility.await;
 import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -30,6 +33,7 @@ class ReliableEventSchedulerTest {
     @Test
     void stopCancelsQueuedCandidatesAndWaitsForTheWholeActiveTask() throws Exception {
         JdbcExpiredLeaseRecovery recovery = mock(JdbcExpiredLeaseRecovery.class);
+        JdbcPublicationStore store = mock(JdbcPublicationStore.class);
         JdbcEventPublicationWorker worker = mock(JdbcEventPublicationWorker.class);
         EventCandidate first = new EventCandidate(new EventId(1), 0);
         EventCandidate queued = new EventCandidate(new EventId(2), 0);
@@ -39,8 +43,8 @@ class ReliableEventSchedulerTest {
         CountDownLatch callback = new CountDownLatch(1);
         AtomicBoolean publicationCompleted = new AtomicBoolean();
         AtomicBoolean callbackAfterPublication = new AtomicBoolean();
-        when(worker.findDueEventCandidates(anyInt())).thenReturn(List.of(first, queued));
-        when(worker.claimCandidate(first)).thenReturn(Optional.of(claim));
+        when(store.findDueEventCandidates(anyInt())).thenReturn(List.of(first, queued));
+        when(store.claimCandidate(first)).thenReturn(Optional.of(claim));
         when(worker.publishClaimedEvent(claim)).thenAnswer(invocation -> {
             publishing.countDown();
             if (!release.await(5, TimeUnit.SECONDS)) {
@@ -51,7 +55,7 @@ class ReliableEventSchedulerTest {
         });
 
         ReliableEventScheduler scheduler = new ReliableEventScheduler(
-                recovery, worker, 2, 1, 1, Duration.ofSeconds(1), Duration.ofSeconds(3));
+                recovery, store, worker, 2, 1, 1, Duration.ofSeconds(1), Duration.ofSeconds(3));
         try {
             assertThat(scheduler.dispatchOnce().submittedCount()).isEqualTo(2);
             assertThat(publishing.await(5, TimeUnit.SECONDS)).isTrue();
@@ -63,7 +67,7 @@ class ReliableEventSchedulerTest {
                     .untilAsserted(() -> assertThat(scheduler.outstandingCount()).isOne());
             assertThat(callback.getCount()).isOne();
             assertThat(scheduler.dispatchOnce().submittedCount()).isZero();
-            verify(worker, never()).claimCandidate(queued);
+            verify(store, never()).claimCandidate(queued);
 
             release.countDown();
             assertThat(callback.await(5, TimeUnit.SECONDS)).isTrue();
@@ -79,6 +83,7 @@ class ReliableEventSchedulerTest {
     @Test
     void timeoutSkipsSendingWhenAClaimFinishesAfterShutdown() throws Exception {
         JdbcExpiredLeaseRecovery recovery = mock(JdbcExpiredLeaseRecovery.class);
+        JdbcPublicationStore store = mock(JdbcPublicationStore.class);
         JdbcEventPublicationWorker worker = mock(JdbcEventPublicationWorker.class);
         EventCandidate candidate = new EventCandidate(new EventId(3), 0);
         ClaimedEvent claim = mock(ClaimedEvent.class);
@@ -86,8 +91,8 @@ class ReliableEventSchedulerTest {
         CountDownLatch releaseClaim = new CountDownLatch(1);
         CountDownLatch callback = new CountDownLatch(1);
         AtomicInteger callbackCount = new AtomicInteger();
-        when(worker.findDueEventCandidates(anyInt())).thenReturn(List.of(candidate));
-        when(worker.claimCandidate(candidate)).thenAnswer(invocation -> {
+        when(store.findDueEventCandidates(anyInt())).thenReturn(List.of(candidate));
+        when(store.claimCandidate(candidate)).thenAnswer(invocation -> {
             claimStarted.countDown();
             while (releaseClaim.getCount() != 0) {
                 try {
@@ -100,7 +105,7 @@ class ReliableEventSchedulerTest {
         });
 
         ReliableEventScheduler scheduler = new ReliableEventScheduler(
-                recovery, worker, 1, 1, 0, Duration.ofSeconds(1), Duration.ofMillis(100));
+                recovery, store, worker, 1, 1, 0, Duration.ofSeconds(1), Duration.ofMillis(100));
         try {
             assertThat(scheduler.dispatchOnce().submittedCount()).isOne();
             assertThat(claimStarted.await(5, TimeUnit.SECONDS)).isTrue();
@@ -126,6 +131,7 @@ class ReliableEventSchedulerTest {
     @Test
     void queuedCandidateIsNotClaimedAndLocalCapacityBoundsDispatch() throws Exception {
         JdbcExpiredLeaseRecovery recovery = mock(JdbcExpiredLeaseRecovery.class);
+        JdbcPublicationStore store = mock(JdbcPublicationStore.class);
         JdbcEventPublicationWorker worker = mock(JdbcEventPublicationWorker.class);
         EventCandidate first = new EventCandidate(new EventId(1), 0);
         EventCandidate second = new EventCandidate(new EventId(2), 0);
@@ -135,9 +141,9 @@ class ReliableEventSchedulerTest {
         CountDownLatch secondStarted = new CountDownLatch(1);
         ClaimedEvent firstClaim = mock(ClaimedEvent.class);
         ClaimedEvent secondClaim = mock(ClaimedEvent.class);
-        when(worker.findDueEventCandidates(anyInt())).thenReturn(List.of(first, second, third));
-        when(worker.claimCandidate(first)).thenReturn(Optional.of(firstClaim));
-        when(worker.claimCandidate(second)).thenReturn(Optional.of(secondClaim));
+        when(store.findDueEventCandidates(anyInt())).thenReturn(List.of(first, second, third));
+        when(store.claimCandidate(first)).thenReturn(Optional.of(firstClaim));
+        when(store.claimCandidate(second)).thenReturn(Optional.of(secondClaim));
         when(worker.publishClaimedEvent(firstClaim)).thenAnswer(invocation -> {
             firstStarted.countDown();
             if (!releaseFirst.await(5, TimeUnit.SECONDS)) {
@@ -151,14 +157,14 @@ class ReliableEventSchedulerTest {
         });
 
         ReliableEventScheduler scheduler = new ReliableEventScheduler(
-                recovery, worker, 3, 1, 1, Duration.ofSeconds(1)
+                recovery, store, worker, 3, 1, 1, Duration.ofSeconds(1)
         );
         try {
             assertThat(scheduler.dispatchOnce()).isEqualTo(new AsyncPublicationCycleResult(0, 2));
             assertThat(firstStarted.await(5, TimeUnit.SECONDS)).isTrue();
             assertThat(scheduler.dispatchOnce().submittedCount()).isZero();
-            verify(worker, never()).claimCandidate(second);
-            verify(worker, never()).claimCandidate(third);
+            verify(store, never()).claimCandidate(second);
+            verify(store, never()).claimCandidate(third);
 
             releaseFirst.countDown();
             assertThat(secondStarted.await(5, TimeUnit.SECONDS)).isTrue();
@@ -171,23 +177,57 @@ class ReliableEventSchedulerTest {
     @Test
     void scanFailureDoesNotCancelLaterScheduledRounds() throws Exception {
         JdbcExpiredLeaseRecovery recovery = mock(JdbcExpiredLeaseRecovery.class);
+        JdbcPublicationStore store = mock(JdbcPublicationStore.class);
         JdbcEventPublicationWorker worker = mock(JdbcEventPublicationWorker.class);
         CountDownLatch nextRound = new CountDownLatch(1);
+        CountDownLatch scanAfterRecovery = new CountDownLatch(1);
         when(recovery.recoverExpiredLeases())
                 .thenThrow(new IllegalStateException("database unavailable"))
                 .thenAnswer(invocation -> {
                     nextRound.countDown();
                     return 0;
                 });
-        when(worker.findDueEventCandidates(anyInt())).thenReturn(List.of());
+        when(store.findDueEventCandidates(anyInt())).thenAnswer(invocation -> {
+            scanAfterRecovery.countDown();
+            return List.of();
+        });
 
         ReliableEventScheduler scheduler = new ReliableEventScheduler(
-                recovery, worker, 1, 1, 0, Duration.ofMillis(10)
+                recovery, store, worker, 1, 1, 0, Duration.ofMillis(10)
         );
         try {
             scheduler.start();
             assertThat(nextRound.await(5, TimeUnit.SECONDS)).isTrue();
+            assertThat(scanAfterRecovery.await(5, TimeUnit.SECONDS)).isTrue();
             assertThat(scheduler.isRunning()).isTrue();
+        } finally {
+            scheduler.stop();
+        }
+    }
+
+    @Test
+    void recoveryRunsBeforeCandidateScanAndFailurePreventsScanning() {
+        JdbcExpiredLeaseRecovery recovery = mock(JdbcExpiredLeaseRecovery.class);
+        JdbcPublicationStore store = mock(JdbcPublicationStore.class);
+        JdbcEventPublicationWorker worker = mock(JdbcEventPublicationWorker.class);
+        when(recovery.recoverExpiredLeases())
+                .thenThrow(new IllegalStateException("database unavailable"))
+                .thenReturn(0);
+
+        ReliableEventScheduler scheduler = new ReliableEventScheduler(
+                recovery, store, worker, 1, 1, 0, Duration.ofMillis(10)
+        );
+        try {
+            assertThatThrownBy(scheduler::dispatchOnce)
+                    .isInstanceOf(IllegalStateException.class)
+                    .hasMessage("database unavailable");
+            verify(store, never()).findDueEventCandidates(anyInt());
+
+            scheduler.dispatchOnce();
+
+            var order = inOrder(recovery, store);
+            order.verify(recovery, times(2)).recoverExpiredLeases();
+            order.verify(store).findDueEventCandidates(anyInt());
         } finally {
             scheduler.stop();
         }
@@ -196,19 +236,20 @@ class ReliableEventSchedulerTest {
     @Test
     void adaptivePollingScansAgainWhenBusyAndReturnsToIdleDelay() throws Exception {
         JdbcExpiredLeaseRecovery recovery = mock(JdbcExpiredLeaseRecovery.class);
+        JdbcPublicationStore store = mock(JdbcPublicationStore.class);
         JdbcEventPublicationWorker worker = mock(JdbcEventPublicationWorker.class);
         EventCandidate candidate = new EventCandidate(new EventId(10), 0);
         List<Long> scanTimes = new CopyOnWriteArrayList<>();
         CountDownLatch threeScans = new CountDownLatch(3);
-        when(worker.findDueEventCandidates(anyInt())).thenAnswer(invocation -> {
+        when(store.findDueEventCandidates(anyInt())).thenAnswer(invocation -> {
             scanTimes.add(System.nanoTime());
             threeScans.countDown();
             return scanTimes.size() == 1 ? List.of(candidate) : List.of();
         });
-        when(worker.claimCandidate(candidate)).thenReturn(Optional.empty());
+        when(store.claimCandidate(candidate)).thenReturn(Optional.empty());
 
         ReliableEventScheduler scheduler = new ReliableEventScheduler(
-                recovery, worker, 1, 1, 0, Duration.ofMillis(600), Duration.ofSeconds(2),
+                recovery, store, worker, 1, 1, 0, Duration.ofMillis(600), Duration.ofSeconds(2),
                 true, Duration.ofMillis(50));
         try {
             scheduler.start();
@@ -225,6 +266,7 @@ class ReliableEventSchedulerTest {
     @Test
     void adaptivePollingUsesRateLimitWhileWorkIsInFlight() throws Exception {
         JdbcExpiredLeaseRecovery recovery = mock(JdbcExpiredLeaseRecovery.class);
+        JdbcPublicationStore store = mock(JdbcPublicationStore.class);
         JdbcEventPublicationWorker worker = mock(JdbcEventPublicationWorker.class);
         EventCandidate candidate = new EventCandidate(new EventId(11), 0);
         CountDownLatch release = new CountDownLatch(1);
@@ -235,14 +277,14 @@ class ReliableEventSchedulerTest {
             threeRecoveryScans.countDown();
             return 0;
         });
-        when(worker.findDueEventCandidates(anyInt())).thenReturn(List.of(candidate));
-        when(worker.claimCandidate(candidate)).thenAnswer(invocation -> {
+        when(store.findDueEventCandidates(anyInt())).thenReturn(List.of(candidate));
+        when(store.claimCandidate(candidate)).thenAnswer(invocation -> {
             release.await(3, TimeUnit.SECONDS);
             return Optional.empty();
         });
 
         ReliableEventScheduler scheduler = new ReliableEventScheduler(
-                recovery, worker, 1, 1, 0, Duration.ofSeconds(1), Duration.ofSeconds(2),
+                recovery, store, worker, 1, 1, 0, Duration.ofSeconds(1), Duration.ofSeconds(2),
                 true, Duration.ofMillis(100));
         try {
             scheduler.start();
@@ -260,6 +302,7 @@ class ReliableEventSchedulerTest {
     @Test
     void adaptivePollingRefillsSoonAfterCapacityIsReleasedDuringAScan() throws Exception {
         JdbcExpiredLeaseRecovery recovery = mock(JdbcExpiredLeaseRecovery.class);
+        JdbcPublicationStore store = mock(JdbcPublicationStore.class);
         JdbcEventPublicationWorker worker = mock(JdbcEventPublicationWorker.class);
         EventCandidate candidate = new EventCandidate(new EventId(12), 0);
         CountDownLatch claimStarted = new CountDownLatch(1);
@@ -282,15 +325,15 @@ class ReliableEventSchedulerTest {
             }
             return null;
         }).when(recovery).refreshSnapshotAutomatically();
-        when(worker.findDueEventCandidates(anyInt())).thenReturn(List.of(candidate));
-        when(worker.claimCandidate(candidate)).thenAnswer(invocation -> {
+        when(store.findDueEventCandidates(anyInt())).thenReturn(List.of(candidate));
+        when(store.claimCandidate(candidate)).thenAnswer(invocation -> {
             claimStarted.countDown();
             releaseClaim.await(3, TimeUnit.SECONDS);
             return Optional.empty();
         });
 
         ReliableEventScheduler scheduler = new ReliableEventScheduler(
-                recovery, worker, 1, 1, 0, Duration.ofSeconds(1), Duration.ofSeconds(2),
+                recovery, store, worker, 1, 1, 0, Duration.ofSeconds(1), Duration.ofSeconds(2),
                 true, Duration.ofMillis(50));
         try {
             scheduler.start();

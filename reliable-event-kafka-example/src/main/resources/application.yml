@@ -27,6 +27,9 @@ example:
     partitions: ${EXAMPLE_KAFKA_PARTITIONS:1}
     replication-factor: ${EXAMPLE_KAFKA_REPLICATION_FACTOR:1}
 reliable-event:
+  initial-retry-delay: 1s
+  max-retry-delay: 5m
+  retry-jitter-ratio: 0.2
   transport: kafka
   lease-duration: 30s
   poll-interval: 200ms

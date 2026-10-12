@@ -9,6 +9,9 @@ spring:
       maximum-pool-size: ${BENCHMARK_DB_POOL_SIZE:16}
 
 reliable-event:
+  initial-retry-delay: 1s
+  max-retry-delay: 5m
+  retry-jitter-ratio: 0.2
   enabled: ${BENCHMARK_PUBLISHING_ENABLED:false}
   poll-interval: ${BENCHMARK_POLL_INTERVAL:1s}
   adaptive-polling-enabled: ${BENCHMARK_ADAPTIVE_POLLING_ENABLED:false}

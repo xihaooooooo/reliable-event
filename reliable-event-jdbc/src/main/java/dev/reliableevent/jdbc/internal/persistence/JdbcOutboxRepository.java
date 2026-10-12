@@ -29,27 +29,6 @@ import java.util.Optional;
 
 public final class JdbcOutboxRepository {
 
-    private static final String INSERT_IDENTITY = """
-            INSERT INTO reliable_event_identity (event_type, event_key, registered_at)
-            VALUES (?, ?, ?)
-            """;
-
-    private static final String INSERT_EVENT = """
-            INSERT INTO reliable_event_outbox (
-                id,
-                event_type,
-                event_key,
-                payload,
-                headers,
-                status,
-                next_attempt_at,
-                first_available_at,
-                max_attempts,
-                created_at,
-                updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """;
-
     private final JdbcTemplate jdbcTemplate;
 
     public JdbcOutboxRepository(JdbcTemplate jdbcTemplate) {
@@ -68,7 +47,8 @@ public final class JdbcOutboxRepository {
         KeyHolder keyHolder = new GeneratedKeyHolder();
         try {
             jdbcTemplate.update(connection -> {
-                var statement = connection.prepareStatement(INSERT_IDENTITY, Statement.RETURN_GENERATED_KEYS);
+                var statement = connection.prepareStatement(
+                        JdbcOutboxSql.INSERT_IDENTITY, Statement.RETURN_GENERATED_KEYS);
                 statement.setString(1, eventType);
                 statement.setString(2, eventKey);
                 statement.setTimestamp(3, Timestamp.from(createdAt));
@@ -78,10 +58,8 @@ public final class JdbcOutboxRepository {
             // The generated primary key is never supplied; the only possible duplicate
             // for this insert is the unique business identity. A locking read sees a
             // concurrent insert after its owner commits, even under REPEATABLE READ.
-            Long existingId = jdbcTemplate.queryForObject("""
-                    SELECT id FROM reliable_event_identity
-                    WHERE event_type = ? AND event_key = ? FOR UPDATE
-                    """, Long.class, eventType, eventKey);
+            Long existingId = jdbcTemplate.queryForObject(
+                    JdbcOutboxSql.FIND_IDENTITY_FOR_UPDATE, Long.class, eventType, eventKey);
             if (existingId == null) {
                 throw new IllegalStateException("Duplicate identity has no existing id", duplicate);
             }
@@ -92,7 +70,7 @@ public final class JdbcOutboxRepository {
             throw new IllegalStateException("Identity insert completed without returning an event id");
         }
         EventId id = new EventId(generatedKey.longValue());
-        jdbcTemplate.update(INSERT_EVENT,
+        jdbcTemplate.update(JdbcOutboxSql.INSERT_EVENT,
                 id.value(), eventType, eventKey, payloadJson, headersJson,
                 EventStatus.PENDING.code(), Timestamp.from(availableAt),
                 Timestamp.from(availableAt), maxAttempts,
@@ -105,14 +83,7 @@ public final class JdbcOutboxRepository {
             throw new IllegalArgumentException("limit must be positive");
         }
         return jdbcTemplate.query(
-                """
-                SELECT id, version
-                FROM reliable_event_outbox
-                WHERE status IN (?, ?) AND next_attempt_at <= ?
-                  AND attempt_count < max_attempts
-                ORDER BY next_attempt_at, id
-                LIMIT ?
-                """,
+                JdbcOutboxSql.FIND_DUE_EVENT_CANDIDATES,
                 (resultSet, rowNumber) -> new EventCandidate(
                         new EventId(resultSet.getLong("id")),
                         resultSet.getLong("version")
@@ -126,12 +97,7 @@ public final class JdbcOutboxRepository {
 
     public OutboxCounts countStatuses() {
         return jdbcTemplate.query(
-                """
-                SELECT status, COUNT(*) AS total
-                FROM reliable_event_outbox
-                WHERE status IN (?, ?, ?)
-                GROUP BY status
-                """,
+                JdbcOutboxSql.COUNT_STATUSES,
                 resultSet -> {
                     long backlog = 0;
                     long dead = 0;
@@ -153,32 +119,9 @@ public final class JdbcOutboxRepository {
         if (queryTimeoutSeconds <= 0) {
             throw new IllegalArgumentException("queryTimeoutSeconds must be positive");
         }
-        String sql = """
-                SELECT
-                  COALESCE(SUM(status IN (0, 3)), 0) AS backlog,
-                  COALESCE(SUM(status = 4), 0) AS dead,
-                  COALESCE(SUM(status IN (0, 3) AND next_attempt_at <= UTC_TIMESTAMP(3)), 0) AS ready,
-                  CASE
-                    WHEN SUM(status IN (0, 3) AND next_attempt_at <= UTC_TIMESTAMP(3)) = 0 THEN 0
-                    ELSE TIMESTAMPDIFF(MICROSECOND,
-                      MIN(CASE WHEN status IN (0, 3) AND next_attempt_at <= UTC_TIMESTAMP(3)
-                               THEN first_available_at END), UTC_TIMESTAMP(3)) / 1000000.0
-                  END AS ready_oldest_age,
-                  COALESCE(SUM(status IN (0, 1, 3) AND first_available_at <= UTC_TIMESTAMP(3)), 0)
-                    AS unfinished_overdue,
-                  CASE
-                    WHEN SUM(status IN (0, 1, 3) AND first_available_at <= UTC_TIMESTAMP(3)) = 0 THEN 0
-                    ELSE TIMESTAMPDIFF(MICROSECOND,
-                      MIN(CASE WHEN status IN (0, 1, 3) AND first_available_at <= UTC_TIMESTAMP(3)
-                               THEN first_available_at END), UTC_TIMESTAMP(3)) / 1000000.0
-                  END AS unfinished_oldest_age,
-                  COALESCE(SUM(status IN (0, 1, 3) AND first_available_at IS NULL), 0)
-                    AS unfinished_timestamp_missing
-                FROM reliable_event_outbox
-                """;
         try (Connection connection = Objects.requireNonNull(jdbcTemplate.getDataSource(), "DataSource unavailable")
                 .getConnection();
-             PreparedStatement statement = connection.prepareStatement(sql)) {
+             PreparedStatement statement = connection.prepareStatement(JdbcOutboxSql.READ_METRICS_SNAPSHOT)) {
             statement.setQueryTimeout(queryTimeoutSeconds);
             try (ResultSet result = statement.executeQuery()) {
                 if (!result.next()) {
@@ -211,23 +154,7 @@ public final class JdbcOutboxRepository {
             throw new IllegalArgumentException("limit must be positive");
         }
         return jdbcTemplate.query(
-                """
-                SELECT id,
-                       version,
-                       event_type,
-                       event_key,
-                       lease_owner,
-                       lease_until,
-                       attempt_count,
-                       max_attempts
-                FROM reliable_event_outbox
-                WHERE status = ?
-                  AND lease_owner IS NOT NULL
-                  AND TRIM(lease_owner) <> ''
-                  AND lease_until <= UTC_TIMESTAMP(3)
-                ORDER BY lease_until, id
-                LIMIT ?
-                """,
+                JdbcOutboxSql.FIND_EXPIRED_LEASE_CANDIDATES,
                 (resultSet, rowNumber) -> new ExpiredLeaseCandidate(
                         new EventId(resultSet.getLong("id")),
                         resultSet.getLong("version"),
@@ -251,20 +178,7 @@ public final class JdbcOutboxRepository {
     ) {
         long leaseDurationMicros = Math.multiplyExact(leaseDuration.toMillis(), 1_000L);
         int updated = jdbcTemplate.update(
-                """
-                UPDATE reliable_event_outbox
-                SET status = ?,
-                    attempt_count = attempt_count + 1,
-                    lease_owner = ?,
-                    lease_until = TIMESTAMPADD(MICROSECOND, ?, UTC_TIMESTAMP(3)),
-                    version = version + 1,
-                    updated_at = ?
-                WHERE id = ?
-                  AND status IN (?, ?)
-                  AND next_attempt_at <= ?
-                  AND attempt_count < max_attempts
-                  AND version = ?
-                """,
+                JdbcOutboxSql.CLAIM_EVENT,
                 EventStatus.PUBLISHING.code(),
                 leaseOwner,
                 leaseDurationMicros,
@@ -283,21 +197,7 @@ public final class JdbcOutboxRepository {
 
     private ClaimedEvent findClaimedEvent(long eventId) {
         return jdbcTemplate.queryForObject(
-                """
-                SELECT id,
-                       event_type,
-                       event_key,
-                       payload,
-                       headers,
-                       version,
-                       attempt_count,
-                       max_attempts,
-                       lease_owner,
-                       lease_until,
-                       first_available_at
-                FROM reliable_event_outbox
-                WHERE id = ?
-                """,
+                JdbcOutboxSql.FIND_CLAIMED_EVENT,
                 (resultSet, rowNumber) -> new ClaimedEvent(
                         new StoredEvent(
                                 new EventId(resultSet.getLong("id")),
@@ -321,20 +221,7 @@ public final class JdbcOutboxRepository {
     public void markPublished(ClaimedEvent claimedEvent, Instant publishedAt) {
         // MySQL DATETIME has no zone. Bind a UTC wall time regardless of the JVM zone.
         int updated = jdbcTemplate.update(
-                """
-                UPDATE reliable_event_outbox
-                SET status = ?,
-                    published_at = ?,
-                    lease_owner = NULL,
-                    lease_until = NULL,
-                    updated_at = ?,
-                    version = version + 1
-                WHERE id = ?
-                  AND status = ?
-                  AND version = ?
-                  AND lease_owner = ?
-                  AND lease_until > UTC_TIMESTAMP(3)
-                """,
+                JdbcOutboxSql.MARK_PUBLISHED,
                 EventStatus.PUBLISHED.code(),
                 LocalDateTime.ofInstant(publishedAt, ZoneOffset.UTC),
                 LocalDateTime.ofInstant(publishedAt, ZoneOffset.UTC),
@@ -355,21 +242,7 @@ public final class JdbcOutboxRepository {
             String lastError
     ) {
         int updated = jdbcTemplate.update(
-                """
-                UPDATE reliable_event_outbox
-                SET status = ?,
-                    next_attempt_at = ?,
-                    last_error = ?,
-                    lease_owner = NULL,
-                    lease_until = NULL,
-                    updated_at = ?,
-                    version = version + 1
-                WHERE id = ?
-                  AND status = ?
-                  AND version = ?
-                  AND lease_owner = ?
-                  AND lease_until > UTC_TIMESTAMP(3)
-                """,
+                JdbcOutboxSql.MARK_RETRY_WAIT,
                 EventStatus.RETRY_WAIT.code(),
                 Timestamp.from(nextAttemptAt),
                 lastError,
@@ -386,20 +259,7 @@ public final class JdbcOutboxRepository {
 
     public void markDead(ClaimedEvent claimedEvent, Instant failedAt, String lastError) {
         int updated = jdbcTemplate.update(
-                """
-                UPDATE reliable_event_outbox
-                SET status = ?,
-                    last_error = ?,
-                    lease_owner = NULL,
-                    lease_until = NULL,
-                    updated_at = ?,
-                    version = version + 1
-                WHERE id = ?
-                  AND status = ?
-                  AND version = ?
-                  AND lease_owner = ?
-                  AND lease_until > UTC_TIMESTAMP(3)
-                """,
+                JdbcOutboxSql.MARK_DEAD,
                 EventStatus.DEAD.code(),
                 lastError,
                 Timestamp.from(failedAt),
@@ -420,22 +280,7 @@ public final class JdbcOutboxRepository {
     ) {
         long delayMicros = positiveDurationMicros(delay, "delay");
         int updated = jdbcTemplate.update(
-                """
-                UPDATE reliable_event_outbox
-                SET status = ?,
-                    next_attempt_at = TIMESTAMPADD(MICROSECOND, ?, UTC_TIMESTAMP(3)),
-                    last_error = ?,
-                    lease_owner = NULL,
-                    lease_until = NULL,
-                    updated_at = UTC_TIMESTAMP(3),
-                    version = version + 1
-                WHERE id = ?
-                  AND status = ?
-                  AND version = ?
-                  AND lease_owner = ?
-                  AND lease_until = ?
-                  AND lease_until <= UTC_TIMESTAMP(3)
-                """,
+                JdbcOutboxSql.RECOVER_EXPIRED_LEASE_TO_RETRY_WAIT,
                 EventStatus.RETRY_WAIT.code(),
                 delayMicros,
                 Objects.requireNonNull(lastError, "lastError must not be null"),
@@ -453,21 +298,7 @@ public final class JdbcOutboxRepository {
             String lastError
     ) {
         int updated = jdbcTemplate.update(
-                """
-                UPDATE reliable_event_outbox
-                SET status = ?,
-                    last_error = ?,
-                    lease_owner = NULL,
-                    lease_until = NULL,
-                    updated_at = UTC_TIMESTAMP(3),
-                    version = version + 1
-                WHERE id = ?
-                  AND status = ?
-                  AND version = ?
-                  AND lease_owner = ?
-                  AND lease_until = ?
-                  AND lease_until <= UTC_TIMESTAMP(3)
-                """,
+                JdbcOutboxSql.RECOVER_EXPIRED_LEASE_TO_DEAD,
                 EventStatus.DEAD.code(),
                 Objects.requireNonNull(lastError, "lastError must not be null"),
                 candidate.id().value(),

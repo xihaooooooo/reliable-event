@@ -38,7 +38,12 @@ class ReliableEventKafkaAutoConfigurationTest {
     private ApplicationContextRunner runner(Duration leaseDuration) {
         ReliableEventProperties commonProperties = new ReliableEventProperties();
         commonProperties.setLeaseDuration(leaseDuration);
+        commonProperties.setInitialRetryDelay(Duration.ofSeconds(1));
+        commonProperties.setMaxRetryDelay(Duration.ofMinutes(5));
+        commonProperties.setRetryJitterRatio(0.2);
         return new ApplicationContextRunner()
+            .withPropertyValues("reliable-event.initial-retry-delay=1s",
+                    "reliable-event.max-retry-delay=5m", "reliable-event.retry-jitter-ratio=0.2")
             .withConfiguration(AutoConfigurations.of(
                     ReliableEventTransportSelectionAutoConfiguration.class,
                     ReliableEventKafkaAutoConfiguration.class))

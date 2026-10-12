@@ -27,9 +27,9 @@ final class DefaultMetricsRuntimeCondition implements ConfigurationCondition {
     static boolean matches(BeanDefinitionRegistry registry) {
         boolean metrics = owned(registry, "reliableEventMetrics", "reliableEventMetrics", METRICS_CONFIG);
         boolean worker = owned(registry, "reliableEventWorker", "reliableEventWorker", AUTOCONFIG);
-        boolean cycle = owned(registry, "reliableEventPublicationCycle", "reliableEventPublicationCycle", AUTOCONFIG);
+        boolean store = owned(registry, "reliableEventPublicationStore", "reliableEventPublicationStore", AUTOCONFIG);
         boolean scheduler = owned(registry, "reliableEventScheduler", "reliableEventScheduler", AUTOCONFIG);
-        boolean matched = metrics && worker && cycle && scheduler;
+        boolean matched = metrics && worker && store && scheduler;
         return matched;
     }
 

@@ -3,6 +3,7 @@ package dev.reliableevent.autoconfigure;
 import dev.reliableevent.jdbc.internal.model.ClaimedEvent;
 import dev.reliableevent.jdbc.internal.model.EventCandidate;
 import dev.reliableevent.jdbc.internal.publication.JdbcEventPublicationWorker;
+import dev.reliableevent.jdbc.internal.persistence.JdbcPublicationStore;
 import dev.reliableevent.jdbc.internal.recovery.JdbcExpiredLeaseRecovery;
 import dev.reliableevent.jdbc.internal.observation.PublicationObserver;
 import org.slf4j.Logger;
@@ -38,6 +39,7 @@ public final class ReliableEventScheduler implements SmartLifecycle {
     private static final Logger LOG = LoggerFactory.getLogger(ReliableEventScheduler.class);
 
     private final JdbcExpiredLeaseRecovery recovery;
+    private final JdbcPublicationStore store;
     private final JdbcEventPublicationWorker worker;
     private final PublicationObserver observer;
     private final int claimBatchSize;
@@ -58,18 +60,20 @@ public final class ReliableEventScheduler implements SmartLifecycle {
 
     public ReliableEventScheduler(
             JdbcExpiredLeaseRecovery recovery,
+            JdbcPublicationStore store,
             JdbcEventPublicationWorker worker,
             int claimBatchSize,
             int workerThreads,
             int workerQueueCapacity,
             Duration pollInterval
     ) {
-        this(recovery, worker, claimBatchSize, workerThreads, workerQueueCapacity,
+        this(recovery, store, worker, claimBatchSize, workerThreads, workerQueueCapacity,
                 pollInterval, Duration.ofSeconds(20), false, Duration.ofMillis(100), PublicationObserver.NOOP);
     }
 
     public ReliableEventScheduler(
             JdbcExpiredLeaseRecovery recovery,
+            JdbcPublicationStore store,
             JdbcEventPublicationWorker worker,
             int claimBatchSize,
             int workerThreads,
@@ -77,12 +81,13 @@ public final class ReliableEventScheduler implements SmartLifecycle {
             Duration pollInterval,
             Duration shutdownTimeout
     ) {
-        this(recovery, worker, claimBatchSize, workerThreads, workerQueueCapacity,
+        this(recovery, store, worker, claimBatchSize, workerThreads, workerQueueCapacity,
                 pollInterval, shutdownTimeout, false, Duration.ofMillis(100), PublicationObserver.NOOP);
     }
 
     public ReliableEventScheduler(
             JdbcExpiredLeaseRecovery recovery,
+            JdbcPublicationStore store,
             JdbcEventPublicationWorker worker,
             int claimBatchSize,
             int workerThreads,
@@ -92,12 +97,13 @@ public final class ReliableEventScheduler implements SmartLifecycle {
             boolean adaptivePollingEnabled,
             Duration activePollInterval
     ) {
-        this(recovery, worker, claimBatchSize, workerThreads, workerQueueCapacity, pollInterval,
+        this(recovery, store, worker, claimBatchSize, workerThreads, workerQueueCapacity, pollInterval,
                 shutdownTimeout, adaptivePollingEnabled, activePollInterval, PublicationObserver.NOOP);
     }
 
     public ReliableEventScheduler(
             JdbcExpiredLeaseRecovery recovery,
+            JdbcPublicationStore store,
             JdbcEventPublicationWorker worker,
             int claimBatchSize,
             int workerThreads,
@@ -109,6 +115,7 @@ public final class ReliableEventScheduler implements SmartLifecycle {
             PublicationObserver observer
     ) {
         this.recovery = Objects.requireNonNull(recovery, "recovery must not be null");
+        this.store = Objects.requireNonNull(store, "store must not be null");
         this.worker = Objects.requireNonNull(worker, "worker must not be null");
         this.observer = Objects.requireNonNull(observer, "observer must not be null");
         if (claimBatchSize <= 0 || workerThreads <= 0 || workerQueueCapacity < 0) {
@@ -189,7 +196,7 @@ public final class ReliableEventScheduler implements SmartLifecycle {
                 (long) dispatchLimit + outstandingIds.size());
         List<EventCandidate> candidates;
         try {
-            candidates = worker.findDueEventCandidates(queryLimit);
+            candidates = store.findDueEventCandidates(queryLimit);
         } catch (RuntimeException failure) {
             observe(() -> observer.schedulerCycleFailed(automatic, "candidate_scan"));
             throw failure;
@@ -416,7 +423,7 @@ public final class ReliableEventScheduler implements SmartLifecycle {
                     admitted = true;
                 }
                 unmarkQueued();
-                ClaimedEvent claimed = worker.claimCandidate(candidate).orElse(null);
+                ClaimedEvent claimed = store.claimCandidate(candidate).orElse(null);
                 if (claimed != null && !timedOut) {
                     worker.publishClaimedEvent(claimed);
                 }

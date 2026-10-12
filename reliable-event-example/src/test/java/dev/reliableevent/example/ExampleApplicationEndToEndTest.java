@@ -15,6 +15,7 @@ import dev.reliableevent.jdbc.DeadEventOperations;
 import dev.reliableevent.jdbc.DeadEventReplayRequest;
 import dev.reliableevent.jdbc.DeadEventReplayResult;
 import dev.reliableevent.jdbc.internal.publication.JdbcEventPublicationWorker;
+import dev.reliableevent.jdbc.internal.persistence.JdbcPublicationStore;
 import dev.reliableevent.jdbc.internal.recovery.JdbcExpiredLeaseRecovery;
 import dev.reliableevent.jdbc.internal.retry.ExponentialBackoff;
 import dev.reliableevent.autoconfigure.ReliableEventScheduler;
@@ -350,13 +351,14 @@ class ExampleApplicationEndToEndTest {
                 }
                 return receipt;
             };
-            worker(receiptLost, Clock.systemUTC()).publishDueEvents();
+            publishPending(worker(receiptLost, Clock.systemUTC()), Clock.systemUTC());
             assertThat(status(created.eventId())).isEqualTo(3);
 
             Instant retryAt = jdbc.queryForObject(
                     "SELECT next_attempt_at FROM reliable_event_outbox WHERE id = ?",
                     (result, row) -> result.getTimestamp(1).toInstant(), created.eventId());
-            worker(realSender, Clock.fixed(retryAt, ZoneOffset.UTC)).publishDueEvents();
+            Clock retryClock = Clock.fixed(retryAt, ZoneOffset.UTC);
+            publishPending(worker(realSender, retryClock), retryClock);
             assertThat(status(created.eventId())).isEqualTo(2);
 
             List<MessageView> received = receiveFor(probe, Long.toString(created.orderId()), 2);
@@ -436,13 +438,14 @@ class ExampleApplicationEndToEndTest {
                         created.eventId());
                 JdbcExpiredLeaseRecovery recovery = new JdbcExpiredLeaseRecovery(jdbc,
                         context.getBean(PlatformTransactionManager.class), 8,
-                        new ExponentialBackoff(Duration.ofMillis(1), Duration.ofMillis(1), 0, () -> 0));
+                        new ExponentialBackoff(Duration.ofMillis(1), Duration.ofMillis(1), 0.0));
                 assertThat(recovery.recoverExpiredLeases()).isOne();
                 assertThat(status(created.eventId())).isEqualTo(3);
                 jdbc.update("UPDATE reliable_event_outbox SET next_attempt_at=UTC_TIMESTAMP(3)-INTERVAL 1 SECOND WHERE id=?",
                         created.eventId());
-                assertThat(worker(context.getBean(EventTransport.class), Clock.systemUTC())
-                        .publishDueEvents()).isOne();
+                Clock publishClock = Clock.systemUTC();
+                assertThat(publishPending(worker(context.getBean(EventTransport.class), publishClock), publishClock))
+                        .isOne();
                 await().atMost(Duration.ofSeconds(30)).pollInterval(Duration.ofMillis(100))
                         .untilAsserted(() -> assertThat(status(created.eventId())).isEqualTo(2));
                 List<MessageView> replay = receiveFor(probe, Long.toString(created.orderId()), 1);
@@ -487,8 +490,9 @@ class ExampleApplicationEndToEndTest {
         Producer producer = context.getBean(Producer.class);
         assertThat(producer).isNotNull();
         Created created = postOrder("native-close", 1);
-        assertThat(worker(context.getBean(EventTransport.class), Clock.systemUTC())
-                .publishDueEvents()).isOne();
+        Clock publishClock = Clock.systemUTC();
+        assertThat(publishPending(worker(context.getBean(EventTransport.class), publishClock), publishClock))
+                .isOne();
         assertThat(status(created.eventId())).isEqualTo(2);
         Set<String> activeProducerThreads = liveRocketMqThreadNames();
         activeProducerThreads.removeAll(threadsBeforeContext);
@@ -656,7 +660,7 @@ class ExampleApplicationEndToEndTest {
             DataSourceTransactionManager externalTransactions =
                     new DataSourceTransactionManager(jdbc.getDataSource());
             JdbcExpiredLeaseRecovery recovery = new JdbcExpiredLeaseRecovery(jdbc, externalTransactions, 8,
-                    new ExponentialBackoff(Duration.ofMillis(1), Duration.ofMillis(1), 0, () -> 0));
+                    new ExponentialBackoff(Duration.ofMillis(1), Duration.ofMillis(1), 0.0));
             assertThat(recovery.recoverExpiredLeases()).isOne();
             assertThat(status(first.eventId())).isEqualTo(3);
             assertThat(attemptCount(first.eventId())).isOne();
@@ -726,7 +730,8 @@ class ExampleApplicationEndToEndTest {
         Created created = postOrder("eraser", 3);
         EventId eventId = new EventId(created.eventId());
         EventTransport missingDestination = new RocketMqEventTransport(PROVIDER, context.getBean(Producer.class), new MapEventDestinationResolver(Map.of()));
-        assertThat(worker(missingDestination, Clock.systemUTC()).publishDueEvents()).isZero();
+        Clock publishClock = Clock.systemUTC();
+        assertThat(publishPending(worker(missingDestination, publishClock), publishClock)).isZero();
         assertThat(status(created.eventId())).isEqualTo(4);
 
         DeadEventOperations operations = context.getBean(DeadEventOperations.class);
@@ -804,7 +809,8 @@ class ExampleApplicationEndToEndTest {
                 realSender.send(event);
                 throw new TransportException(TransportFailureType.RESULT_UNKNOWN, "Test discarded a successful Broker receipt");
             };
-            assertThat(worker(receiptLost, Clock.systemUTC()).publishDueEvents()).isZero();
+            Clock publishClock = Clock.systemUTC();
+            assertThat(publishPending(worker(receiptLost, publishClock), publishClock)).isZero();
             assertThat(status(created.eventId())).isEqualTo(4);
             List<MessageView> firstDelivery = receiveFor(probe,
                     Long.toString(created.orderId()), 1);
@@ -822,7 +828,7 @@ class ExampleApplicationEndToEndTest {
             assertThat(auditCount(created.eventId())).isOne();
             assertThat(attemptCount(created.eventId())).isZero();
 
-            assertThat(worker(realSender, Clock.systemUTC()).publishDueEvents()).isOne();
+            assertThat(publishPending(worker(realSender, publishClock), publishClock)).isOne();
             List<MessageView> secondDelivery = receiveFor(probe,
                     Long.toString(created.orderId()), 1);
             MessageView first = firstDelivery.get(0);
@@ -959,10 +965,25 @@ class ExampleApplicationEndToEndTest {
     }
 
     private JdbcEventPublicationWorker worker(EventTransport sender, Clock clock) {
-        return new JdbcEventPublicationWorker(jdbc,
-                context.getBean(PlatformTransactionManager.class), sender, clock,
-                10, "example-test-worker", Duration.ofSeconds(30),
-                new ExponentialBackoff(Duration.ofMillis(100), Duration.ofMillis(100), 0, () -> 0));
+        JdbcPublicationStore store = publicationStore(clock);
+        return new JdbcEventPublicationWorker(store, sender, clock,
+                new ExponentialBackoff(Duration.ofMillis(100), Duration.ofMillis(100), 0.0),
+                PublicationObserver.NOOP, dev.reliableevent.jdbc.internal.tracing.PublicationTracer.NOOP);
+    }
+
+    private JdbcPublicationStore publicationStore(Clock clock) {
+        return new JdbcPublicationStore(jdbc, context.getBean(PlatformTransactionManager.class), clock,
+                "example-test-worker", Duration.ofSeconds(30), PublicationObserver.NOOP);
+    }
+
+    private int publishPending(JdbcEventPublicationWorker worker, Clock clock) {
+        JdbcPublicationStore store = publicationStore(clock);
+        int published = 0;
+        for (var candidate : store.findDueEventCandidates(10)) {
+            var claimed = store.claimCandidate(candidate);
+            if (claimed.isPresent() && worker.publishClaimedEvent(claimed.get())) published++;
+        }
+        return published;
     }
 
     private Created postOrder(String itemCode, int quantity) throws Exception {

@@ -3,6 +3,7 @@ package dev.reliableevent.autoconfigure;
 import dev.reliableevent.EventId;
 import dev.reliableevent.jdbc.internal.model.ClaimedEvent;
 import dev.reliableevent.jdbc.internal.model.EventCandidate;
+import dev.reliableevent.jdbc.internal.persistence.JdbcPublicationStore;
 import dev.reliableevent.jdbc.internal.publication.JdbcEventPublicationWorker;
 import dev.reliableevent.jdbc.internal.recovery.JdbcExpiredLeaseRecovery;
 import org.apache.rocketmq.client.apis.producer.Producer;
@@ -29,6 +30,7 @@ class ReliableEventShutdownContextTest {
     @Test
     void contextClosesTheProducerAfterPublicationAndStateCompletion() throws Exception {
         JdbcExpiredLeaseRecovery recovery = mock(JdbcExpiredLeaseRecovery.class);
+        JdbcPublicationStore store = mock(JdbcPublicationStore.class);
         JdbcEventPublicationWorker worker = mock(JdbcEventPublicationWorker.class);
         Producer producer = mock(Producer.class);
         EventCandidate candidate = new EventCandidate(new EventId(1), 0);
@@ -37,8 +39,8 @@ class ReliableEventShutdownContextTest {
         CountDownLatch releasePublication = new CountDownLatch(1);
         AtomicBoolean publicationCompleted = new AtomicBoolean();
         AtomicBoolean closedBeforeCompletion = new AtomicBoolean();
-        when(worker.findDueEventCandidates(anyInt())).thenReturn(List.of(candidate));
-        when(worker.claimCandidate(candidate)).thenReturn(Optional.of(claim));
+        when(store.findDueEventCandidates(anyInt())).thenReturn(List.of(candidate));
+        when(store.claimCandidate(candidate)).thenReturn(Optional.of(claim));
         when(worker.publishClaimedEvent(claim)).thenAnswer(invocation -> {
             publicationStarted.countDown();
             if (!releasePublication.await(5, TimeUnit.SECONDS)) {
@@ -56,7 +58,7 @@ class ReliableEventShutdownContextTest {
         context.registerBean(Producer.class, () -> producer,
                 definition -> definition.setDestroyMethodName("close"));
         context.registerBean(ReliableEventScheduler.class, () -> new ReliableEventScheduler(
-                recovery, worker, 1, 1, 0, Duration.ofMillis(100), Duration.ofSeconds(3)));
+                recovery, store, worker, 1, 1, 0, Duration.ofMillis(100), Duration.ofSeconds(3)));
         Thread closer = new Thread(context::close, "test-context-close");
         try {
             context.refresh();

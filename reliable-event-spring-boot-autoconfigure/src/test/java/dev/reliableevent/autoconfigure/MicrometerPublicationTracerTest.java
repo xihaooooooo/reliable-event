@@ -92,10 +92,12 @@ class MicrometerPublicationTracerTest {
             try {
                 assertThat(attempt.eventForSend()).isSameAs(original);
                 var observer = org.mockito.Mockito.mock(dev.reliableevent.jdbc.internal.observation.PublicationObserver.class);
+                var store = new dev.reliableevent.jdbc.internal.persistence.JdbcPublicationStore(
+                        jdbc, transactions, java.time.Clock.systemUTC(), "worker-test",
+                        java.time.Duration.ofSeconds(30), observer);
                 var worker = new dev.reliableevent.jdbc.internal.publication.JdbcEventPublicationWorker(
-                        jdbc, transactions, transport, java.time.Clock.systemUTC(), 10, "worker-test",
-                        java.time.Duration.ofSeconds(30),
-                        dev.reliableevent.jdbc.internal.retry.ExponentialBackoff.defaults(), observer,
+                        store, transport, java.time.Clock.systemUTC(),
+                        new dev.reliableevent.jdbc.internal.retry.ExponentialBackoff(java.time.Duration.ofSeconds(1), java.time.Duration.ofMinutes(5), 0.2), observer,
                         ignored -> attempt);
                 var claimedEvent = claimed(original, 1);
                 assertThat(worker.publishClaimedEvent(claimedEvent)).isFalse();

@@ -10,8 +10,8 @@ import dev.reliableevent.jdbc.DeadEventOperations;
 import dev.reliableevent.jdbc.JdbcDeadEventOperations;
 import dev.reliableevent.jdbc.JdbcPublishedEventRetention;
 import dev.reliableevent.jdbc.PublishedRetentionResult;
-import dev.reliableevent.jdbc.internal.cycle.JdbcEventPublicationCycle;
 import dev.reliableevent.jdbc.internal.publication.JdbcEventPublicationWorker;
+import dev.reliableevent.jdbc.internal.persistence.JdbcPublicationStore;
 import dev.reliableevent.jdbc.internal.recovery.JdbcExpiredLeaseRecovery;
 import dev.reliableevent.jdbc.internal.observation.PublicationObserver;
 import dev.reliableevent.jdbc.internal.tracing.RegistrationTracer;
@@ -29,6 +29,7 @@ import org.springframework.context.annotation.Primary;
 import org.springframework.boot.test.context.FilteredClassLoader;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.core.PreparedStatementCreator;
+import org.springframework.jdbc.datasource.ConnectionHolder;
 import org.springframework.jdbc.support.KeyHolder;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
@@ -36,6 +37,7 @@ import org.springframework.transaction.support.TransactionSynchronizationManager
 import javax.sql.DataSource;
 import java.io.IOException;
 import java.io.InputStream;
+import java.sql.Connection;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.time.Instant;
@@ -51,6 +53,8 @@ import static org.mockito.ArgumentCaptor.forClass;
 class ReliableEventAutoConfigurationTest {
 
     private final ApplicationContextRunner runner = new ApplicationContextRunner()
+            .withPropertyValues("reliable-event.initial-retry-delay=1s",
+                    "reliable-event.max-retry-delay=5m", "reliable-event.retry-jitter-ratio=0.2")
             .withConfiguration(AutoConfigurations.of(
                     ReliableEventAutoConfiguration.class,
                     ReliableEventPublicationAutoConfiguration.class,
@@ -225,7 +229,7 @@ class ReliableEventAutoConfigurationTest {
                                     return 1;
                                 });
                         when(jdbcTemplate.update(anyString(), any(Object[].class))).thenReturn(1);
-                        TransactionSynchronizationManager.setActualTransactionActive(true);
+                        bindPublisherTransaction(jdbcTemplate);
                         try {
                             context.getBean(ReliableEventPublisher.class).publish(new ReliableEvent<>(
                                     "order-created", "boot-tracing-test", Map.of("orderId", 1),
@@ -233,20 +237,20 @@ class ReliableEventAutoConfigurationTest {
                                     Map.of("traceparent",
                                             "00-ffffffffffffffffffffffffffffffff-eeeeeeeeeeeeeeee-01")));
                         } finally {
-                            TransactionSynchronizationManager.setActualTransactionActive(false);
+                            clearPublisherTransaction(jdbcTemplate);
                         }
                         assertThat(tracer.currentSpan().context()).isEqualTo(request.context());
                     } finally {
                         request.end();
                     }
                     assertThat(tracer.currentSpan()).isNull();
-                    TransactionSynchronizationManager.setActualTransactionActive(true);
+                    bindPublisherTransaction(context.getBean(JdbcTemplate.class));
                     try {
                         context.getBean(ReliableEventPublisher.class).publish(new ReliableEvent<>(
                                 "order-created", "boot-tracing-root-test", Map.of("orderId", 2),
                                 Instant.parse("2026-10-01T00:00:00Z"), Map.of()));
                     } finally {
-                        TransactionSynchronizationManager.setActualTransactionActive(false);
+                        clearPublisherTransaction(context.getBean(JdbcTemplate.class));
                     }
                     assertThat(tracer.currentSpan()).isNull();
                     JdbcTemplate jdbcTemplate = context.getBean(JdbcTemplate.class);
@@ -334,7 +338,7 @@ class ReliableEventAutoConfigurationTest {
 
         jdbcRunner().withBean(EventTransport.class, () -> mock(EventTransport.class))
                 .withBean(SimpleMeterRegistry.class, SimpleMeterRegistry::new)
-                .withBean(JdbcEventPublicationCycle.class, () -> mock(JdbcEventPublicationCycle.class))
+                .withBean(JdbcPublicationStore.class, () -> mock(JdbcPublicationStore.class))
                 .withPropertyValues("reliable-event.scheduling-enabled=true")
                 .run(context -> assertThat(context).doesNotHaveBean(MetricsSnapshotSampler.class));
 
@@ -407,14 +411,14 @@ class ReliableEventAutoConfigurationTest {
                                 return 1;
                             });
                     when(jdbcTemplate.update(anyString(), any(Object[].class))).thenReturn(1);
-                    TransactionSynchronizationManager.setActualTransactionActive(true);
+                    bindPublisherTransaction(jdbcTemplate);
                     try {
                         context.getBean(ReliableEventPublisher.class).publish(new ReliableEvent<>(
                                 "order-created", "disabled-tracing-test", Map.of("orderId", 3),
                                 Instant.parse("2026-10-01T00:00:00Z"),
                                 Map.of("traceparent", "caller-context")));
                     } finally {
-                        TransactionSynchronizationManager.setActualTransactionActive(false);
+                        clearPublisherTransaction(jdbcTemplate);
                     }
                     org.mockito.ArgumentCaptor<Object[]> arguments = forClass(Object[].class);
                     org.mockito.Mockito.verify(jdbcTemplate).update(anyString(), arguments.capture());
@@ -460,7 +464,7 @@ class ReliableEventAutoConfigurationTest {
                     assertThat(context).hasNotFailed();
                     assertThat(context).doesNotHaveBean(ReliableEventPublisher.class);
 
-                    assertThat(context).doesNotHaveBean(JdbcEventPublicationCycle.class);
+                    assertThat(context).doesNotHaveBean(JdbcPublicationStore.class);
                     assertThat(context).doesNotHaveBean(ReliableEventScheduler.class);
                 });
     }
@@ -475,7 +479,7 @@ class ReliableEventAutoConfigurationTest {
                     assertThat(context).hasSingleBean(ReliableEventPublisher.class);
                     assertThat(context).hasSingleBean(JdbcExpiredLeaseRecovery.class);
                     assertThat(context).hasSingleBean(JdbcEventPublicationWorker.class);
-                    assertThat(context).hasSingleBean(JdbcEventPublicationCycle.class);
+                    assertThat(context).hasSingleBean(JdbcPublicationStore.class);
                     assertThat(context).doesNotHaveBean(ReliableEventScheduler.class);
 
                 });
@@ -489,7 +493,7 @@ class ReliableEventAutoConfigurationTest {
                 .run(context -> {
                     assertThat(context).hasNotFailed();
                     assertThat(context).getBean(ReliableEventPublisher.class).isSameAs(custom);
-                    assertThat(context).hasSingleBean(JdbcEventPublicationCycle.class);
+                    assertThat(context).hasSingleBean(JdbcPublicationStore.class);
                 });
     }
 
@@ -497,10 +501,12 @@ class ReliableEventAutoConfigurationTest {
     void schedulingCanStartWithCustomSenderAndBacksOffForCustomRuntime() {
         JdbcExpiredLeaseRecovery recovery = mock(JdbcExpiredLeaseRecovery.class);
         JdbcEventPublicationWorker worker = mock(JdbcEventPublicationWorker.class);
-        when(worker.findDueEventCandidates(org.mockito.ArgumentMatchers.anyInt()))
+        JdbcPublicationStore store = mock(JdbcPublicationStore.class);
+        when(store.findDueEventCandidates(org.mockito.ArgumentMatchers.anyInt()))
                 .thenReturn(java.util.List.of());
         jdbcRunner().withBean(EventTransport.class, () -> mock(EventTransport.class))
                 .withBean(JdbcExpiredLeaseRecovery.class, () -> recovery)
+                .withBean(JdbcPublicationStore.class, () -> store)
                 .withBean(JdbcEventPublicationWorker.class, () -> worker)
                 .withBean(SimpleMeterRegistry.class, SimpleMeterRegistry::new)
                 .withPropertyValues("reliable-event.scheduling-enabled=true")
@@ -537,7 +543,8 @@ class ReliableEventAutoConfigurationTest {
             assertThat(new String(resource.readAllBytes(), StandardCharsets.UTF_8))
                     .contains("\"name\": \"reliable-event.shutdown-timeout\"")
                     .contains("\"name\": \"reliable-event.adaptive-polling-enabled\"")
-                    .contains("\"name\": \"reliable-event.active-poll-interval\"");
+                    .contains("\"name\": \"reliable-event.active-poll-interval\"")
+                    .contains("\"name\": \"reliable-event.retry-jitter-ratio\"");
         }
     }
 
@@ -546,6 +553,8 @@ class ReliableEventAutoConfigurationTest {
         for (String property : new String[]{
                 "reliable-event.claim-batch-size=0",
                 "reliable-event.lease-duration=0ms",
+                "reliable-event.initial-retry-delay=0ms",
+                "reliable-event.max-retry-delay=0ms",
                 "reliable-event.max-retry-delay=500ms",
                 "reliable-event.poll-interval=0ms",
                 "reliable-event.active-poll-interval=0ms",
@@ -561,11 +570,91 @@ class ReliableEventAutoConfigurationTest {
         }
     }
 
+    @Test
+    void eachRetryPropertyMustBeExplicitlyConfigured() {
+        String[] required = {
+                "reliable-event.initial-retry-delay=1s",
+                "reliable-event.max-retry-delay=5m",
+                "reliable-event.retry-jitter-ratio=0.2"
+        };
+        for (int missing = 0; missing < required.length; missing++) {
+            java.util.List<String> supplied = new java.util.ArrayList<>(java.util.List.of(required));
+            String missingProperty = supplied.remove(missing).split("=")[0];
+            new ApplicationContextRunner()
+                    .withConfiguration(AutoConfigurations.of(ReliableEventAutoConfiguration.class))
+                    .withPropertyValues(supplied.toArray(String[]::new))
+                    .run(context -> assertThat(context).hasFailed().getFailure()
+                            .hasRootCauseMessage(missingProperty + " must be configured"));
+        }
+    }
+
+    @Test
+    void explicitJitterConfigurationControlsTheBackoff() {
+        for (double ratio : new double[]{0.0, 0.1, 0.2}) {
+            jdbcRunner().withPropertyValues("reliable-event.retry-jitter-ratio=" + ratio)
+                    .run(context -> {
+                        assertThat(context).hasNotFailed();
+                        assertThat(context.getBean(ReliableEventProperties.class).getRetryJitterRatio())
+                                .isEqualTo(ratio);
+                        var backoff = context.getBean(
+                                dev.reliableevent.jdbc.internal.retry.ExponentialBackoff.class);
+                        long upperBound = 1_000L + Math.max(0, (long) Math.ceil(1_000 * ratio) - 1);
+                        assertThat(backoff.nextDelay(1).toMillis()).isBetween(1_000L, upperBound);
+                    });
+        }
+    }
+
+    @Test
+    void invalidJitterConfigurationFailsAtStartup() {
+        for (String ratio : new String[]{"-0.01", "0.21", "NaN", "Infinity", ""}) {
+            jdbcRunner().withPropertyValues("reliable-event.retry-jitter-ratio=" + ratio)
+                    .run(context -> assertThat(context).hasFailed().getFailure()
+                            .hasStackTraceContaining("retry-jitter-ratio"));
+        }
+    }
+
+    @Test
+    void disabledReliableEventDoesNotRequireRetryConfiguration() {
+        new ApplicationContextRunner()
+                .withConfiguration(AutoConfigurations.of(ReliableEventAutoConfiguration.class))
+                .withPropertyValues("reliable-event.enabled=false")
+                .run(context -> assertThat(context).hasNotFailed());
+    }
+
+    @Test
+    void customBackoffDoesNotBypassRequiredRetryConfiguration() {
+        new ApplicationContextRunner()
+                .withConfiguration(AutoConfigurations.of(ReliableEventAutoConfiguration.class))
+                .withBean(dev.reliableevent.jdbc.internal.retry.ExponentialBackoff.class,
+                        () -> new dev.reliableevent.jdbc.internal.retry.ExponentialBackoff(
+                                Duration.ofSeconds(1), Duration.ofMinutes(5), 0.0))
+                .run(context -> assertThat(context).hasFailed().getFailure()
+                        .hasRootCauseMessage("reliable-event.initial-retry-delay must be configured"));
+    }
+
     private ApplicationContextRunner jdbcRunner() {
         return runner.withBean(DataSource.class, () -> mock(DataSource.class))
                 .withBean(JdbcTemplate.class, () -> mock(JdbcTemplate.class))
                 .withBean(PlatformTransactionManager.class, () -> mock(PlatformTransactionManager.class))
                 .withBean(ObjectMapper.class, ObjectMapper::new);
+    }
+
+    private void bindPublisherTransaction(JdbcTemplate jdbcTemplate) {
+        DataSource dataSource = mock(DataSource.class);
+        when(jdbcTemplate.getDataSource()).thenReturn(dataSource);
+        Connection connection = mock(Connection.class);
+        try {
+            when(connection.getAutoCommit()).thenReturn(false);
+        } catch (java.sql.SQLException failure) {
+            throw new AssertionError(failure);
+        }
+        TransactionSynchronizationManager.bindResource(dataSource, new ConnectionHolder(connection));
+        TransactionSynchronizationManager.setActualTransactionActive(true);
+    }
+
+    private void clearPublisherTransaction(JdbcTemplate jdbcTemplate) {
+        TransactionSynchronizationManager.unbindResource(jdbcTemplate.getDataSource());
+        TransactionSynchronizationManager.setActualTransactionActive(false);
     }
 
     private void addSystemEnvironment(

@@ -31,19 +31,6 @@ public final class JdbcExpiredLeaseRecovery {
     public JdbcExpiredLeaseRecovery(
             JdbcTemplate jdbcTemplate,
             PlatformTransactionManager transactionManager,
-            int recoveryBatchSize
-    ) {
-        this(
-                jdbcTemplate,
-                transactionManager,
-                recoveryBatchSize,
-                ExponentialBackoff.defaults()
-        );
-    }
-
-    public JdbcExpiredLeaseRecovery(
-            JdbcTemplate jdbcTemplate,
-            PlatformTransactionManager transactionManager,
             int recoveryBatchSize,
             ExponentialBackoff backoff
     ) {

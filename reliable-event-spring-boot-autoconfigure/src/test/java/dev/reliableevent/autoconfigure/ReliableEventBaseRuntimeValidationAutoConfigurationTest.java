@@ -16,7 +16,9 @@ import static org.assertj.core.api.Assertions.*;
 import static org.mockito.Mockito.mock;
 
 class ReliableEventBaseRuntimeValidationAutoConfigurationTest {
-    private final ApplicationContextRunner runner=new ApplicationContextRunner().withConfiguration(AutoConfigurations.of(
+    private final ApplicationContextRunner runner=new ApplicationContextRunner()
+            .withPropertyValues("reliable-event.initial-retry-delay=1s",
+                    "reliable-event.max-retry-delay=5m", "reliable-event.retry-jitter-ratio=0.2").withConfiguration(AutoConfigurations.of(
             ReliableEventAutoConfiguration.class,ReliableEventTransportSelectionAutoConfiguration.class,
             ReliableEventBaseRuntimeValidationAutoConfiguration.class,
             ReliableEventPublicationAutoConfiguration.class));

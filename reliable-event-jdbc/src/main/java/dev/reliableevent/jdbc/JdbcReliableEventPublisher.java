@@ -9,9 +9,14 @@ import dev.reliableevent.ReliableEventPublisher;
 import dev.reliableevent.ReliableEventSerializationException;
 import dev.reliableevent.jdbc.internal.persistence.JdbcOutboxRepository;
 import dev.reliableevent.jdbc.internal.tracing.RegistrationTracer;
+import org.springframework.dao.DataAccessResourceFailureException;
 import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.jdbc.datasource.ConnectionHolder;
+import org.springframework.jdbc.datasource.TransactionAwareDataSourceProxy;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 
+import javax.sql.DataSource;
+import java.sql.SQLException;
 import java.time.Clock;
 import java.util.Objects;
 
@@ -20,6 +25,7 @@ public final class JdbcReliableEventPublisher implements ReliableEventPublisher 
     private static final int DEFAULT_MAX_ATTEMPTS = 8;
 
     private final JdbcOutboxRepository repository;
+    private final JdbcTemplate jdbcTemplate;
     private final ObjectMapper objectMapper;
     private final Clock clock;
     private final int maxAttempts;
@@ -65,7 +71,8 @@ public final class JdbcReliableEventPublisher implements ReliableEventPublisher 
         if (maxAttempts <= 0) {
             throw new IllegalArgumentException("maxAttempts must be positive");
         }
-        this.repository = new JdbcOutboxRepository(Objects.requireNonNull(jdbcTemplate));
+        this.jdbcTemplate = Objects.requireNonNull(jdbcTemplate);
+        this.repository = new JdbcOutboxRepository(jdbcTemplate);
         this.objectMapper = Objects.requireNonNull(objectMapper);
         this.clock = Objects.requireNonNull(clock);
         this.maxAttempts = maxAttempts;
@@ -75,9 +82,7 @@ public final class JdbcReliableEventPublisher implements ReliableEventPublisher 
     @Override
     public EventId publish(ReliableEvent<?> event) {
         Objects.requireNonNull(event, "event must not be null");
-        if (!TransactionSynchronizationManager.isActualTransactionActive()) {
-            throw new MissingActiveTransactionException();
-        }
+        requireWritableTransaction();
 
         RegistrationTracer.Registration registration = beginRegistration(event.headers());
         try {
@@ -99,6 +104,33 @@ public final class JdbcReliableEventPublisher implements ReliableEventPublisher 
             throw failure;
         } finally {
             safely(registration::close);
+        }
+    }
+
+    private void requireWritableTransaction() {
+        if (!TransactionSynchronizationManager.isActualTransactionActive()) {
+            throw new MissingActiveTransactionException();
+        }
+        if (TransactionSynchronizationManager.isCurrentTransactionReadOnly()) {
+            throw new IllegalStateException("Reliable events cannot be published inside a read-only transaction");
+        }
+
+        DataSource dataSource = jdbcTemplate.getDataSource();
+        while (dataSource instanceof TransactionAwareDataSourceProxy proxy) {
+            dataSource = proxy.getTargetDataSource();
+        }
+        // Inspect the existing resource before acquiring a connection: acquisition can
+        // bind an unrelated DataSource's auto-commit connection through synchronization.
+        Object resource = dataSource == null ? null : TransactionSynchronizationManager.getResource(dataSource);
+        if (!(resource instanceof ConnectionHolder holder)) {
+            throw new IllegalStateException("Outbox DataSource must participate in the active database transaction");
+        }
+        try {
+            if (holder.getConnection().getAutoCommit()) {
+                throw new IllegalStateException("Outbox connection must not use auto-commit inside the active database transaction");
+            }
+        } catch (SQLException failure) {
+            throw new DataAccessResourceFailureException("Unable to verify Outbox connection transaction state", failure);
         }
     }
 

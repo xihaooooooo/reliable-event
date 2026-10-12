@@ -5,6 +5,9 @@ import dev.reliableevent.spi.EventTransport;
 import dev.reliableevent.spi.TransportReceipt;
 import dev.reliableevent.jdbc.internal.model.EventCandidate;
 import dev.reliableevent.jdbc.internal.publication.JdbcEventPublicationWorker;
+import dev.reliableevent.jdbc.internal.persistence.JdbcPublicationStore;
+import dev.reliableevent.jdbc.internal.observation.PublicationObserver;
+import dev.reliableevent.jdbc.internal.tracing.PublicationTracer;
 import dev.reliableevent.jdbc.internal.retry.ExponentialBackoff;
 import org.apache.rocketmq.client.apis.ClientConfiguration;
 import org.apache.rocketmq.client.apis.ClientServiceProvider;
@@ -41,11 +44,11 @@ public final class RocketMqCrashChild {
         dataSource.setPassword(password);
         JdbcTemplate jdbc = new JdbcTemplate(dataSource);
         var tx = new org.springframework.jdbc.datasource.DataSourceTransactionManager(dataSource);
-        JdbcEventPublicationWorker worker = new JdbcEventPublicationWorker(
-                jdbc, tx, event -> { throw new IllegalStateException("sender not initialized"); },
-                Clock.systemUTC(), 8, "crash-child-" + ProcessHandle.current().pid(), Duration.ofSeconds(15),
-                new ExponentialBackoff(Duration.ofMillis(1), Duration.ofMillis(1), 0.0, () -> 0.0));
-        EventCandidate candidate = worker.findDueEventCandidates(32).stream()
+        String workerId = "crash-child-" + ProcessHandle.current().pid();
+        Clock clock = Clock.systemUTC();
+        JdbcPublicationStore store = new JdbcPublicationStore(jdbc, tx, clock, workerId,
+                Duration.ofSeconds(15), PublicationObserver.NOOP);
+        EventCandidate candidate = store.findDueEventCandidates(32).stream()
                 .filter(item -> item.id().value() == eventId)
                 .findFirst().orElseThrow(() -> new IllegalStateException("event candidate not found"));
 
@@ -53,7 +56,7 @@ public final class RocketMqCrashChild {
             Path gate = Path.of(args[7]);
             writeReady(ready, "scanned=true\n");
             while (!Files.exists(gate)) Thread.sleep(10);
-            var claim = worker.claimCandidate(candidate).orElse(null);
+            var claim = store.claimCandidate(candidate).orElse(null);
             if (claim == null) {
                 writeReady(ready, "scanned=true\noutcome=lost\n");
                 return;
@@ -64,7 +67,7 @@ public final class RocketMqCrashChild {
         }
 
         if (mode.equals("claim-before-send")) {
-            var claim = worker.claimCandidate(candidate).orElseThrow();
+            var claim = store.claimCandidate(candidate).orElseThrow();
             writeReady(ready, "boundary=claimed-before-send\nclaimVersion=" + claim.claimVersion()
                     + "\nleaseOwner=" + claim.leaseOwner());
             new CountDownLatch(1).await();
@@ -94,11 +97,15 @@ public final class RocketMqCrashChild {
             awaitParentKill();
             return receipt;
         };
-        JdbcEventPublicationWorker confirmedWorker = new JdbcEventPublicationWorker(
-                jdbc, tx, holdAfterConfirmation, Clock.systemUTC(), 8,
-                "confirmed-crash-child-" + ProcessHandle.current().pid(), Duration.ofSeconds(15),
-                new ExponentialBackoff(Duration.ofMillis(1), Duration.ofMillis(1), 0.0, () -> 0.0));
-        confirmedWorker.publishCandidate(candidate);
+        String confirmedWorkerId = "confirmed-crash-child-" + ProcessHandle.current().pid();
+        JdbcPublicationStore confirmedStore = new JdbcPublicationStore(jdbc, tx, clock, confirmedWorkerId,
+                Duration.ofSeconds(15), PublicationObserver.NOOP);
+        var claim = confirmedStore.claimCandidate(candidate).orElseThrow();
+        JdbcEventPublicationWorker confirmedWorker = new JdbcEventPublicationWorker(confirmedStore,
+                holdAfterConfirmation, clock,
+                new ExponentialBackoff(Duration.ofMillis(1), Duration.ofMillis(1), 0.0),
+                PublicationObserver.NOOP, PublicationTracer.NOOP);
+        confirmedWorker.publishClaimedEvent(claim);
     }
 
     private static void writeReady(Path path, String value) {

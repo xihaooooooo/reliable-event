@@ -22,6 +22,7 @@ import org.junit.jupiter.api.TestInfo;
 import dev.reliableevent.spi.TransportException;
 import dev.reliableevent.spi.EventTransport;
 import dev.reliableevent.jdbc.internal.publication.JdbcEventPublicationWorker;
+import dev.reliableevent.jdbc.internal.persistence.JdbcPublicationStore;
 import dev.reliableevent.jdbc.internal.retry.ExponentialBackoff;
 import org.springframework.boot.builder.SpringApplicationBuilder;
 import org.springframework.boot.web.context.WebServerApplicationContext;
@@ -245,13 +246,13 @@ class KafkaOrderEndToEndTest {
         JdbcEventPublicationWorker worker = worker(dropFirstAcknowledgement);
 
         try {
-            assertThat(worker.publishDueEvents()).isZero();
+            assertThat(publishPending(worker)).isZero();
             assertThat(status(created.eventId())).isEqualTo(3);
             assertThat(jdbc.queryForObject("SELECT attempt_count FROM reliable_event_outbox WHERE id = ?",
                     Integer.class, created.eventId())).isEqualTo(1);
 
             await(() -> isDue(created.eventId()), Duration.ofSeconds(5));
-            assertThat(worker.publishDueEvents()).isEqualTo(1);
+            assertThat(publishPending(worker)).isEqualTo(1);
             assertThat(status(created.eventId())).isEqualTo(2);
             assertThat(eventIds).containsExactly(created.eventId(), created.eventId());
             await(() -> committed(consumerGroup, 0) == 2, Duration.ofSeconds(20));
@@ -275,13 +276,13 @@ class KafkaOrderEndToEndTest {
         OrderService.CreatedOrder created = context.getBean(OrderService.class).create("cup", 5);
         JdbcEventPublicationWorker worker = worker(context.getBean(EventTransport.class));
 
-        assertThat(worker.publishDueEvents()).isZero();
+        assertThat(publishPending(worker)).isZero();
         assertThat(status(created.eventId())).isEqualTo(3);
         createTopic();
         awaitKafkaAvailable();
         await(() -> isDue(created.eventId()), Duration.ofSeconds(5));
 
-        assertThat(worker.publishDueEvents()).isEqualTo(1);
+        assertThat(publishPending(worker)).isEqualTo(1);
         assertThat(status(created.eventId())).isEqualTo(2);
         assertThat(jdbc.queryForObject("SELECT id FROM reliable_event_outbox WHERE id = ?",
                 Long.class, created.eventId())).isEqualTo(created.eventId());
@@ -294,7 +295,7 @@ class KafkaOrderEndToEndTest {
         try {
             DockerClientFactory.instance().client().pauseContainerCmd(KAFKA.getContainerId()).exec();
             paused = true;
-            assertThat(worker(context.getBean(EventTransport.class)).publishDueEvents()).isZero();
+            assertThat(publishPending(worker(context.getBean(EventTransport.class)))).isZero();
             assertThat(status(created.eventId())).isEqualTo(3);
         } finally {
             if (paused) {
@@ -304,7 +305,7 @@ class KafkaOrderEndToEndTest {
 
         awaitKafkaAvailable();
         await(() -> isDue(created.eventId()), Duration.ofSeconds(5));
-        assertThat(worker(context.getBean(EventTransport.class)).publishDueEvents()).isEqualTo(1);
+        assertThat(publishPending(worker(context.getBean(EventTransport.class)))).isEqualTo(1);
         assertThat(status(created.eventId())).isEqualTo(2);
     }
 
@@ -313,7 +314,7 @@ class KafkaOrderEndToEndTest {
         setMaxMessageBytes(1);
         OrderService.CreatedOrder created = context.getBean(OrderService.class).create("pen", 2);
 
-        assertThat(worker(context.getBean(EventTransport.class)).publishDueEvents()).isZero();
+        assertThat(publishPending(worker(context.getBean(EventTransport.class)))).isZero();
         assertThat(status(created.eventId())).isEqualTo(4);
         assertThat(jdbc.queryForObject("SELECT attempt_count FROM reliable_event_outbox WHERE id = ?",
                 Integer.class, created.eventId())).isEqualTo(1);
@@ -357,16 +358,35 @@ class KafkaOrderEndToEndTest {
     }
 
     private JdbcEventPublicationWorker worker(EventTransport sender) {
-        return new JdbcEventPublicationWorker(jdbc,
-                context.getBean(org.springframework.transaction.PlatformTransactionManager.class), sender,
-                java.time.Clock.systemUTC(), 10, "kafka-example-state-test", Duration.ofSeconds(30),
-                new ExponentialBackoff(Duration.ofMillis(10), Duration.ofMillis(10), 0, () -> 0),
-                dev.reliableevent.jdbc.internal.observation.PublicationObserver.NOOP,
-                context.getBean(dev.reliableevent.jdbc.internal.tracing.PublicationTracer.class));
+        java.time.Clock clock = java.time.Clock.systemUTC();
+        String workerId = "kafka-example-state-test";
+        var observer = dev.reliableevent.jdbc.internal.observation.PublicationObserver.NOOP;
+        JdbcPublicationStore store = new JdbcPublicationStore(jdbc,
+                context.getBean(org.springframework.transaction.PlatformTransactionManager.class),
+                clock, workerId, Duration.ofSeconds(30), observer);
+        return new JdbcEventPublicationWorker(store, sender, clock,
+                new ExponentialBackoff(Duration.ofMillis(10), Duration.ofMillis(10), 0.0),
+                observer, context.getBean(dev.reliableevent.jdbc.internal.tracing.PublicationTracer.class));
     }
 
     private int publishPending() {
-        return worker(context.getBean(EventTransport.class)).publishDueEvents();
+        return publishPending(worker(context.getBean(EventTransport.class)));
+    }
+
+    private int publishPending(JdbcEventPublicationWorker worker) {
+        java.time.Clock clock = java.time.Clock.systemUTC();
+        JdbcPublicationStore store = new JdbcPublicationStore(jdbc,
+                context.getBean(org.springframework.transaction.PlatformTransactionManager.class),
+                clock, "kafka-example-state-test", Duration.ofSeconds(30),
+                dev.reliableevent.jdbc.internal.observation.PublicationObserver.NOOP);
+        int published = 0;
+        for (var candidate : store.findDueEventCandidates(10)) {
+            var claim = store.claimCandidate(candidate);
+            if (claim.isPresent() && worker.publishClaimedEvent(claim.get())) {
+                published++;
+            }
+        }
+        return published;
     }
 
     private void createTopic() throws Exception {

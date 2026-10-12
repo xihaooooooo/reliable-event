@@ -6,7 +6,10 @@ import dev.reliableevent.ReliableEvent;
 import dev.reliableevent.ReliableEventPublisher;
 import dev.reliableevent.spi.EventTransport;
 import dev.reliableevent.spi.TransportReceipt;
-import dev.reliableevent.jdbc.internal.cycle.JdbcEventPublicationCycle;
+import dev.reliableevent.jdbc.internal.model.EventCandidate;
+import dev.reliableevent.jdbc.internal.observation.PublicationObserver;
+import dev.reliableevent.jdbc.internal.publication.JdbcEventPublicationWorker;
+import dev.reliableevent.jdbc.internal.persistence.JdbcPublicationStore;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import org.apache.rocketmq.client.apis.ClientConfiguration;
 import org.apache.rocketmq.client.apis.ClientServiceProvider;
@@ -124,6 +127,8 @@ class StarterPublicationIntegrationTest {
     @Test
     void starterRegistersAndPublishesThroughRealServices() throws Exception {
         try (ConfigurableApplicationContext context = new SpringApplicationBuilder(TestApplication.class)
+                .properties("reliable-event.initial-retry-delay=1s",
+                        "reliable-event.max-retry-delay=5m", "reliable-event.retry-jitter-ratio=0.2")
                 .properties(
                         "spring.main.web-application-type=none",
                         "spring.datasource.url=" + MYSQL.getJdbcUrl(),
@@ -158,8 +163,7 @@ class StarterPublicationIntegrationTest {
                     Integer.class, eventId.value()
             )).isEqualTo(0);
 
-            assertThat(context.getBean(JdbcEventPublicationCycle.class).runOnce().publishedCount())
-                    .isOne();
+            assertThat(publishEvent(context, eventId)).isTrue();
             assertThat(jdbc.queryForObject(
                     "SELECT status FROM reliable_event_outbox WHERE id = ?",
                     Integer.class, eventId.value()
@@ -196,6 +200,8 @@ class StarterPublicationIntegrationTest {
     @Test
     void realBrokerSendProducesMetricsAndAStateSnapshot() {
         try (ConfigurableApplicationContext context = new SpringApplicationBuilder(MetricsApplication.class)
+                .properties("reliable-event.initial-retry-delay=1s",
+                        "reliable-event.max-retry-delay=5m", "reliable-event.retry-jitter-ratio=0.2")
                 .properties(
                         "spring.main.web-application-type=none",
                         "spring.datasource.url=" + MYSQL.getJdbcUrl(),
@@ -214,9 +220,9 @@ class StarterPublicationIntegrationTest {
                             new ReliableEvent<>("coupon-task-execute", key, Map.of("taskId", 303),
                                     Instant.now().minusSeconds(1), Map.of())));
             assertThat(id).isNotNull();
-            assertThat(context.getBean(JdbcEventPublicationCycle.class).runOnce().publishedCount())
-                    .isOne();
+            assertThat(publishEvent(context, id)).isTrue();
             SimpleMeterRegistry metrics = context.getBean(SimpleMeterRegistry.class);
+            context.getBean(PublicationObserver.class).refreshSnapshot();
             assertThat(metrics.get("reliable_event.publish.success").counter().count()).isOne();
             assertThat(metrics.get("reliable_event.publish.duration").tag("outcome", "success")
                     .timer().count()).isOne();
@@ -238,6 +244,8 @@ class StarterPublicationIntegrationTest {
         ).execute(dataSource);
 
         try (ConfigurableApplicationContext context = new SpringApplicationBuilder(TestApplication.class)
+                .properties("reliable-event.initial-retry-delay=1s",
+                        "reliable-event.max-retry-delay=5m", "reliable-event.retry-jitter-ratio=0.2")
                 .properties(
                         "spring.main.web-application-type=none",
                         "spring.datasource.url=" + MYSQL.getJdbcUrl(),
@@ -321,6 +329,8 @@ class StarterPublicationIntegrationTest {
         };
 
         try (ConfigurableApplicationContext context = new SpringApplicationBuilder(BlockingSenderApplication.class)
+                .properties("reliable-event.initial-retry-delay=1s",
+                        "reliable-event.max-retry-delay=5m", "reliable-event.retry-jitter-ratio=0.2")
                 .properties(
                         "spring.main.web-application-type=none",
                         "spring.datasource.url=" + MYSQL.getJdbcUrl(),
@@ -419,6 +429,8 @@ class StarterPublicationIntegrationTest {
                 "reliable-event.shutdown-timeout=5s"
         };
         ConfigurableApplicationContext first = new SpringApplicationBuilder(BlockingSenderApplication.class)
+                .properties("reliable-event.initial-retry-delay=1s",
+                        "reliable-event.max-retry-delay=5m", "reliable-event.retry-jitter-ratio=0.2")
                 .properties(properties).run();
         Thread closer = new Thread(first::close, "first-instance-close");
         try {
@@ -474,6 +486,8 @@ class StarterPublicationIntegrationTest {
             };
             try (ConfigurableApplicationContext second =
                          new SpringApplicationBuilder(BlockingSenderApplication.class)
+                .properties("reliable-event.initial-retry-delay=1s",
+                        "reliable-event.max-retry-delay=5m", "reliable-event.retry-jitter-ratio=0.2")
                                  .properties(properties).run()) {
                 await().atMost(Duration.ofSeconds(20)).pollInterval(Duration.ofMillis(50))
                         .untilAsserted(() -> assertThat(jdbc.queryForObject(
@@ -530,6 +544,8 @@ class StarterPublicationIntegrationTest {
                 "reliable-event.max-retry-delay=100ms"
         };
         ConfigurableApplicationContext first = new SpringApplicationBuilder(BlockingSenderApplication.class)
+                .properties("reliable-event.initial-retry-delay=1s",
+                        "reliable-event.max-retry-delay=5m", "reliable-event.retry-jitter-ratio=0.2")
                 .properties(properties).run();
         try {
             EventId eventId = new TransactionTemplate(first.getBean(PlatformTransactionManager.class))
@@ -565,6 +581,8 @@ class StarterPublicationIntegrationTest {
             };
             try (ConfigurableApplicationContext second =
                          new SpringApplicationBuilder(BlockingSenderApplication.class)
+                .properties("reliable-event.initial-retry-delay=1s",
+                        "reliable-event.max-retry-delay=5m", "reliable-event.retry-jitter-ratio=0.2")
                                  .properties(properties).run()) {
                 await().atMost(Duration.ofSeconds(20)).pollInterval(Duration.ofMillis(50))
                         .untilAsserted(() -> assertThat(jdbc.queryForObject(
@@ -597,6 +615,8 @@ class StarterPublicationIntegrationTest {
                 new TransportReceipt(Optional.of("recovered-" + sendCount.incrementAndGet()), Map.of());
 
         try (ConfigurableApplicationContext context = new SpringApplicationBuilder(BlockingSenderApplication.class)
+                .properties("reliable-event.initial-retry-delay=1s",
+                        "reliable-event.max-retry-delay=5m", "reliable-event.retry-jitter-ratio=0.2")
                 .properties(
                         "spring.main.web-application-type=none",
                         "spring.datasource.url=" + MYSQL.getJdbcUrl(),
@@ -662,8 +682,12 @@ class StarterPublicationIntegrationTest {
         };
 
         try (ConfigurableApplicationContext first = new SpringApplicationBuilder(BlockingSenderApplication.class)
+                .properties("reliable-event.initial-retry-delay=1s",
+                        "reliable-event.max-retry-delay=5m", "reliable-event.retry-jitter-ratio=0.2")
                 .properties(properties).run();
              ConfigurableApplicationContext second = new SpringApplicationBuilder(BlockingSenderApplication.class)
+                .properties("reliable-event.initial-retry-delay=1s",
+                        "reliable-event.max-retry-delay=5m", "reliable-event.retry-jitter-ratio=0.2")
                      .properties(properties).run()) {
             JdbcTemplate jdbc = first.getBean(JdbcTemplate.class);
             EventId eventId = new TransactionTemplate(first.getBean(PlatformTransactionManager.class))
@@ -687,6 +711,15 @@ class StarterPublicationIntegrationTest {
         } finally {
             BlockingSenderApplication.sender = null;
         }
+    }
+
+    private boolean publishEvent(ConfigurableApplicationContext context, EventId eventId) {
+        JdbcPublicationStore store = context.getBean(JdbcPublicationStore.class);
+        JdbcEventPublicationWorker worker = context.getBean(JdbcEventPublicationWorker.class);
+        EventCandidate candidate = store.findDueEventCandidates(32).stream()
+                .filter(value -> value.id().equals(eventId))
+                .findFirst().orElseThrow();
+        return store.claimCandidate(candidate).map(worker::publishClaimedEvent).orElse(false);
     }
 
     private static MessageView receive(SimpleConsumer consumer, String eventKey) throws Exception {

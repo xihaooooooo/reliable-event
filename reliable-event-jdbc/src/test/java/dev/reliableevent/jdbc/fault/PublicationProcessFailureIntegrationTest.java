@@ -4,6 +4,9 @@ import dev.reliableevent.EventId;
 import dev.reliableevent.jdbc.internal.model.EventStatus;
 import dev.reliableevent.jdbc.internal.persistence.JdbcOutboxRepository;
 import dev.reliableevent.jdbc.internal.publication.JdbcEventPublicationWorker;
+import dev.reliableevent.jdbc.internal.persistence.JdbcPublicationStore;
+import dev.reliableevent.jdbc.internal.observation.PublicationObserver;
+import dev.reliableevent.jdbc.internal.tracing.PublicationTracer;
 import dev.reliableevent.jdbc.internal.recovery.JdbcExpiredLeaseRecovery;
 import dev.reliableevent.jdbc.internal.retry.ExponentialBackoff;
 import org.junit.jupiter.api.BeforeEach;
@@ -259,18 +262,18 @@ class PublicationProcessFailureIntegrationTest {
 
     private void publishRecoveredEvent(EventId eventId) {
         Instant nextAttemptAt = nextAttemptAtOf(eventId);
-        JdbcEventPublicationWorker worker = new JdbcEventPublicationWorker(
-                jdbcTemplate,
-                transactionManager,
-                new JdbcDeliveryProbeSender(dataSource, RECOVERY_WORKER_ID),
-                Clock.fixed(nextAttemptAt, ZoneOffset.UTC),
-                50,
-                RECOVERY_WORKER_ID,
-                LEASE_DURATION,
-                deterministicBackoff()
-        );
-
-        assertThat(worker.publishDueEvents()).isOne();
+        Clock clock = Clock.fixed(nextAttemptAt, ZoneOffset.UTC);
+        JdbcPublicationStore store = new JdbcPublicationStore(jdbcTemplate, transactionManager, clock,
+                RECOVERY_WORKER_ID, LEASE_DURATION, PublicationObserver.NOOP);
+        JdbcEventPublicationWorker worker = new JdbcEventPublicationWorker(store,
+                new JdbcDeliveryProbeSender(dataSource, RECOVERY_WORKER_ID), clock,
+                deterministicBackoff(), PublicationObserver.NOOP, PublicationTracer.NOOP);
+        int published = 0;
+        for (var candidate : store.findDueEventCandidates(50)) {
+            var claimed = store.claimCandidate(candidate);
+            if (claimed.isPresent() && worker.publishClaimedEvent(claimed.get())) published++;
+        }
+        assertThat(published).isOne();
     }
 
     private EventId insertEvent(long taskId) {
@@ -400,9 +403,7 @@ class PublicationProcessFailureIntegrationTest {
         return new ExponentialBackoff(
                 Duration.ofSeconds(1),
                 Duration.ofMinutes(5),
-                0.0,
-                () -> 0.0
-        );
+                0.0);
     }
 
     private <T> T inTransaction(Supplier<T> action) {

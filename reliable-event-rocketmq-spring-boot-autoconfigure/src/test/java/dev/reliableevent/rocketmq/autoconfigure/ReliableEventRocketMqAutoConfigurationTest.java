@@ -36,6 +36,8 @@ import static org.mockito.Mockito.*;
 
 class ReliableEventRocketMqAutoConfigurationTest {
     private final ApplicationContextRunner runner = new ApplicationContextRunner()
+            .withPropertyValues("reliable-event.initial-retry-delay=1s",
+                    "reliable-event.max-retry-delay=5m", "reliable-event.retry-jitter-ratio=0.2")
             .withConfiguration(AutoConfigurations.of(
                     ReliableEventAutoConfiguration.class,
                     ReliableEventTransportSelectionAutoConfiguration.class,
@@ -175,6 +177,8 @@ class ReliableEventRocketMqAutoConfigurationTest {
     @Test
     void explicitRocketWithoutAdapterFailsBeforeAnyClient() {
         new ApplicationContextRunner()
+            .withPropertyValues("reliable-event.initial-retry-delay=1s",
+                    "reliable-event.max-retry-delay=5m", "reliable-event.retry-jitter-ratio=0.2")
                 .withConfiguration(AutoConfigurations.of(
                         ReliableEventAutoConfiguration.class,
                         ReliableEventTransportSelectionAutoConfiguration.class))

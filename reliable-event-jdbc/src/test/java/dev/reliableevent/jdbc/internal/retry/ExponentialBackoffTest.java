@@ -10,76 +10,86 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 class ExponentialBackoffTest {
 
     @Test
-    void calculatesExponentialDelayWithDeterministicJitter() {
+    void calculatesExponentialDelayWithoutJitter() {
         ExponentialBackoff backoff = new ExponentialBackoff(
-                Duration.ofSeconds(1),
-                Duration.ofMinutes(5),
-                0.2,
-                () -> 0.5
-        );
+                Duration.ofSeconds(1), Duration.ofMinutes(5), 0.0);
 
-        assertThat(backoff.nextDelay(1)).isEqualTo(Duration.ofMillis(1_100));
-        assertThat(backoff.nextDelay(2)).isEqualTo(Duration.ofMillis(2_200));
-        assertThat(backoff.nextDelay(3)).isEqualTo(Duration.ofMillis(4_400));
+        assertThat(backoff.nextDelay(1)).isEqualTo(Duration.ofSeconds(1));
+        assertThat(backoff.nextDelay(2)).isEqualTo(Duration.ofSeconds(2));
+        assertThat(backoff.nextDelay(3)).isEqualTo(Duration.ofSeconds(4));
+        assertThat(backoff.nextDelay(9)).isEqualTo(Duration.ofSeconds(256));
+        assertThat(backoff.nextDelay(10)).isEqualTo(Duration.ofMinutes(5));
+        assertThat(backoff.nextDelay(Integer.MAX_VALUE)).isEqualTo(Duration.ofMinutes(5));
+    }
+
+    @Test
+    void addsJitterWithinTheConfiguredRange() {
+        ExponentialBackoff backoff = new ExponentialBackoff(
+                Duration.ofSeconds(1), Duration.ofMinutes(5), 0.1);
+
+        assertThat(backoff.nextDelay(1).toMillis()).isBetween(1_000L, 1_099L);
+        assertThat(backoff.nextDelay(2).toMillis()).isBetween(2_000L, 2_199L);
+        assertThat(backoff.nextDelay(3).toMillis()).isBetween(4_000L, 4_399L);
     }
 
     @Test
     void capsBaseDelayBeforeAddingJitter() {
         ExponentialBackoff backoff = new ExponentialBackoff(
-                Duration.ofSeconds(1),
-                Duration.ofSeconds(5),
-                0.2,
-                () -> 0.5
-        );
+                Duration.ofSeconds(1), Duration.ofSeconds(5), 0.2);
 
-        assertThat(backoff.nextDelay(4)).isEqualTo(Duration.ofMillis(5_500));
-        assertThat(backoff.nextDelay(Integer.MAX_VALUE)).isEqualTo(Duration.ofMillis(5_500));
+        assertThat(backoff.nextDelay(4).toMillis()).isBetween(5_000L, 5_999L);
+        assertThat(backoff.nextDelay(Integer.MAX_VALUE).toMillis()).isBetween(5_000L, 5_999L);
     }
 
     @Test
-    void zeroJitterDoesNotReadRandomSource() {
+    void truncatesSubMillisecondJitter() {
         ExponentialBackoff backoff = new ExponentialBackoff(
-                Duration.ofMillis(1_001),
-                Duration.ofSeconds(5),
-                0.0,
-                () -> Double.NaN
-        );
+                Duration.ofMillis(1), Duration.ofMillis(1), 0.2);
 
-        assertThat(backoff.nextDelay(1)).isEqualTo(Duration.ofMillis(1_001));
+        assertThat(backoff.nextDelay(1)).isEqualTo(Duration.ofMillis(1));
     }
 
     @Test
-    void rejectsInvalidConfigurationAndInputs() {
-        assertThatThrownBy(() -> new ExponentialBackoff(
-                Duration.ZERO,
-                Duration.ofSeconds(1),
-                0.2,
-                () -> 0.0
-        )).isInstanceOf(IllegalArgumentException.class);
+    void capsBeforeDoublingCanOverflow() {
+        ExponentialBackoff backoff = new ExponentialBackoff(
+                Duration.ofMillis(Long.MAX_VALUE / 2 + 1), Duration.ofMillis(Long.MAX_VALUE), 0.0);
 
-        assertThatThrownBy(() -> new ExponentialBackoff(
-                Duration.ofSeconds(2),
-                Duration.ofSeconds(1),
-                0.2,
-                () -> 0.0
-        )).isInstanceOf(IllegalArgumentException.class);
+        assertThat(backoff.nextDelay(2)).isEqualTo(Duration.ofMillis(Long.MAX_VALUE));
+    }
 
+    @Test
+    void rejectsInvalidDelaysAndAttemptCounts() {
         assertThatThrownBy(() -> new ExponentialBackoff(
-                Duration.ofSeconds(1),
-                Duration.ofSeconds(2),
-                0.21,
-                () -> 0.0
-        )).isInstanceOf(IllegalArgumentException.class);
+                Duration.ZERO, Duration.ofSeconds(1), 0.0))
+                .isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> new ExponentialBackoff(
+                Duration.ofNanos(999_999), Duration.ofSeconds(1), 0.0))
+                .isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> new ExponentialBackoff(
+                Duration.ofSeconds(2), Duration.ofSeconds(1), 0.0))
+                .isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> new ExponentialBackoff(
+                null, Duration.ofSeconds(1), 0.0))
+                .isInstanceOf(NullPointerException.class);
+        assertThatThrownBy(() -> new ExponentialBackoff(
+                Duration.ofSeconds(1), null, 0.0))
+                .isInstanceOf(NullPointerException.class);
 
         ExponentialBackoff backoff = new ExponentialBackoff(
-                Duration.ofSeconds(1),
-                Duration.ofSeconds(2),
-                0.2,
-                () -> 1.0
-        );
+                Duration.ofSeconds(1), Duration.ofSeconds(2), 0.0);
         assertThatThrownBy(() -> backoff.nextDelay(0))
                 .isInstanceOf(IllegalArgumentException.class);
-        assertThatThrownBy(() -> backoff.nextDelay(1))
-                .isInstanceOf(IllegalStateException.class);
+        assertThatThrownBy(() -> backoff.nextDelay(-1))
+                .isInstanceOf(IllegalArgumentException.class);
+    }
+
+    @Test
+    void rejectsInvalidJitterRatios() {
+        for (double ratio : new double[]{-0.01, 0.21, Double.NaN, Double.POSITIVE_INFINITY}) {
+            assertThatThrownBy(() -> new ExponentialBackoff(
+                    Duration.ofSeconds(1), Duration.ofSeconds(2), ratio))
+                    .isInstanceOf(IllegalArgumentException.class)
+                    .hasMessageContaining("jitterRatio");
+        }
     }
 }

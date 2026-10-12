@@ -12,6 +12,7 @@ import dev.reliableevent.jdbc.internal.model.ClaimedEvent;
 import dev.reliableevent.jdbc.internal.observation.PublicationObserver;
 import dev.reliableevent.jdbc.internal.persistence.StaleEventClaimException;
 import dev.reliableevent.jdbc.internal.publication.JdbcEventPublicationWorker;
+import dev.reliableevent.jdbc.internal.persistence.JdbcPublicationStore;
 import dev.reliableevent.jdbc.internal.persistence.JdbcOutboxRepository;
 import dev.reliableevent.jdbc.internal.retry.ExponentialBackoff;
 import dev.reliableevent.jdbc.internal.tracing.PublicationTracer;
@@ -201,8 +202,11 @@ class MicrometerPublicationWorkerTest {
     private JdbcEventPublicationWorker worker(JdbcTemplate jdbc, PlatformTransactionManager transactionManager,
                                               EventTransport sender, PublicationTracer tracer,
                                               PublicationObserver observer) {
-        return new JdbcEventPublicationWorker(jdbc, transactionManager, sender, java.time.Clock.systemUTC(),
-                10, "worker-test", LEASE, new ExponentialBackoff(Duration.ofSeconds(1), Duration.ofMinutes(1), 0.2, () -> 0.0),
+        java.time.Clock clock = java.time.Clock.systemUTC();
+        JdbcPublicationStore store = new JdbcPublicationStore(jdbc, transactionManager, clock,
+                "worker-test", LEASE, observer);
+        return new JdbcEventPublicationWorker(store, sender, clock,
+                new ExponentialBackoff(Duration.ofSeconds(1), Duration.ofMinutes(1), 0.0),
                 observer, tracer);
     }
 

@@ -20,9 +20,7 @@ class JdbcExpiredLeaseRecoveryTest {
     private final ExponentialBackoff backoff = new ExponentialBackoff(
             Duration.ofSeconds(1),
             Duration.ofMinutes(5),
-            0.0,
-            () -> 0.0
-    );
+            0.0);
 
     @Test
     void requiresAPositiveRecoveryBatchSize() {

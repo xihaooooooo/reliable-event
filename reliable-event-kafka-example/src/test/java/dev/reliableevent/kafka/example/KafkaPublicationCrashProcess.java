@@ -2,6 +2,9 @@ package dev.reliableevent.kafka.example;
 
 import dev.reliableevent.spi.EventTransport;
 import dev.reliableevent.jdbc.internal.publication.JdbcEventPublicationWorker;
+import dev.reliableevent.jdbc.internal.persistence.JdbcPublicationStore;
+import dev.reliableevent.jdbc.internal.observation.PublicationObserver;
+import dev.reliableevent.jdbc.internal.tracing.PublicationTracer;
 import dev.reliableevent.jdbc.internal.retry.ExponentialBackoff;
 import org.springframework.boot.builder.SpringApplicationBuilder;
 import org.springframework.context.ConfigurableApplicationContext;
@@ -48,11 +51,16 @@ public final class KafkaPublicationCrashProcess {
                 waitUntilKilled();
                 return receipt;
             };
-            JdbcEventPublicationWorker worker = new JdbcEventPublicationWorker(jdbc,
-                    context.getBean(PlatformTransactionManager.class), gatedProducer,
-                    Clock.systemUTC(), 20, workerId, Duration.ofSeconds(12),
-                    new ExponentialBackoff(Duration.ofMillis(1), Duration.ofMillis(1), 0, () -> 0));
-            worker.publishDueEvents();
+            Clock clock = Clock.systemUTC();
+            JdbcPublicationStore store = new JdbcPublicationStore(jdbc,
+                    context.getBean(PlatformTransactionManager.class), clock, workerId,
+                    Duration.ofSeconds(12), PublicationObserver.NOOP);
+            JdbcEventPublicationWorker worker = new JdbcEventPublicationWorker(store, gatedProducer,
+                    clock, new ExponentialBackoff(Duration.ofMillis(1), Duration.ofMillis(1), 0.0),
+                    PublicationObserver.NOOP, PublicationTracer.NOOP);
+            var candidate = store.findDueEventCandidates(20).stream().findFirst().orElseThrow();
+            var claim = store.claimCandidate(candidate).orElseThrow();
+            worker.publishClaimedEvent(claim);
             throw new IllegalStateException("fault gate returned unexpectedly");
         }
     }

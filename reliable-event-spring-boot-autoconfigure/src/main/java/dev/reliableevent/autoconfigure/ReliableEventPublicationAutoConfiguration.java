@@ -1,6 +1,7 @@
 package dev.reliableevent.autoconfigure;
 
 import dev.reliableevent.spi.EventTransport;
+import dev.reliableevent.EventFallbackHandler;
 import dev.reliableevent.jdbc.internal.publication.JdbcEventPublicationWorker;
 import dev.reliableevent.jdbc.internal.observation.PublicationObserver;
 import dev.reliableevent.jdbc.internal.persistence.JdbcPublicationStore;
@@ -58,14 +59,16 @@ public class ReliableEventPublicationAutoConfiguration {
             ExponentialBackoff backoff,
             ReliableEventProperties properties,
             ObjectProvider<PublicationObserver> observers,
-            ObjectProvider<PublicationTracer> tracers
+            ObjectProvider<PublicationTracer> tracers,
+            ObjectProvider<EventFallbackHandler> fallbackHandlers
     ) {
         properties.validateCore();
         return new JdbcEventPublicationWorker(store, transport, Clock.systemUTC(), backoff,
                 observers.getIfAvailable(() -> PublicationObserver.NOOP),
                 properties.isTracingEnabled()
                         ? tracers.getIfAvailable(() -> PublicationTracer.NOOP)
-                        : PublicationTracer.NOOP);
+                        : PublicationTracer.NOOP,
+                fallbackHandlers.getIfAvailable());
     }
 
     @Bean

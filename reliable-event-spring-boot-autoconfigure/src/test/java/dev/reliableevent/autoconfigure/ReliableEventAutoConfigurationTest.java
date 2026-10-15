@@ -5,9 +5,8 @@ import dev.reliableevent.spi.TransportReceipt;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import dev.reliableevent.ReliableEvent;
 import dev.reliableevent.ReliableEventPublisher;
+import dev.reliableevent.EventFallbackHandler;
 import dev.reliableevent.spi.EventTransport;
-import dev.reliableevent.jdbc.DeadEventOperations;
-import dev.reliableevent.jdbc.JdbcDeadEventOperations;
 import dev.reliableevent.jdbc.JdbcPublishedEventRetention;
 import dev.reliableevent.jdbc.PublishedRetentionResult;
 import dev.reliableevent.jdbc.internal.publication.JdbcEventPublicationWorker;
@@ -31,6 +30,7 @@ import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.core.PreparedStatementCreator;
 import org.springframework.jdbc.datasource.ConnectionHolder;
 import org.springframework.jdbc.support.KeyHolder;
+import org.springframework.test.util.ReflectionTestUtils;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 
@@ -75,7 +75,21 @@ class ReliableEventAutoConfigurationTest {
                     assertThat(context).hasNotFailed();
                     assertThat(context).hasSingleBean(EventTransport.class);
                     assertThat(context).hasSingleBean(JdbcEventPublicationWorker.class);
+                    assertThat(ReflectionTestUtils.getField(
+                            context.getBean(JdbcEventPublicationWorker.class), "fallbackHandler")).isNull();
+                });
+    }
 
+    @Test
+    void applicationFallbackHandlerBeanIsOptionalAndInjectedWhenPresent() {
+        EventFallbackHandler fallback = context -> { };
+        jdbcRunner().withBean(EventTransport.class, () -> event -> TransportReceipt.confirmed())
+                .withBean(EventFallbackHandler.class, () -> fallback)
+                .run(context -> {
+                    assertThat(context).hasNotFailed();
+                    assertThat(ReflectionTestUtils.getField(
+                            context.getBean(JdbcEventPublicationWorker.class), "fallbackHandler"))
+                            .isSameAs(fallback);
                 });
     }
 
@@ -162,40 +176,7 @@ class ReliableEventAutoConfigurationTest {
                 .run(context -> assertThat(context).hasFailed());
     }
 
-    @Test
-    void deadOperationsRequireExplicitOptInWithoutAffectingPublisher() {
-        jdbcRunner().withBean(EventTransport.class, () -> mock(EventTransport.class))
-                .run(context -> {
-                    assertThat(context).hasNotFailed();
-                    assertThat(context).hasSingleBean(ReliableEventPublisher.class);
-                    assertThat(context).doesNotHaveBean(DeadEventOperations.class);
-                });
-
-        jdbcRunner().withBean(EventTransport.class, () -> mock(EventTransport.class))
-                .withPropertyValues("reliable-event.dead-operations-enabled=true")
-                .run(context -> {
-                    assertThat(context).hasNotFailed();
-                    assertThat(context).hasSingleBean(ReliableEventPublisher.class);
-                    assertThat(context).hasSingleBean(DeadEventOperations.class);
-                    assertThat(context.getBean(DeadEventOperations.class))
-                            .isInstanceOf(JdbcDeadEventOperations.class);
-                });
-    }
-
-    @Test
-    void customDeadOperationsOverrideIsPreserved() {
-        DeadEventOperations custom = mock(DeadEventOperations.class);
-        jdbcRunner().withBean(EventTransport.class, () -> mock(EventTransport.class))
-                .withBean(DeadEventOperations.class, () -> custom)
-                .withPropertyValues("reliable-event.dead-operations-enabled=true")
-                .run(context -> {
-                    assertThat(context).hasNotFailed();
-                    assertThat(context).hasSingleBean(DeadEventOperations.class);
-                    assertThat(context.getBean(DeadEventOperations.class)).isSameAs(custom);
-                });
-    }
-
-    @Test
+            @Test
     void bootOpenTelemetryTracerEnablesTracingWithoutReplacingCustomObserver() {
         PublicationObserver observer = mock(PublicationObserver.class);
         jdbcRunner().withConfiguration(AutoConfigurations.of(

@@ -7,6 +7,9 @@ import dev.reliableevent.jdbc.internal.persistence.StaleEventClaimException;
 import dev.reliableevent.jdbc.internal.retry.ExponentialBackoff;
 import dev.reliableevent.jdbc.internal.tracing.PublicationTracer;
 import dev.reliableevent.internal.model.StoredEvent;
+import dev.reliableevent.EventFallbackContext;
+import dev.reliableevent.EventFallbackHandler;
+import dev.reliableevent.FailedEvent;
 import dev.reliableevent.spi.EventTransport;
 import dev.reliableevent.spi.TransportFailureType;
 import dev.reliableevent.spi.TransportException;
@@ -29,6 +32,7 @@ public final class JdbcEventPublicationWorker {
     private final ExponentialBackoff backoff;
     private final PublicationObserver observer;
     private final PublicationTracer publicationTracer;
+    private final EventFallbackHandler fallbackHandler;
 
     public JdbcEventPublicationWorker(
             JdbcPublicationStore store,
@@ -38,12 +42,21 @@ public final class JdbcEventPublicationWorker {
             PublicationObserver observer,
             PublicationTracer publicationTracer
     ) {
+        this(store, transport, clock, backoff, observer, publicationTracer, null);
+    }
+
+    public JdbcEventPublicationWorker(
+            JdbcPublicationStore store, EventTransport transport, Clock clock,
+            ExponentialBackoff backoff, PublicationObserver observer,
+            PublicationTracer publicationTracer, EventFallbackHandler fallbackHandler
+    ) {
         this.store = Objects.requireNonNull(store);
         this.transport = Objects.requireNonNull(transport);
         this.clock = Objects.requireNonNull(clock);
         this.backoff = Objects.requireNonNull(backoff);
         this.observer = Objects.requireNonNull(observer);
         this.publicationTracer = Objects.requireNonNull(publicationTracer);
+        this.fallbackHandler = fallbackHandler;
     }
 
     public boolean publishClaimedEvent(ClaimedEvent claimedEvent) {
@@ -79,16 +92,16 @@ public final class JdbcEventPublicationWorker {
             TransportFailureType type = sendFailure.failureType();
             safelyTrace(() -> tracing.sendFailed(type, sendFailure));
             observe(() -> observer.sendFailed(claimedEvent, type, elapsed));
-            boolean dead = type == TransportFailureType.NON_RETRYABLE || !claimedEvent.canRetry();
+            boolean terminal = type == TransportFailureType.NON_RETRYABLE || !claimedEvent.canRetry();
             eventLog(LOG.atWarn(), claimedEvent)
                     .addKeyValue("event", "reliable_event.publish.failed")
                     .addKeyValue("failureType", type)
-                    .addKeyValue("targetStatus", dead ? "DEAD" : "RETRY_WAIT")
+                    .addKeyValue("targetStatus", terminal ? "FALLBACK_PROCESSING" : "RETRY_WAIT")
                     .addKeyValue("exceptionType", sendFailure.getClass().getName())
                     .log("event=reliable_event.publish.failed eventId={} eventType={} eventKey={} attemptCount={} leaseOwner={} failureType={} targetStatus={} exceptionType={}",
                     claimedEvent.event().id().value(), claimedEvent.event().eventType(),
                     claimedEvent.event().eventKey(), claimedEvent.attemptCount(),
-                    claimedEvent.leaseOwner(), type, dead ? "DEAD" : "RETRY_WAIT",
+                    claimedEvent.leaseOwner(), type, terminal ? "FALLBACK_PROCESSING" : "RETRY_WAIT",
                     sendFailure.getClass().getName());
             try {
                 markFailed(claimedEvent, sendFailure, type, tracing);
@@ -152,11 +165,20 @@ public final class JdbcEventPublicationWorker {
         boolean outerTransaction = TransactionSynchronizationManager.isActualTransactionActive();
 
         if (failureType == TransportFailureType.NON_RETRYABLE || !claimedEvent.canRetry()) {
+            requireNoActiveTransactionForFallback();
             try {
-                store.markDead(claimedEvent, failedAt, lastError);
-                safelyTrace(() -> tracing.stateUpdated("DEAD", outerTransaction));
+                EventFallbackContext.StopReason stopReason = failureType == TransportFailureType.NON_RETRYABLE
+                        ? EventFallbackContext.StopReason.NON_RETRYABLE
+                        : EventFallbackContext.StopReason.ATTEMPTS_EXHAUSTED;
+                EventFallbackContext.FailureClassification classification = fallbackClassification(failureType);
+                ClaimedEvent processing = store.beginFallback(claimedEvent, lastError,
+                        stopReason.name(), classification.name());
+                FallbackOutcome outcome = invokeFallback(processing, stopReason, classification, lastError);
+                store.finishFallback(processing, outcome.completed(), outcome.failureSummary());
+                String status = outcome.completed() ? "FALLBACK_COMPLETED" : "FAILED";
+                safelyTrace(() -> tracing.stateUpdated(status, outerTransaction));
             } catch (RuntimeException stateFailure) {
-                safelyTrace(() -> tracing.stateUpdateFailed("DEAD", stateFailure,
+                safelyTrace(() -> tracing.stateUpdateFailed("FALLBACK_PROCESSING", stateFailure,
                         stateFailure instanceof StaleEventClaimException));
                 throw stateFailure;
             }
@@ -172,6 +194,48 @@ public final class JdbcEventPublicationWorker {
                     stateFailure instanceof StaleEventClaimException));
             throw stateFailure;
         }
+    }
+
+    private void requireNoActiveTransactionForFallback() {
+        if (TransactionSynchronizationManager.isActualTransactionActive()) {
+            throw new IllegalStateException("Event fallback must run outside an active transaction; "
+                    + "the claimed event will be handled by lease recovery");
+        }
+    }
+
+    private FallbackOutcome invokeFallback(ClaimedEvent claimedEvent, EventFallbackContext.StopReason reason,
+                                           EventFallbackContext.FailureClassification classification,
+                                           String originalSummary) {
+        if (fallbackHandler == null) return new FallbackOutcome(false,
+                combineErrors("No EventFallbackHandler is configured", originalSummary));
+        StoredEvent stored = claimedEvent.event();
+        try {
+            fallbackHandler.handle(new EventFallbackContext(new FailedEvent(stored.id(), stored.eventType(),
+                    stored.eventKey(), stored.payloadJson(), stored.headersJson()), claimedEvent.attemptCount(),
+                    reason, classification, originalSummary));
+            return new FallbackOutcome(true, null);
+        } catch (RuntimeException fallbackFailure) {
+            LOG.warn("event=reliable_event.fallback.failed eventId={} exceptionType={}",
+                    stored.id().value(), fallbackFailure.getClass().getName());
+            return new FallbackOutcome(false,
+                    combineErrors(EventFailureSummary.from(fallbackFailure), originalSummary));
+        }
+    }
+
+    private String combineErrors(String fallback, String original) {
+        String combined = fallback + "; original send failure: " + original;
+        int count = combined.codePointCount(0, combined.length());
+        return count <= 1024 ? combined : combined.substring(0, combined.offsetByCodePoints(0, 1024));
+    }
+
+    private record FallbackOutcome(boolean completed, String failureSummary) { }
+
+    private EventFallbackContext.FailureClassification fallbackClassification(TransportFailureType type) {
+        return switch (type) {
+            case RETRYABLE -> EventFallbackContext.FailureClassification.RETRYABLE;
+            case NON_RETRYABLE -> EventFallbackContext.FailureClassification.NON_RETRYABLE;
+            case RESULT_UNKNOWN -> EventFallbackContext.FailureClassification.RESULT_UNKNOWN;
+        };
     }
 
     private PublicationTracer.Attempt beginAttempt(ClaimedEvent claimedEvent) {

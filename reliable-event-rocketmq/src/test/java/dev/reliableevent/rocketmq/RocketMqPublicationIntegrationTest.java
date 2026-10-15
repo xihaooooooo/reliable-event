@@ -225,14 +225,14 @@ class RocketMqPublicationIntegrationTest {
     }
 
     @Test
-    void missingDestinationBecomesDeadWithoutCallingTheProducer() throws Exception {
+    void missingDestinationEntersFallbackWithoutCallingTheProducer() throws Exception {
         Producer unusedProducer = mock(Producer.class);
         RocketMqEventTransport missingDestinationSender = new RocketMqEventTransport(PROVIDER, unusedProducer, new MapEventDestinationResolver(Map.of()));
         EventId eventId = publish("missing-" + System.nanoTime(), new TaskPayload(102));
 
         assertThat(publishPending(worker(missingDestinationSender, Clock.systemUTC()), Clock.systemUTC())).isZero();
 
-        assertThat(statusOf(eventId)).isEqualTo(EventStatus.DEAD.code());
+        assertThat(statusOf(eventId)).isEqualTo(EventStatus.FAILED.code());
         assertThat(attemptCountOf(eventId)).isOne();
         assertThat(lastErrorOf(eventId)).contains("No RocketMQ destination is configured")
                 .doesNotContain("TaskPayload");
@@ -240,7 +240,7 @@ class RocketMqPublicationIntegrationTest {
     }
 
     @Test
-    void oversizedBodyBecomesDeadWithoutCallingTheProducer() throws Exception {
+    void oversizedBodyEntersFallbackWithoutCallingTheProducer() throws Exception {
         Producer unusedProducer = mock(Producer.class);
         RocketMqEventTransport smallBodySender = sender(unusedProducer, 32);
         EventId eventId = publish(
@@ -250,7 +250,7 @@ class RocketMqPublicationIntegrationTest {
 
         assertThat(publishPending(worker(smallBodySender, Clock.systemUTC()), Clock.systemUTC())).isZero();
 
-        assertThat(statusOf(eventId)).isEqualTo(EventStatus.DEAD.code());
+        assertThat(statusOf(eventId)).isEqualTo(EventStatus.FAILED.code());
         assertThat(attemptCountOf(eventId)).isOne();
         assertThat(lastErrorOf(eventId)).contains("exceeds the configured limit")
                 .doesNotContain("xxxxxxxx");
@@ -369,21 +369,21 @@ class RocketMqPublicationIntegrationTest {
                     eventId.value());
             assertThat(publishPending(worker(sender, Clock.systemUTC()), Clock.systemUTC())).isZero();
 
-            assertThat(statusOf(eventId)).isEqualTo(EventStatus.DEAD.code());
+            assertThat(statusOf(eventId)).isEqualTo(EventStatus.FAILED.code());
             assertThat(attemptCountOf(eventId)).isEqualTo(2);
             assertThat(firstAttempt).isOne();
         } finally {
             environment.unpauseBroker();
         }
         List<MessageView> possiblyAccepted = receiveAvailableMessages(eventKey);
-        assertThat(statusOf(eventId)).isEqualTo(EventStatus.DEAD.code());
+        assertThat(statusOf(eventId)).isEqualTo(EventStatus.FAILED.code());
         assertThat(attemptCountOf(eventId)).isEqualTo(2);
         Files.writeString(timeline, "broker=RocketMQ 5.5.0 paused during both real Producer attempts\n" +
                 "firstAttemptCount=" + firstAttempt + "\nsecondAttemptCount=" + attemptCountOf(eventId) +
-                "\nsecondAttemptState=DEAD\nnextAttemptAdvance=SQL test acceleration\n" +
+                "\nsecondAttemptState=FAILED\nnextAttemptAdvance=SQL test acceleration\n" +
                 "possibleLateBrokerAcceptances=" + possiblyAccepted.size() + "\n" +
                 "acceptedMessageIds=" + messageIds(possiblyAccepted) + "\n" +
-                "postUnpauseOutboxState=DEAD; no further application retry\n");
+                "postUnpauseOutboxState=FAILED; no further application retry\n");
     }
 
     @Test

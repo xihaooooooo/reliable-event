@@ -282,7 +282,7 @@ try {
     $samplesPath = Join-Path $runDir 'samples.csv'
     $samples = [System.IO.StreamWriter]::new($samplesPath, $false, [System.Text.UTF8Encoding]::new($false))
     try {
-        $samples.WriteLine('epoch_ms,total,pending,publishing,published,retry_wait,dead,mysql_cpu_pct,mysql_mem_usage,mysql_block_io,broker_cpu_pct,broker_mem_usage,broker_block_io,publisher_cpu_seconds,publisher_working_set_bytes,publisher_private_bytes,publisher_thread_count,publisher_handle_count,receiver_cpu_seconds,receiver_working_set_bytes,receiver_private_bytes,receiver_thread_count,receiver_handle_count,threads_connected,threads_running,innodb_row_lock_waits,innodb_row_lock_time_ms')
+        $samples.WriteLine('epoch_ms,total,pending,publishing,published,retry_wait,failed,mysql_cpu_pct,mysql_mem_usage,mysql_block_io,broker_cpu_pct,broker_mem_usage,broker_block_io,publisher_cpu_seconds,publisher_working_set_bytes,publisher_private_bytes,publisher_thread_count,publisher_handle_count,receiver_cpu_seconds,receiver_working_set_bytes,receiver_private_bytes,receiver_thread_count,receiver_handle_count,threads_connected,threads_running,innodb_row_lock_waits,innodb_row_lock_time_ms')
         do {
             if ($brokerPaused -and (Get-Date) -ge $pauseUntil) {
                 docker compose unpause broker

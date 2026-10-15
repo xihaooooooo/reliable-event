@@ -13,12 +13,25 @@ public record ExpiredLeaseCandidate(
         int attemptCount,
         int maxAttempts,
         String eventType,
-        String eventKey
+        String eventKey,
+        String payloadJson,
+        String headersJson,
+        EventStatus status,
+        String lastError,
+        String fallbackStopReason,
+        String fallbackFailureClassification
 ) {
 
     public ExpiredLeaseCandidate(EventId id, long version, String leaseOwner, Instant leaseUntil,
                                  int attemptCount, int maxAttempts) {
-        this(id, version, leaseOwner, leaseUntil, attemptCount, maxAttempts, null, null);
+        this(id, version, leaseOwner, leaseUntil, attemptCount, maxAttempts, null, null,
+                null, null, EventStatus.PUBLISHING, null, null, null);
+    }
+
+    public ExpiredLeaseCandidate(EventId id, long version, String leaseOwner, Instant leaseUntil,
+                                 int attemptCount, int maxAttempts, String eventType, String eventKey) {
+        this(id, version, leaseOwner, leaseUntil, attemptCount, maxAttempts, eventType, eventKey,
+                null, null, EventStatus.PUBLISHING, null, null, null);
     }
 
     public ExpiredLeaseCandidate {

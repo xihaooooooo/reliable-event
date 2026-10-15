@@ -1,6 +1,8 @@
 package dev.reliableevent.jdbc.internal.publication;
 
 import dev.reliableevent.EventId;
+import dev.reliableevent.EventFallbackContext;
+import dev.reliableevent.EventFallbackHandler;
 import dev.reliableevent.internal.model.StoredEvent;
 import dev.reliableevent.jdbc.internal.model.ClaimedEvent;
 import dev.reliableevent.jdbc.internal.model.EventStatus;
@@ -16,6 +18,7 @@ import org.junit.jupiter.api.Test;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.TransactionStatus;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 
 import java.time.Clock;
 import java.time.Duration;
@@ -24,6 +27,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -44,6 +48,10 @@ class JdbcEventPublicationWorkerTest {
     private final List<String> updates = new ArrayList<>();
 
     private JdbcEventPublicationWorker worker(EventTransport transport) {
+        return worker(transport, null);
+    }
+
+    private JdbcEventPublicationWorker worker(EventTransport transport, EventFallbackHandler fallbackHandler) {
         when(transactions.getTransaction(any())).thenReturn(mock(TransactionStatus.class));
         when(jdbc.update(anyString(), any(Object[].class))).thenAnswer(invocation -> {
             states.add(invocation.getArgument(1));
@@ -53,7 +61,8 @@ class JdbcEventPublicationWorkerTest {
         JdbcPublicationStore store = new JdbcPublicationStore(jdbc, transactions, Clock.systemUTC(),
                 "worker-test", Duration.ofSeconds(30), observer);
         return new JdbcEventPublicationWorker(store, transport, Clock.systemUTC(),
-                new ExponentialBackoff(java.time.Duration.ofSeconds(1), java.time.Duration.ofMinutes(5), 0.2), observer, dev.reliableevent.jdbc.internal.tracing.PublicationTracer.NOOP);
+                new ExponentialBackoff(java.time.Duration.ofSeconds(1), java.time.Duration.ofMinutes(5), 0.2),
+                observer, dev.reliableevent.jdbc.internal.tracing.PublicationTracer.NOOP, fallbackHandler);
     }
 
     @Test
@@ -77,7 +86,7 @@ class JdbcEventPublicationWorkerTest {
     }
 
     @Test
-    void classifiedTransportFailuresChooseRetryOrDead() {
+    void classifiedTransportFailuresChooseRetryOrFallback() {
         for (TransportFailureType type : TransportFailureType.values()) {
             var event = claimed("{}", 1);
             var failure = new TransportException(type, "classified");
@@ -85,7 +94,7 @@ class JdbcEventPublicationWorkerTest {
             verify(observer).sendFailed(eq(event), eq(type), anyLong());
             assertThat(states.get(states.size() - 1)).isEqualTo(
                     type == TransportFailureType.NON_RETRYABLE
-                            ? EventStatus.DEAD.code() : EventStatus.RETRY_WAIT.code());
+                            ? EventStatus.FAILED.code() : EventStatus.RETRY_WAIT.code());
         }
     }
 
@@ -103,14 +112,73 @@ class JdbcEventPublicationWorkerTest {
     }
 
     @Test
-    void exhaustedUnknownResultBecomesDead() {
+    void exhaustedUnknownResultFallsBackAndMissingHandlerLeavesFailed() {
         var event = claimed("{}", 4);
         assertThat(worker(outbound -> null).publishClaimedEvent(event)).isFalse();
-        assertThat(states).containsExactly(EventStatus.DEAD.code());
+        assertThat(states).contains(EventStatus.FAILED.code());
+        assertThat(updates.toString()).contains("status = 6");
     }
 
     @Test
-    void malformedReservedAndOversizedHeadersBecomeDeadBeforeCallingTransport() {
+    void fallbackIsCalledOnlyForTerminalFailureAndReceivesRawInvalidHeaders() {
+        AtomicInteger calls = new AtomicInteger();
+        List<EventFallbackContext> contexts = new ArrayList<>();
+        EventFallbackHandler handler = context -> { calls.incrementAndGet(); contexts.add(context); };
+        var retryable = claimed("{}", 1);
+        assertThat(worker(outbound -> { throw new TransportException(TransportFailureType.RETRYABLE, "retry"); },
+                handler).publishClaimedEvent(retryable)).isFalse();
+        assertThat(calls).hasValue(0);
+
+        var terminal = claimed("not-json", 1);
+        assertThat(worker(outbound -> { throw new TransportException(TransportFailureType.NON_RETRYABLE, "reject"); },
+                handler).publishClaimedEvent(terminal)).isFalse();
+        assertThat(calls).hasValue(1);
+        assertThat(contexts.get(0).event().headersJson()).isEqualTo("not-json");
+        assertThat(contexts.get(0).failureClassification())
+                .isEqualTo(EventFallbackContext.FailureClassification.NON_RETRYABLE);
+        assertThat(states).contains(EventStatus.FALLBACK_COMPLETED.code());
+    }
+
+    @Test
+    void fallbackExceptionLeavesFailedWithFallbackAndOriginalErrors() {
+        EventFallbackHandler handler = context -> { throw new IllegalArgumentException("fallback-broke"); };
+        assertThat(worker(outbound -> { throw new TransportException(TransportFailureType.NON_RETRYABLE, "send-broke"); },
+                handler).publishClaimedEvent(claimed("{}", 1))).isFalse();
+        assertThat(updates.toString()).contains("fallback-broke", "send-broke");
+        assertThat(states).contains(EventStatus.FAILED.code());
+    }
+
+    @Test
+    void exhaustedUnknownResultPreservesUnknownClassificationAndStopReason() {
+        List<EventFallbackContext> handled = new ArrayList<>();
+        assertThat(worker(outbound -> null, handled::add)
+                .publishClaimedEvent(claimed("{}", 4))).isFalse();
+        assertThat(handled).singleElement().satisfies(context -> {
+            assertThat(context.stopReason()).isEqualTo(EventFallbackContext.StopReason.ATTEMPTS_EXHAUSTED);
+            assertThat(context.failureClassification())
+                    .isEqualTo(EventFallbackContext.FailureClassification.RESULT_UNKNOWN);
+        });
+        assertThat(states).contains(EventStatus.FALLBACK_COMPLETED.code());
+    }
+
+    @Test
+    void fallbackIsRejectedInsideCallerTransaction() {
+        TransactionSynchronizationManager.setActualTransactionActive(true);
+        try {
+            AtomicInteger calls = new AtomicInteger();
+            assertThatThrownBy(() -> worker(outbound -> {
+                throw new TransportException(TransportFailureType.NON_RETRYABLE, "reject");
+            }, context -> calls.incrementAndGet()).publishClaimedEvent(claimed("{}", 1)))
+                    .isInstanceOf(IllegalStateException.class)
+                    .hasMessageContaining("outside an active transaction");
+            assertThat(calls).hasValue(0);
+        } finally {
+            TransactionSynchronizationManager.clear();
+        }
+    }
+
+    @Test
+    void malformedReservedAndOversizedHeadersEnterFallbackBeforeCallingTransport() {
         EventTransport transport = mock(EventTransport.class);
         var worker = worker(transport);
         for (String headers : new String[]{null, " ", "not-json", "null", "[]", "{\"x\":1}",
@@ -122,17 +190,20 @@ class JdbcEventPublicationWorkerTest {
             verify(observer).sendFailed(eq(event), eq(TransportFailureType.NON_RETRYABLE), anyLong());
         }
         verifyNoInteractions(transport);
-        assertThat(states).hasSize(10).containsOnly(EventStatus.DEAD.code());
+        assertThat(states).hasSize(20);
+        assertThat(states).contains(EventStatus.FAILED.code());
+        assertThat(updates.toString()).contains("status = 6");
     }
 
     @Test
-    void invalidStoredFieldsBecomeDeadBeforeCallingTransport() {
+    void invalidStoredFieldsEnterFallbackBeforeCallingTransport() {
         EventTransport transport = mock(EventTransport.class);
         var event = new ClaimedEvent(new StoredEvent(new EventId(1), " ", "key", "{}", "{}"),
                 1, 1, 4, "worker-test", Instant.now().plusSeconds(30));
         assertThat(worker(transport).publishClaimedEvent(event)).isFalse();
         verifyNoInteractions(transport);
-        assertThat(states).containsExactly(EventStatus.DEAD.code());
+        assertThat(states).contains(EventStatus.FAILED.code());
+        assertThat(updates.toString()).contains("status = 6");
     }
 
     private ClaimedEvent claimed(String headers, int attempt) {

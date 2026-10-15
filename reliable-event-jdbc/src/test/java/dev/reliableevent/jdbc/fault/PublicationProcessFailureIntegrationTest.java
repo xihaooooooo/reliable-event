@@ -45,7 +45,6 @@ import static org.assertj.core.api.Assertions.assertThat;
 @Transactional(propagation = Propagation.NOT_SUPPORTED)
 @Sql({
         "classpath:schema/reliable-event-outbox.sql",
-        "classpath:schema/reliable-event-replay-audit-m6-2.sql",
         "classpath:schema/test-business-record.sql",
         "classpath:schema/test-message-delivery.sql",
         "classpath:schema/clear-test-data.sql"
@@ -60,10 +59,8 @@ class PublicationProcessFailureIntegrationTest {
     private static final String RECOVERY_WORKER_ID = "process-recovery-worker";
 
     @Container
-    static final MySQLContainer<?> MYSQL = new MySQLContainer<>("mysql:8.0.36")
-            .withDatabaseName("reliable_event_process_test")
-            .withUsername("test")
-            .withPassword("test");
+    static final dev.reliableevent.jdbc.TestMySqlContainer MYSQL =
+            dev.reliableevent.jdbc.TestMySqlContainer.configured("reliable_event_process_test");
 
     @DynamicPropertySource
     static void configureDataSource(DynamicPropertyRegistry registry) {

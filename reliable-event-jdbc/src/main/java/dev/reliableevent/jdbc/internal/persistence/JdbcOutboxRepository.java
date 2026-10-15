@@ -100,17 +100,17 @@ public final class JdbcOutboxRepository {
                 JdbcOutboxSql.COUNT_STATUSES,
                 resultSet -> {
                     long backlog = 0;
-                    long dead = 0;
+                    long failed = 0;
                     while (resultSet.next()) {
-                        if (resultSet.getInt("status") == EventStatus.DEAD.code()) {
-                            dead += resultSet.getLong("total");
+                        if (resultSet.getInt("status") == EventStatus.FAILED.code()) {
+                            failed += resultSet.getLong("total");
                         } else {
                             backlog += resultSet.getLong("total");
                         }
                     }
-                    return new OutboxCounts(backlog, dead);
+                    return new OutboxCounts(backlog, failed);
                 },
-                EventStatus.PENDING.code(), EventStatus.RETRY_WAIT.code(), EventStatus.DEAD.code()
+                EventStatus.PENDING.code(), EventStatus.RETRY_WAIT.code(), EventStatus.FAILED.code()
         );
     }
 
@@ -130,7 +130,7 @@ public final class JdbcOutboxRepository {
                 long ready = result.getLong("ready");
                 long unfinished = result.getLong("unfinished_overdue");
                 return new OutboxMetricsSnapshot(
-                        result.getLong("backlog"), result.getLong("dead"), ready,
+                        result.getLong("backlog"), result.getLong("failed"), ready,
                         age(result, "ready_oldest_age", ready), unfinished,
                         age(result, "unfinished_oldest_age", unfinished),
                         result.getLong("unfinished_timestamp_missing"));
@@ -163,9 +163,14 @@ public final class JdbcOutboxRepository {
                         resultSet.getInt("attempt_count"),
                         resultSet.getInt("max_attempts"),
                         resultSet.getString("event_type"),
-                        resultSet.getString("event_key")
+                        resultSet.getString("event_key"),
+                        resultSet.getString("payload"), resultSet.getString("headers"),
+                        resultSet.getInt("status") == EventStatus.FALLBACK_PROCESSING.code()
+                                ? EventStatus.FALLBACK_PROCESSING : EventStatus.PUBLISHING,
+                        resultSet.getString("last_error"), resultSet.getString("fallback_stop_reason"),
+                        resultSet.getString("fallback_failure_classification")
                 ),
-                EventStatus.PUBLISHING.code(),
+                EventStatus.PUBLISHING.code(), EventStatus.FALLBACK_PROCESSING.code(),
                 limit
         );
     }
@@ -257,20 +262,48 @@ public final class JdbcOutboxRepository {
         }
     }
 
-    public void markDead(ClaimedEvent claimedEvent, Instant failedAt, String lastError) {
-        int updated = jdbcTemplate.update(
-                JdbcOutboxSql.MARK_DEAD,
-                EventStatus.DEAD.code(),
-                lastError,
-                Timestamp.from(failedAt),
-                claimedEvent.event().id().value(),
-                EventStatus.PUBLISHING.code(),
-                claimedEvent.claimVersion(),
-                claimedEvent.leaseOwner()
-        );
-        if (updated != 1) {
-            throw staleClaim(claimedEvent);
-        }
+    public boolean beginFallback(ClaimedEvent event, String summary, String stopReason,
+                                 String failureClassification, String fallbackOwner, long leaseMicros) {
+        int updated = jdbcTemplate.update(JdbcOutboxSql.BEGIN_FALLBACK, summary, stopReason,
+                failureClassification, fallbackOwner, leaseMicros, event.event().id().value(),
+                event.claimVersion(), event.leaseOwner());
+        return updated == 1;
+    }
+
+    public boolean claimExpiredFallback(ExpiredLeaseCandidate candidate, String fallbackOwner,
+                                        long leaseMicros) {
+        int updated = jdbcTemplate.update(JdbcOutboxSql.CLAIM_EXPIRED_FALLBACK,
+                fallbackOwner, leaseMicros, candidate.id().value(), candidate.version(),
+                candidate.leaseOwner(), Timestamp.from(candidate.leaseUntil()));
+        return updated == 1;
+    }
+
+    public Optional<ClaimedEvent> claimExpiredFallbackEvent(ExpiredLeaseCandidate candidate,
+                                                             String fallbackOwner, Duration leaseDuration) {
+        long leaseMicros = positiveDurationMicros(leaseDuration, "leaseDuration");
+        if (!claimExpiredFallback(candidate, fallbackOwner, leaseMicros)) return Optional.empty();
+        return Optional.of(findClaimedEvent(candidate.id().value()));
+    }
+
+    public Optional<ClaimedEvent> recoverExpiredLeaseToFallback(ExpiredLeaseCandidate candidate,
+                                                                  String fallbackOwner,
+                                                                  Duration leaseDuration,
+                                                                  String summary,
+                                                                  String stopReason,
+                                                                  String failureClassification) {
+        long micros = positiveDurationMicros(leaseDuration, "leaseDuration");
+        int updated = jdbcTemplate.update(JdbcOutboxSql.RECOVER_EXPIRED_LEASE_TO_FALLBACK,
+                summary, stopReason, failureClassification, fallbackOwner, micros,
+                candidate.id().value(), candidate.version(), candidate.leaseOwner(),
+                Timestamp.from(candidate.leaseUntil()));
+        return updated == 1 ? Optional.of(findClaimedEvent(candidate.id().value())) : Optional.empty();
+    }
+
+    public void finishFallback(ClaimedEvent event, boolean completed, String failureSummary) {
+        int updated = jdbcTemplate.update(JdbcOutboxSql.FINISH_FALLBACK,
+                completed ? EventStatus.FALLBACK_COMPLETED.code() : EventStatus.FAILED.code(),
+                failureSummary, event.event().id().value(), event.claimVersion(), event.leaseOwner());
+        if (updated != 1) throw staleClaim(event);
     }
 
     public boolean recoverExpiredLeaseToRetryWait(
@@ -283,23 +316,6 @@ public final class JdbcOutboxRepository {
                 JdbcOutboxSql.RECOVER_EXPIRED_LEASE_TO_RETRY_WAIT,
                 EventStatus.RETRY_WAIT.code(),
                 delayMicros,
-                Objects.requireNonNull(lastError, "lastError must not be null"),
-                candidate.id().value(),
-                EventStatus.PUBLISHING.code(),
-                candidate.version(),
-                candidate.leaseOwner(),
-                Timestamp.from(candidate.leaseUntil())
-        );
-        return updated == 1;
-    }
-
-    public boolean recoverExpiredLeaseToDead(
-            ExpiredLeaseCandidate candidate,
-            String lastError
-    ) {
-        int updated = jdbcTemplate.update(
-                JdbcOutboxSql.RECOVER_EXPIRED_LEASE_TO_DEAD,
-                EventStatus.DEAD.code(),
                 Objects.requireNonNull(lastError, "lastError must not be null"),
                 candidate.id().value(),
                 EventStatus.PUBLISHING.code(),

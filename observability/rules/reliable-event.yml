@@ -27,10 +27,10 @@ groups:
             reliable_event_unfinished_overdue_oldest_age{job="reliable-event-example"}
             and on (instance, outbox_store) reliable_event:snapshot_fresh
           )
-      - record: reliable_event:dead:fresh
+      - record: reliable_event:failed:fresh
         expr: |
           max by (outbox_store) (
-            reliable_event_dead{job="reliable-event-example"}
+            reliable_event_failed{job="reliable-event-example"}
             and on (instance, outbox_store) reliable_event:snapshot_fresh
           )
   - name: reliable-event-alerts
@@ -97,7 +97,7 @@ groups:
           summary: "An overdue Outbox event is older than the demo threshold"
           impact: "At least one PENDING, PUBLISHING, or RETRY_WAIT event has remained unfinished after first availability; active progress elsewhere cannot hide it."
           diagnosis: "Inspect Outbox status, first_available_at, attempt_count, next_attempt_at, scheduler heartbeat, sender failure counters, and state update failures."
-          recovery: "Fresh snapshot reports no overdue unfinished event older than 60 seconds. DEAD transitions are followed by ReliableEventNewDeadLetter."
+          recovery: "Fresh snapshot reports no overdue unfinished event older than 60 seconds. FAILED transitions are followed by ReliableEventNewFailedEvent."
           runbook: "http://localhost:3000/d/reliable-event-ops/reliable-event-operations?viewPanel=11"
 
       - alert: ReliableEventSchedulerNotRunning
@@ -142,15 +142,15 @@ groups:
           recovery: "A persisted counter increase occurs or no fresh overdue unfinished events remain."
           runbook: "http://localhost:3000/d/reliable-event-ops/reliable-event-operations?viewPanel=11"
 
-      - alert: ReliableEventNewDeadLetter
-        expr: sum by (outbox_store) (increase(reliable_event_dead_entered_total{job="reliable-event-example"}[10m])) > 0
+      - alert: ReliableEventNewFailedEvent
+        expr: sum by (outbox_store) (increase(reliable_event_failed_entered_total{job="reliable-event-example"}[10m])) > 0
         labels:
           severity: warning
         annotations:
-          summary: "A new event entered DEAD for Outbox {{ $labels.outbox_store }}"
+          summary: "A new event entered FAILED for Outbox {{ $labels.outbox_store }}"
           impact: "This event will not be sent automatically; producer PUBLISHED does not represent consumer completion."
-          diagnosis: "Inspect the dead gauge and use the documented read-only DEAD query; compare broker and consumer facts before any replay."
-          recovery: "An operator records the cause and authorized disposition; the increase alert clears after its 10-minute window."
+          diagnosis: "Inspect the failed gauge and the application's failure records; compare broker and consumer facts before retry or compensation."
+          recovery: "The application records the cause and completes its authorized disposition; the increase alert clears after its 10-minute window."
           runbook: "http://localhost:3000/d/reliable-event-ops/reliable-event-operations?viewPanel=11"
 
       - alert: ReliableEventSendFailureRateHigh

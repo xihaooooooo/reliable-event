@@ -17,7 +17,17 @@ public interface PublicationObserver {
 
     default void sendFailed(ClaimedEvent event, TransportFailureType type, long elapsedNanos) { }
 
-    default void leaseRecovered(ExpiredLeaseCandidate candidate, boolean dead) { }
+    default void leaseRecovered(ExpiredLeaseCandidate candidate, boolean failed) { }
+
+    /**
+     * Called after an expired-lease transition commits. The default bridges the historical
+     * retry-versus-failed callback; fallback completion has no boolean equivalent and is omitted
+     * for legacy observers.
+     */
+    default void leaseRecovered(ExpiredLeaseCandidate candidate, String targetStatus) {
+        if ("RETRY_WAIT".equals(targetStatus)) leaseRecovered(candidate, false);
+        else if ("FAILED".equals(targetStatus)) leaseRecovered(candidate, true);
+    }
 
     default void refreshSnapshot() { }
 

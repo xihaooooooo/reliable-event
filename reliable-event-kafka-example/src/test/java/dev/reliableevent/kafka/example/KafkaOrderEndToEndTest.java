@@ -310,7 +310,7 @@ class KafkaOrderEndToEndTest {
     }
 
     @Test
-    void brokerRejectingOversizedRecordMovesEventToDead() throws Exception {
+    void brokerRejectingOversizedRecordEntersFallback() throws Exception {
         setMaxMessageBytes(1);
         OrderService.CreatedOrder created = context.getBean(OrderService.class).create("pen", 2);
 

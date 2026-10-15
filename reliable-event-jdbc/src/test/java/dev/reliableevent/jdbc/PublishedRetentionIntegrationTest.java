@@ -40,10 +40,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 class PublishedRetentionIntegrationTest {
 
     @Container
-    static final MySQLContainer<?> MYSQL = new MySQLContainer<>("mysql:8.0.36")
-            .withDatabaseName("reliable_event_retention_test")
-            .withUsername("test")
-            .withPassword("test");
+    static final TestMySqlContainer MYSQL = TestMySqlContainer.configured("reliable_event_retention_test");
 
     @DynamicPropertySource
     static void configure(DynamicPropertyRegistry registry) {
@@ -72,16 +69,16 @@ class PublishedRetentionIntegrationTest {
     @Test
     void oldRowsAreBackfilledAndDuplicateRegistrationReturnsOriginalId() {
         EventId old = publish("old");
-        EventId dead = publish("dead-old");
-        jdbc.update("UPDATE reliable_event_outbox SET status = 4 WHERE id = ?", dead.value());
+        EventId failed = publish("failed-old");
+        jdbc.update("UPDATE reliable_event_outbox SET status = 4 WHERE id = ?", failed.value());
         jdbc.update("DELETE FROM reliable_event_identity WHERE id = ?", old.value());
-        jdbc.update("DELETE FROM reliable_event_identity WHERE id = ?", dead.value());
+        jdbc.update("DELETE FROM reliable_event_identity WHERE id = ?", failed.value());
         new ResourceDatabasePopulator(new ClassPathResource("schema/reliable-event-identity-m7-1.sql"))
                 .execute(jdbc.getDataSource());
 
         assertThat(publish("old")).isEqualTo(old);
         EventId next = publish("new");
-        assertThat(next.value()).isGreaterThan(dead.value());
+        assertThat(next.value()).isGreaterThan(failed.value());
         assertThat(count("reliable_event_outbox")).isEqualTo(3);
         assertThat(count("reliable_event_identity")).isEqualTo(3);
     }
@@ -109,20 +106,20 @@ class PublishedRetentionIntegrationTest {
     }
 
     @Test
-    void batchLimitAndFourOtherStatesProtectRows() {
+    void batchLimitAndAllNonPublishedStatesProtectRows() {
         for (int index = 0; index < 3; index++) {
             EventId id = publish("published-" + index);
             markOld(id, 2);
         }
-        for (int status : new int[] {0, 1, 3, 4}) {
+        for (int status : new int[] {0, 1, 3, 4, 5, 6}) {
             EventId id = publish("state-" + status);
             markOld(id, status);
         }
         assertThat(retention.runOnce(Duration.ofDays(1), 2).deleted()).isEqualTo(2);
         assertThat(retention.runOnce(Duration.ofDays(1), 2).deleted()).isOne();
         assertThat(retention.runOnce(Duration.ofDays(1), 2).deleted()).isZero();
-        assertThat(count("reliable_event_outbox")).isEqualTo(4);
-        assertThat(count("reliable_event_identity")).isEqualTo(7);
+        assertThat(count("reliable_event_outbox")).isEqualTo(6);
+        assertThat(count("reliable_event_identity")).isEqualTo(9);
     }
 
     @Test

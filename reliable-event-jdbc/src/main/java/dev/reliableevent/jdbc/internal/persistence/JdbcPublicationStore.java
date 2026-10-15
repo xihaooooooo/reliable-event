@@ -16,6 +16,7 @@ import java.time.Instant;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.UUID;
 
 /** Coordinates outbox queries and short state-transition transactions. */
 public final class JdbcPublicationStore {
@@ -75,8 +76,26 @@ public final class JdbcPublicationStore {
                 () -> repository.markRetryWait(event, failedAt, nextAttemptAt, lastError));
     }
 
-    public void markDead(ClaimedEvent event, Instant failedAt, String lastError) {
-        update("DEAD", () -> repository.markDead(event, failedAt, lastError));
+    public ClaimedEvent beginFallback(ClaimedEvent event, String summary, String stopReason,
+                                      String failureClassification) {
+        String owner = "fallback-" + UUID.randomUUID();
+        long leaseMicros = Math.multiplyExact(leaseDuration.toMillis(), 1_000L);
+        Boolean changed = transaction.execute(status -> repository.beginFallback(event, summary,
+                stopReason, failureClassification, owner, leaseMicros));
+        if (!Boolean.TRUE.equals(changed)) throw new StaleEventClaimException(event.event().id().value(), event.leaseOwner());
+        return new ClaimedEvent(event.event(), event.claimVersion() + 1, event.attemptCount(),
+                event.maxAttempts(), owner, clock.instant().plus(leaseDuration), event.firstAvailableAt());
+    }
+
+    public Optional<ClaimedEvent> claimExpiredFallback(
+            dev.reliableevent.jdbc.internal.model.ExpiredLeaseCandidate candidate) {
+        String owner = "fallback-" + UUID.randomUUID();
+        return transaction.execute(status -> repository.claimExpiredFallbackEvent(candidate, owner, leaseDuration));
+    }
+
+    public void finishFallback(ClaimedEvent event, boolean completed, String failureSummary) {
+        update(completed ? "FALLBACK_COMPLETED" : "FAILED",
+                () -> repository.finishFallback(event, completed, failureSummary));
     }
 
     private void update(String state, Runnable operation) {
@@ -84,7 +103,7 @@ public final class JdbcPublicationStore {
         try {
             transaction.executeWithoutResult(status -> {
                 operation.run();
-                if (state.equals("PUBLISHED") || state.equals("DEAD")) {
+                if (state.equals("PUBLISHED") || state.equals("FAILED") || state.equals("FALLBACK_COMPLETED")) {
                     afterCommit(state);
                 }
             });

@@ -13,7 +13,6 @@ import java.util.Map;
 public class ReliableEventProperties {
 
     private boolean enabled = true;
-    private boolean deadOperationsEnabled = false;
     private boolean publishedRetentionEnabled = false;
     private boolean tracingEnabled = true;
     private Duration publishedRetention;
@@ -46,10 +45,6 @@ public class ReliableEventProperties {
     public void setTransport(String transport) { this.transport = transport; }
     public boolean isEnabled() { return enabled; }
     public void setEnabled(boolean enabled) { this.enabled = enabled; }
-    public boolean isDeadOperationsEnabled() { return deadOperationsEnabled; }
-    public void setDeadOperationsEnabled(boolean deadOperationsEnabled) {
-        this.deadOperationsEnabled = deadOperationsEnabled;
-    }
     public boolean isPublishedRetentionEnabled() { return publishedRetentionEnabled; }
     public void setPublishedRetentionEnabled(boolean publishedRetentionEnabled) {
         this.publishedRetentionEnabled = publishedRetentionEnabled;

@@ -336,7 +336,7 @@ class MetricsSnapshotSamplerTest {
                 return switch (method.getName()) {
                     case "next" -> returned.compareAndSet(false, true);
                     case "getLong" -> switch (args[0].toString()) {
-                        case "backlog", "dead", "unfinished_timestamp_missing" -> 0L;
+                        case "backlog", "failed", "unfinished_timestamp_missing" -> 0L;
                         case "ready", "unfinished_overdue" -> 1L;
                         default -> 0L;
                     };

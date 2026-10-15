@@ -38,7 +38,8 @@ final class MicrometerPublicationObserver implements PublicationObserver, AutoCl
     private final Counter success;
     private final Counter failure;
     private final Counter recoveredRetry;
-    private final Counter recoveredDead;
+    private final Counter recoveredFailed;
+    private final Counter recoveredFallbackCompleted;
     private final Counter cleanupDeleted;
     private final Counter cleanupFailures;
     private final Timer cleanupDuration;
@@ -60,7 +61,8 @@ final class MicrometerPublicationObserver implements PublicationObserver, AutoCl
     private final Counter snapshotFailures;
     private final Counter stateUpdateFailures;
     private final Counter persisted;
-    private final Counter deadEntered;
+    private final Counter failedEntered;
+    private final Counter fallbackCompleted;
     private final AtomicBoolean closed = new AtomicBoolean();
     private final Object snapshotLock = new Object();
     private final AtomicBoolean snapshotInProgress = new AtomicBoolean();
@@ -86,8 +88,10 @@ final class MicrometerPublicationObserver implements PublicationObserver, AutoCl
         failure = own(Counter.builder("reliable_event.publish.failure").register(registry));
         recoveredRetry = own(Counter.builder("reliable_event.lease.expired")
                 .tag("result", "retry_wait").register(registry));
-        recoveredDead = own(Counter.builder("reliable_event.lease.expired")
-                .tag("result", "dead").register(registry));
+        recoveredFailed = own(Counter.builder("reliable_event.lease.expired")
+                .tag("result", "failed").register(registry));
+        recoveredFallbackCompleted = own(Counter.builder("reliable_event.lease.expired")
+                .tag("result", "fallback_completed").register(registry));
         cleanupDeleted = own(Counter.builder("reliable_event.retention.deleted").register(registry));
         cleanupFailures = own(Counter.builder("reliable_event.retention.failed").register(registry));
         cleanupDuration = own(Timer.builder("reliable_event.retention.duration").register(registry));
@@ -100,8 +104,8 @@ final class MicrometerPublicationObserver implements PublicationObserver, AutoCl
         own(Gauge.builder("reliable_event.backlog", snapshot, value -> {
             var current = value.get(); return current == null ? Double.NaN : (double) current.value().backlog();
         }).strongReference(true).register(registry));
-        own(Gauge.builder("reliable_event.dead", snapshot, value -> {
-            var current = value.get(); return current == null ? Double.NaN : (double) current.value().dead();
+        own(Gauge.builder("reliable_event.failed", snapshot, value -> {
+            var current = value.get(); return current == null ? Double.NaN : (double) current.value().failed();
         }).strongReference(true).register(registry));
         own(Gauge.builder("reliable_event.retention.oldest_eligible_age", oldestEligibleAge,
                 AtomicReference::get).strongReference(true).register(registry));
@@ -138,7 +142,8 @@ final class MicrometerPublicationObserver implements PublicationObserver, AutoCl
         snapshotFailures = own(Counter.builder("reliable_event.snapshot.failure").register(registry));
         stateUpdateFailures = own(Counter.builder("reliable_event.publication.state_update_failure").register(registry));
         persisted = own(Counter.builder("reliable_event.publication.persisted").register(registry));
-        deadEntered = own(Counter.builder("reliable_event.dead.entered").register(registry));
+        failedEntered = own(Counter.builder("reliable_event.failed.entered").register(registry));
+        fallbackCompleted = own(Counter.builder("reliable_event.fallback.completed").register(registry));
         for (String mode : List.of("manual", "auto")) {
             for (String stage : List.of("candidate_scan", "lease_recovery", "dispatch", "reschedule", "other")) {
                 schedulerFailures.put(mode + ":" + stage, own(Counter.builder("reliable_event.scheduler.failure")
@@ -171,8 +176,18 @@ final class MicrometerPublicationObserver implements PublicationObserver, AutoCl
     }
 
     @Override
-    public void leaseRecovered(ExpiredLeaseCandidate candidate, boolean deadResult) {
-        (deadResult ? recoveredDead : recoveredRetry).increment();
+    public void leaseRecovered(ExpiredLeaseCandidate candidate, boolean failedResult) {
+        (failedResult ? recoveredFailed : recoveredRetry).increment();
+    }
+
+    @Override
+    public void leaseRecovered(ExpiredLeaseCandidate candidate, String targetStatus) {
+        switch (targetStatus) {
+            case "RETRY_WAIT" -> recoveredRetry.increment();
+            case "FAILED" -> recoveredFailed.increment();
+            case "FALLBACK_COMPLETED" -> recoveredFallbackCompleted.increment();
+            default -> throw new IllegalArgumentException("Unknown expired-lease target status: " + targetStatus);
+        }
     }
 
     @Override
@@ -270,7 +285,8 @@ final class MicrometerPublicationObserver implements PublicationObserver, AutoCl
     public void stateTransitionCommitted(String status) {
         if (closed.get()) return;
         if ("PUBLISHED".equals(status)) persisted.increment();
-        if ("DEAD".equals(status)) deadEntered.increment();
+        if ("FAILED".equals(status)) failedEntered.increment();
+        if ("FALLBACK_COMPLETED".equals(status)) fallbackCompleted.increment();
     }
 
     @Override

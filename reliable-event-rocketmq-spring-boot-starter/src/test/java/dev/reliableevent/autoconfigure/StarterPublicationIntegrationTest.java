@@ -640,7 +640,7 @@ class StarterPublicationIntegrationTest {
                     SET status = 1,
                         attempt_count = 1,
                         version = 1,
-                        lease_owner = 'dead-worker',
+                        lease_owner = 'failed-worker',
                         lease_until = TIMESTAMPADD(SECOND, -1, UTC_TIMESTAMP(3))
                     WHERE id = ?
                     """, eventId.value());

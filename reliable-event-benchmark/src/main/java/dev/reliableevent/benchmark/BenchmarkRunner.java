@@ -217,7 +217,7 @@ final class BenchmarkRunner implements ApplicationRunner {
                     writeTimer(writer, at, "publish.lag", "", timer);
                 }
                 writeGauge(writer, at, "backlog", registry.find("reliable_event.backlog").gauge());
-                writeGauge(writer, at, "dead", registry.find("reliable_event.dead").gauge());
+                writeGauge(writer, at, "failed", registry.find("reliable_event.failed").gauge());
                 writer.flush();
                 Thread.sleep(1000);
             }

@@ -5,9 +5,12 @@ public enum EventStatus {
     PUBLISHING(1),
     PUBLISHED(2),
     RETRY_WAIT(3),
-    DEAD(4);
+    FAILED(4),
+    FALLBACK_COMPLETED(5),
+    FALLBACK_PROCESSING(6);
 
     private final int code;
+
 
     EventStatus(int code) {
         this.code = code;

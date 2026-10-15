@@ -4,6 +4,11 @@ import dev.reliableevent.jdbc.internal.model.ExpiredLeaseCandidate;
 import dev.reliableevent.jdbc.internal.observation.PublicationObserver;
 import dev.reliableevent.jdbc.internal.persistence.JdbcOutboxRepository;
 import dev.reliableevent.jdbc.internal.retry.ExponentialBackoff;
+import dev.reliableevent.EventFallbackContext;
+import dev.reliableevent.EventFallbackHandler;
+import dev.reliableevent.FailedEvent;
+import dev.reliableevent.jdbc.internal.model.ClaimedEvent;
+import dev.reliableevent.internal.model.StoredEvent;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.jdbc.core.JdbcTemplate;
@@ -15,6 +20,8 @@ import org.springframework.transaction.support.TransactionSynchronization;
 import java.time.Duration;
 import java.util.List;
 import java.util.Objects;
+import java.util.UUID;
+import java.util.Optional;
 
 public final class JdbcExpiredLeaseRecovery {
 
@@ -27,6 +34,8 @@ public final class JdbcExpiredLeaseRecovery {
     private final ExponentialBackoff backoff;
     private final int recoveryBatchSize;
     private final PublicationObserver observer;
+    private final Duration leaseDuration;
+    private final EventFallbackHandler fallbackHandler;
 
     public JdbcExpiredLeaseRecovery(
             JdbcTemplate jdbcTemplate,
@@ -35,7 +44,7 @@ public final class JdbcExpiredLeaseRecovery {
             ExponentialBackoff backoff
     ) {
         this(jdbcTemplate, transactionManager, recoveryBatchSize, backoff,
-                PublicationObserver.NOOP);
+                PublicationObserver.NOOP, Duration.ofSeconds(30), null);
     }
 
     public JdbcExpiredLeaseRecovery(
@@ -45,6 +54,14 @@ public final class JdbcExpiredLeaseRecovery {
             ExponentialBackoff backoff,
             PublicationObserver observer
     ) {
+        this(jdbcTemplate, transactionManager, recoveryBatchSize, backoff, observer,
+                Duration.ofSeconds(30), null);
+    }
+
+    public JdbcExpiredLeaseRecovery(JdbcTemplate jdbcTemplate, PlatformTransactionManager transactionManager,
+                                    int recoveryBatchSize, ExponentialBackoff backoff,
+                                    PublicationObserver observer, Duration leaseDuration,
+                                    EventFallbackHandler fallbackHandler) {
         if (recoveryBatchSize <= 0) {
             throw new IllegalArgumentException("recoveryBatchSize must be positive");
         }
@@ -53,6 +70,8 @@ public final class JdbcExpiredLeaseRecovery {
         this.recoveryBatchSize = recoveryBatchSize;
         this.backoff = Objects.requireNonNull(backoff);
         this.observer = Objects.requireNonNull(observer);
+        this.leaseDuration = Objects.requireNonNull(leaseDuration);
+        this.fallbackHandler = fallbackHandler;
     }
 
     public int recoverExpiredLeases() {
@@ -75,25 +94,16 @@ public final class JdbcExpiredLeaseRecovery {
     }
 
     private boolean recover(ExpiredLeaseCandidate candidate) {
-        boolean dead = !candidate.canRetry();
-        boolean recovered;
-        if (!candidate.canRetry()) {
-            recovered = Boolean.TRUE.equals(transaction.execute(status ->
-                    {
-                        boolean changed = repository.recoverExpiredLeaseToDead(
-                                candidate, LEASE_EXPIRED_ERROR);
-                        if (changed) afterCommit("DEAD");
-                        return changed;
-                    }
-            ));
-        } else {
-            Duration delay = backoff.nextDelay(candidate.attemptCount());
-            recovered = Boolean.TRUE.equals(transaction.execute(status ->
-                    repository.recoverExpiredLeaseToRetryWait(
-                            candidate, delay, LEASE_EXPIRED_ERROR
-                    )
-            ));
+        if (candidate.status() == dev.reliableevent.jdbc.internal.model.EventStatus.FALLBACK_PROCESSING) {
+            return recoverFallback(candidate);
         }
+        if (!candidate.canRetry()) return recoverTerminalLease(candidate);
+        Duration delay = backoff.nextDelay(candidate.attemptCount());
+        boolean recovered = Boolean.TRUE.equals(transaction.execute(status -> {
+            boolean changed = repository.recoverExpiredLeaseToRetryWait(candidate, delay, LEASE_EXPIRED_ERROR);
+            if (changed) afterCommitRecovery(candidate, "RETRY_WAIT");
+            return changed;
+        }));
         if (recovered) {
             LOG.atInfo().addKeyValue("event", "reliable_event.lease.recovered")
                     .addKeyValue("eventId", candidate.id().value())
@@ -101,18 +111,81 @@ public final class JdbcExpiredLeaseRecovery {
                     .addKeyValue("eventKey", candidate.eventKey())
                     .addKeyValue("attemptCount", candidate.attemptCount())
                     .addKeyValue("leaseOwner", candidate.leaseOwner())
-                    .addKeyValue("targetStatus", dead ? "DEAD" : "RETRY_WAIT")
-                    .log("event=reliable_event.lease.recovered eventId={} eventType={} eventKey={} attemptCount={} leaseOwner={} targetStatus={}",
+                    .addKeyValue("targetStatus", "RETRY_WAIT")
+                    .log("event=reliable_event.lease.recovered eventId={} eventType={} eventKey={} attemptCount={} leaseOwner={} targetStatus=RETRY_WAIT",
                     candidate.id().value(), candidate.eventType(), candidate.eventKey(),
-                    candidate.attemptCount(), candidate.leaseOwner(), dead ? "DEAD" : "RETRY_WAIT");
-            try {
-                observer.leaseRecovered(candidate, dead);
-            } catch (RuntimeException failure) {
-                LOG.warn("event=reliable_event.observation.failed exceptionType={}",
-                        failure.getClass().getName());
-            }
+                    candidate.attemptCount(), candidate.leaseOwner());
         }
         return recovered;
+    }
+
+    private boolean recoverTerminalLease(ExpiredLeaseCandidate candidate) {
+        requireNoActiveTransactionForFallback();
+        String owner = "fallback-" + UUID.randomUUID();
+        EventFallbackContext.StopReason reason = EventFallbackContext.StopReason.LEASE_EXPIRED;
+        EventFallbackContext.FailureClassification classification =
+                EventFallbackContext.FailureClassification.RESULT_UNKNOWN;
+        Optional<ClaimedEvent> claimed = transaction.execute(status -> repository.recoverExpiredLeaseToFallback(
+                candidate, owner, leaseDuration, LEASE_EXPIRED_ERROR, reason.name(), classification.name()));
+        if (claimed == null || claimed.isEmpty()) return false;
+        return runFallback(candidate, claimed.get(), candidate.attemptCount(), reason, classification,
+                LEASE_EXPIRED_ERROR);
+    }
+
+    private boolean recoverFallback(ExpiredLeaseCandidate candidate) {
+        requireNoActiveTransactionForFallback();
+        String owner = "fallback-" + UUID.randomUUID();
+        Optional<ClaimedEvent> claimed = transaction.execute(status -> repository.claimExpiredFallbackEvent(
+                candidate, owner, leaseDuration));
+        if (claimed == null || claimed.isEmpty()) return false;
+        EventFallbackContext.StopReason reason = EventFallbackContext.StopReason.valueOf(candidate.fallbackStopReason());
+        EventFallbackContext.FailureClassification classification = EventFallbackContext.FailureClassification
+                .valueOf(candidate.fallbackFailureClassification());
+        return runFallback(candidate, claimed.get(), candidate.attemptCount(), reason, classification,
+                candidate.lastError() == null ? LEASE_EXPIRED_ERROR : candidate.lastError());
+    }
+
+    private void requireNoActiveTransactionForFallback() {
+        if (TransactionSynchronizationManager.isActualTransactionActive()) {
+            throw new IllegalStateException("Event fallback lease recovery must run outside an active transaction");
+        }
+    }
+
+    private boolean runFallback(ExpiredLeaseCandidate candidate, ClaimedEvent claimed, int failureCount,
+                                EventFallbackContext.StopReason reason,
+                                EventFallbackContext.FailureClassification classification, String summary) {
+        boolean completed = false;
+        String failureSummary = fallbackHandler == null
+                ? bounded("No EventFallbackHandler is configured; original send failure: " + summary) : null;
+        if (fallbackHandler != null) {
+            StoredEvent event = claimed.event();
+            try {
+                fallbackHandler.handle(new EventFallbackContext(new FailedEvent(event.id(), event.eventType(),
+                        event.eventKey(), event.payloadJson(), event.headersJson()), failureCount,
+                        reason, classification, summary));
+                completed = true;
+            } catch (RuntimeException failure) {
+                LOG.warn("event=reliable_event.fallback.failed eventId={} exceptionType={}",
+                        event.id().value(), failure.getClass().getName());
+                failureSummary = bounded(failure.getClass().getName() + ": " + failure.getMessage()
+                        + "; original send failure: " + summary);
+            }
+        }
+        boolean result = completed;
+        String persistedFailure = failureSummary;
+        String state = completed ? "FALLBACK_COMPLETED" : "FAILED";
+        transaction.executeWithoutResult(status -> {
+            repository.finishFallback(claimed, result, persistedFailure);
+            afterCommit(state);
+            afterCommitRecovery(candidate, state);
+        });
+        return true;
+    }
+
+    private String bounded(String summary) {
+        String safe = summary == null ? "Fallback failed" : summary;
+        int count = safe.codePointCount(0, safe.length());
+        return count <= 1024 ? safe : safe.substring(0, safe.offsetByCodePoints(0, 1024));
     }
 
     public void refreshSnapshot() {
@@ -155,5 +228,18 @@ public final class JdbcExpiredLeaseRecovery {
                 @Override public void afterCommit() { increment.run(); }
             });
         }
+    }
+
+    private void afterCommitRecovery(ExpiredLeaseCandidate candidate, String targetStatus) {
+        if (!TransactionSynchronizationManager.isSynchronizationActive()) return;
+        TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+            @Override public void afterCommit() {
+                try { observer.leaseRecovered(candidate, targetStatus); }
+                catch (RuntimeException failure) {
+                    LOG.warn("event=reliable_event.observation.failed exceptionType={}",
+                            failure.getClass().getName());
+                }
+            }
+        });
     }
 }

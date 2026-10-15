@@ -3,6 +3,8 @@ package dev.reliableevent.jdbc;
 import dev.reliableevent.spi.OutboundEvent;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import dev.reliableevent.EventId;
+import dev.reliableevent.EventFallbackContext;
+import dev.reliableevent.EventFallbackHandler;
 import dev.reliableevent.MissingActiveTransactionException;
 import dev.reliableevent.ReliableEvent;
 import dev.reliableevent.ReliableEventPublisher;
@@ -84,7 +86,6 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 @Transactional(propagation = Propagation.NOT_SUPPORTED)
 @Sql({
         "classpath:schema/reliable-event-outbox.sql",
-        "classpath:schema/reliable-event-replay-audit-m6-2.sql",
         "classpath:schema/test-business-record.sql",
         "classpath:schema/test-message-delivery.sql",
         "classpath:schema/clear-test-data.sql"
@@ -100,10 +101,7 @@ class ReliableEventIntegrationTest {
     private static final Duration LEASE_DURATION = Duration.ofSeconds(30);
 
     @Container
-    static final MySQLContainer<?> MYSQL = new MySQLContainer<>("mysql:8.0.36")
-            .withDatabaseName("reliable_event_test")
-            .withUsername("test")
-            .withPassword("test");
+    static final TestMySqlContainer MYSQL = TestMySqlContainer.configured("reliable_event_test");
 
     @DynamicPropertySource
     static void configureDataSource(DynamicPropertyRegistry registry) {
@@ -359,273 +357,23 @@ class ReliableEventIntegrationTest {
         assertThat(outboxRowCount()).isOne();
     }
 
-    @Test
-    void deadEventLookupDistinguishesMissingActiveAndDeadWithoutChangingRows() {
-        JdbcDeadEventQuery query = new JdbcDeadEventQuery(jdbcTemplate);
-        EventId pending = inTransaction(() -> publisher.publish(event(401L, NOW)));
-        EventId dead = inTransaction(() -> publisher.publish(new ReliableEvent<>(
-                "safe-type", "sensitive-business-key", Map.of("secret", "payload-sentinel"),
-                NOW, Map.of("token", "header-sentinel"))));
-        Instant deadAt = NOW.plusSeconds(2);
-        jdbcTemplate.update("""
-                UPDATE reliable_event_outbox
-                SET status = ?, attempt_count = 3, version = 7,
-                    last_error = ?, updated_at = ?
-                WHERE id = ?
-                """, EventStatus.DEAD.code(), "restricted-error-sentinel",
-                Timestamp.from(deadAt), dead.value());
-
-        assertThat(query.lookup(new EventId(dead.value() + 1000)))
-                .isInstanceOf(DeadEventLookup.NotFound.class);
-        assertThat(query.lookup(pending)).isEqualTo(new DeadEventLookup.NotDead(pending));
-        DeadEventLookup.Dead result = (DeadEventLookup.Dead) query.lookup(dead);
-        DeadEventDetails details = result.event();
-        assertThat(details.id()).isEqualTo(dead);
-        assertThat(details.eventType()).isEqualTo("safe-type");
-        assertThat(details.eventKey()).isEqualTo("sensitive-business-key");
-        assertThat(details.attemptCount()).isEqualTo(3);
-        assertThat(details.maxAttempts()).isEqualTo(8);
-        assertThat(details.createdAt()).isEqualTo(NOW);
-        assertThat(details.deadAt()).isEqualTo(deadAt);
-        assertThat(details.version()).isEqualTo(7);
-        assertThat(details.lastError()).isEqualTo("restricted-error-sentinel");
-        assertThat(details.toString()).doesNotContain("payload-sentinel", "header-sentinel",
-                "sensitive-business-key", "restricted-error-sentinel");
-        assertThat(statusOf(dead)).isEqualTo(EventStatus.DEAD.code());
-        assertThat(versionOf(dead)).isEqualTo(7);
-        assertThat(attemptCountOf(dead)).isEqualTo(3);
-    }
-
-    @Test
-    void deadEventPagesAreBoundedAndUseStableExclusiveIdCursor() {
-        JdbcDeadEventQuery query = new JdbcDeadEventQuery(jdbcTemplate);
-        List<EventId> ids = inTransaction(() -> List.of(
-                publisher.publish(event(411L, NOW)),
-                publisher.publish(event(412L, NOW)),
-                publisher.publish(event(413L, NOW)),
-                publisher.publish(event(414L, NOW)),
-                publisher.publish(event(415L, NOW)),
-                publisher.publish(event(416L, NOW))
-        ));
-        for (int index : List.of(0, 2, 3, 5)) {
-            jdbcTemplate.update("UPDATE reliable_event_outbox SET status = ? WHERE id = ?",
-                    EventStatus.DEAD.code(), ids.get(index).value());
-        }
-
-        DeadEventPage first = query.firstPage(2);
-        assertThat(first.events()).extracting(DeadEventSummary::id)
-                .containsExactly(ids.get(5), ids.get(3));
-        assertThat(first.nextCursor()).contains(ids.get(3));
-
-        EventId newlyDead = inTransaction(() -> publisher.publish(event(417L, NOW)));
-        jdbcTemplate.update("UPDATE reliable_event_outbox SET status = ? WHERE id = ?",
-                EventStatus.DEAD.code(), newlyDead.value());
-
-        DeadEventPage second = query.nextPage(first.nextCursor().orElseThrow(), 2);
-        assertThat(second.events()).extracting(DeadEventSummary::id)
-                .containsExactly(ids.get(2), ids.get(0));
-        assertThat(second.nextCursor()).isEmpty();
-        assertThat(statusOf(ids.get(1))).isEqualTo(EventStatus.PENDING.code());
-        assertThat(statusOf(ids.get(4))).isEqualTo(EventStatus.PENDING.code());
-        assertThat(query.firstPage(1).events()).extracting(DeadEventSummary::id)
-                .containsExactly(newlyDead);
-        assertThatThrownBy(() -> query.firstPage(0)).isInstanceOf(IllegalArgumentException.class);
-        assertThatThrownBy(() -> query.firstPage(JdbcDeadEventQuery.MAX_PAGE_SIZE + 1))
-                .isInstanceOf(IllegalArgumentException.class);
-    }
-
-    @Test
-    void exhaustedDeadEventRequeuesAndPublishesWithAnAtomicAudit() {
-        EventId id = inTransaction(() -> publisher.publish(event(418L, NOW)));
-        jdbcTemplate.update("""
-                UPDATE reliable_event_outbox
-                SET status = ?, attempt_count = max_attempts, version = 7, last_error = ?
-                WHERE id = ?
-                """, EventStatus.DEAD.code(), "previous-failure", id.value());
-        JdbcDeadEventReplay replay = new JdbcDeadEventReplay(jdbcTemplate, transactionManager);
-
-        var result = replay.replay(new DeadEventReplayRequest(id, 7, " operator-1 ", " fixed topic "));
-
-        assertThat(result).isInstanceOf(DeadEventReplayResult.Replayed.class);
-        var success = (DeadEventReplayResult.Replayed) result;
-        assertThat(success.id()).isEqualTo(id);
-        assertThat(success.previousVersion()).isEqualTo(7);
-        assertThat(success.newVersion()).isEqualTo(8);
-        assertThat(success.auditId()).isPositive();
-        assertThat(success.replayedAt()).isBetween(
-                Instant.now().minusSeconds(10), Instant.now().plusSeconds(10));
-        assertThat(statusOf(id)).isEqualTo(EventStatus.PENDING.code());
-        assertThat(attemptCountOf(id)).isZero();
-        assertThat(versionOf(id)).isEqualTo(8);
-        assertThat(leaseOwnerOf(id)).isNull();
-        assertThat(jdbcTemplate.queryForObject(
-                "SELECT last_error FROM reliable_event_outbox WHERE id = ?", String.class, id.value()))
-                .isNull();
-        assertThat(jdbcTemplate.queryForObject("""
-                SELECT previous_attempt_count FROM reliable_event_replay_audit WHERE id = ?
-                """, Integer.class, success.auditId())).isEqualTo(8);
-        assertThat(jdbcTemplate.queryForMap("""
-                SELECT event_id, previous_version, new_version, previous_max_attempts,
-                       previous_last_error, operator_id, reason, result
-                FROM reliable_event_replay_audit WHERE id = ?
-                """, success.auditId())).containsEntry("event_id", id.value())
-                .containsEntry("previous_version", 7L)
-                .containsEntry("new_version", 8L)
-                .containsEntry("previous_max_attempts", 8)
-                .containsEntry("previous_last_error", "previous-failure")
-                .containsEntry("operator_id", "operator-1")
-                .containsEntry("reason", "fixed topic")
-                .containsEntry("result", "REQUEUED");
-        assertThat(repository.findDueEventCandidates(Instant.now().plusSeconds(1), 10))
-                .contains(new EventCandidate(id, 8));
-
-        Clock replayClock = Clock.systemUTC();
-        JdbcEventPublicationWorker worker = new JdbcEventPublicationWorker(
-                publicationStore(replayClock, WORKER_ID, PublicationObserver.NOOP),
-                event -> new TransportReceipt(Optional.of("replayed-" + event.id().value()), Map.of()),
-                replayClock, deterministicBackoff(), PublicationObserver.NOOP, PublicationTracer.NOOP);
-        assertThat(publishPending(worker, replayClock)).isOne();
-        assertThat(statusOf(id)).isEqualTo(EventStatus.PUBLISHED.code());
-        assertThat(attemptCountOf(id)).isOne();
-        assertThat(outboxRowCount()).isOne();
-    }
-
-    @Test
-    void replayRejectsMissingNonDeadAndStaleVersionWithoutAudit() {
-        EventId pending = inTransaction(() -> publisher.publish(event(419L, NOW)));
-        EventId dead = inTransaction(() -> publisher.publish(event(420L, NOW)));
-        jdbcTemplate.update("UPDATE reliable_event_outbox SET status = ?, version = 4 WHERE id = ?",
-                EventStatus.DEAD.code(), dead.value());
-        JdbcDeadEventReplay replay = new JdbcDeadEventReplay(jdbcTemplate, transactionManager);
-
-        assertThat(replay.replay(new DeadEventReplayRequest(
-                new EventId(dead.value() + 1000), 0, "operator", "reason")))
-                .isInstanceOf(DeadEventReplayResult.NotFound.class);
-        assertThat(replay.replay(new DeadEventReplayRequest(pending, 0, "operator", "reason")))
-                .isEqualTo(new DeadEventReplayResult.NotDead(pending));
-        assertThat(replay.replay(new DeadEventReplayRequest(dead, 3, "operator", "reason")))
-                .isEqualTo(new DeadEventReplayResult.VersionMismatch(dead, 4));
-        assertThat(statusOf(dead)).isEqualTo(EventStatus.DEAD.code());
-        assertThat(versionOf(dead)).isEqualTo(4);
-        assertThat(replayAuditCount()).isZero();
-    }
-
-    @Test
-    void duplicateReplayRequestCannotRequeueTheSameDeadVersionTwice() {
-        EventId dead = inTransaction(() -> publisher.publish(event(421L, NOW)));
-        jdbcTemplate.update("UPDATE reliable_event_outbox SET status = ? WHERE id = ?",
-                EventStatus.DEAD.code(), dead.value());
-        JdbcDeadEventReplay replay = new JdbcDeadEventReplay(jdbcTemplate, transactionManager);
-        DeadEventReplayRequest request = new DeadEventReplayRequest(dead, 0, "operator", "reason");
-
-        assertThat(replay.replay(request)).isInstanceOf(DeadEventReplayResult.Replayed.class);
-        assertThat(replay.replay(request)).isEqualTo(new DeadEventReplayResult.NotDead(dead));
-        assertThat(versionOf(dead)).isOne();
-        assertThat(replayAuditCount()).isOne();
-    }
-
-    @Test
-    void replayAndAuditBothRollbackWithTheCallerTransaction() {
-        EventId dead = inTransaction(() -> publisher.publish(event(422L, NOW)));
-        jdbcTemplate.update("UPDATE reliable_event_outbox SET status = ? WHERE id = ?",
-                EventStatus.DEAD.code(), dead.value());
-        JdbcDeadEventReplay replay = new JdbcDeadEventReplay(jdbcTemplate, transactionManager);
-
-        assertThatThrownBy(() -> inTransaction(() -> {
-            assertThat(replay.replay(new DeadEventReplayRequest(dead, 0, "operator", "reason")))
-                    .isInstanceOf(DeadEventReplayResult.Replayed.class);
-            throw new IntentionalRollbackException();
-        })).isInstanceOf(IntentionalRollbackException.class);
-
-        assertThat(statusOf(dead)).isEqualTo(EventStatus.DEAD.code());
-        assertThat(versionOf(dead)).isZero();
-        assertThat(replayAuditCount()).isZero();
-    }
-
-    @Test
-    void auditInsertFailureRollsBackTheReplayStateChange() {
-        EventId dead = inTransaction(() -> publisher.publish(event(424L, NOW)));
-        jdbcTemplate.update("UPDATE reliable_event_outbox SET status = ? WHERE id = ?",
-                EventStatus.DEAD.code(), dead.value());
-        jdbcTemplate.update("""
-                INSERT INTO reliable_event_replay_audit (
-                    event_id, previous_version, new_version, previous_attempt_count,
-                    previous_max_attempts, operator_id, reason, replayed_at, result
-                ) VALUES (?, 0, 1, 0, 8, 'prior-operator', 'prior-reason', UTC_TIMESTAMP(3), 'REQUEUED')
-                """, dead.value());
-        JdbcDeadEventReplay replay = new JdbcDeadEventReplay(jdbcTemplate, transactionManager);
-
-        assertThatThrownBy(() -> replay.replay(new DeadEventReplayRequest(
-                dead, 0, "operator", "reason")))
-                .isInstanceOf(DataIntegrityViolationException.class);
-        assertThat(statusOf(dead)).isEqualTo(EventStatus.DEAD.code());
-        assertThat(versionOf(dead)).isZero();
-        assertThat(replayAuditCount()).isOne();
-    }
-
-    @Test
-    void concurrentReplayRequestsProduceOneEffectiveReplay() throws Exception {
-        EventId dead = inTransaction(() -> publisher.publish(event(423L, NOW)));
-        jdbcTemplate.update("UPDATE reliable_event_outbox SET status = ? WHERE id = ?",
-                EventStatus.DEAD.code(), dead.value());
-        JdbcDeadEventReplay replay = new JdbcDeadEventReplay(jdbcTemplate, transactionManager);
-        DeadEventReplayRequest request = new DeadEventReplayRequest(dead, 0, "operator", "reason");
-        CyclicBarrier start = new CyclicBarrier(2);
-        ExecutorService executor = Executors.newFixedThreadPool(2);
-        try {
-            var attempts = List.of(
-                    executor.submit(() -> { start.await(); return replay.replay(request); }),
-                    executor.submit(() -> { start.await(); return replay.replay(request); })
-            );
-            List<DeadEventReplayResult> results = List.of(
-                    attempts.get(0).get(15, TimeUnit.SECONDS),
-                    attempts.get(1).get(15, TimeUnit.SECONDS));
-            assertThat(results.stream().filter(DeadEventReplayResult.Replayed.class::isInstance).count())
-                    .isOne();
-            assertThat(results.stream().filter(DeadEventReplayResult.NotDead.class::isInstance).count())
-                    .isOne();
-            assertThat(statusOf(dead)).isEqualTo(EventStatus.PENDING.code());
-            assertThat(versionOf(dead)).isOne();
-            assertThat(replayAuditCount()).isOne();
-        } finally {
-            executor.shutdownNow();
-        }
-    }
-
-    @Test
-    void replayRequestRejectsInvalidOperationInformation() {
-        EventId id = new EventId(1);
-        assertThatThrownBy(() -> new DeadEventReplayRequest(id, -1, "operator", "reason"))
-                .isInstanceOf(IllegalArgumentException.class);
-        assertThatThrownBy(() -> new DeadEventReplayRequest(id, 0, " ", "reason"))
-                .isInstanceOf(IllegalArgumentException.class);
-        assertThatThrownBy(() -> new DeadEventReplayRequest(id, 0, "operator", " "))
-                .isInstanceOf(IllegalArgumentException.class);
-        assertThatThrownBy(() -> new DeadEventReplayRequest(id, 0, "x".repeat(129), "reason"))
-                .isInstanceOf(IllegalArgumentException.class);
-        assertThatThrownBy(() -> new DeadEventReplayRequest(id, 0, "operator", "x".repeat(1025)))
-                .isInstanceOf(IllegalArgumentException.class);
-        assertThat(new DeadEventReplayRequest(id, 0, "private-operator", "private-reason").toString())
-                .doesNotContain("private-operator", "private-reason");
-    }
-
-    @Test
+                                        @Test
     void firstAvailabilitySurvivesDuplicateAndRetryAndStatusCountsUseDatabaseRows() {
         Instant firstAvailable = NOW.plusSeconds(60);
         EventId future = inTransaction(() -> publisher.publish(event(140L, firstAvailable)));
         EventId duplicate = inTransaction(() -> publisher.publish(event(140L, NOW.plusSeconds(120))));
-        EventId dead = inTransaction(() -> publisher.publish(event(141L, NOW)));
+        EventId failed = inTransaction(() -> publisher.publish(event(141L, NOW)));
         jdbcTemplate.update("UPDATE reliable_event_outbox SET next_attempt_at = ? WHERE id = ?",
                 Timestamp.from(firstAvailable.plusSeconds(30)), future.value());
         jdbcTemplate.update("UPDATE reliable_event_outbox SET status = ? WHERE id = ?",
-                EventStatus.DEAD.code(), dead.value());
+                EventStatus.FAILED.code(), failed.value());
 
         assertThat(duplicate).isEqualTo(future);
         assertThat(jdbcTemplate.queryForObject(
                 "SELECT first_available_at FROM reliable_event_outbox WHERE id = ?",
                 Timestamp.class, future.value()).toInstant()).isEqualTo(firstAvailable);
         assertThat(repository.countStatuses().backlog()).isOne();
-        assertThat(repository.countStatuses().dead()).isOne();
+        assertThat(repository.countStatuses().failed()).isOne();
 
         EventCandidate due = repository.findDueEventCandidates(firstAvailable.plusSeconds(31), 1).get(0);
         ClaimedEvent claimed = inTransaction(() -> repository.claim(due,
@@ -661,11 +409,11 @@ class ReliableEventIntegrationTest {
                 EventStatus.RETRY_WAIT.code(), ids.get(6).value());
         jdbcTemplate.update("UPDATE reliable_event_outbox SET status=?, "
                 + "first_available_at=UTC_TIMESTAMP(3)-INTERVAL 1 HOUR WHERE id=?",
-                EventStatus.DEAD.code(), ids.get(7).value());
+                EventStatus.FAILED.code(), ids.get(7).value());
 
         OutboxMetricsSnapshot pending = repository.readMetricsSnapshot(2);
         assertThat(pending.backlog()).isEqualTo(6);
-        assertThat(pending.dead()).isOne();
+        assertThat(pending.failed()).isOne();
         assertThat(pending.ready()).isEqualTo(3);
         assertThat(pending.readyOldestAgeSeconds()).isBetween(295.0, 315.0);
         assertThat(pending.unfinishedOverdue()).isEqualTo(4);
@@ -700,7 +448,7 @@ class ReliableEventIntegrationTest {
         assertThat(published.unfinishedOldestAgeSeconds()).isBetween(235.0, 255.0);
 
         jdbcTemplate.update("UPDATE reliable_event_outbox SET status=? WHERE id=?",
-                EventStatus.DEAD.code(), ids.get(3).value());
+                EventStatus.FAILED.code(), ids.get(3).value());
         assertThat(repository.readMetricsSnapshot(2).unfinishedOverdue()).isEqualTo(2);
     }
 
@@ -739,7 +487,7 @@ class ReliableEventIntegrationTest {
     void metricsSnapshotExplainUsesExistingOutboxSchemaWithoutAddingAnIndex() {
         String aggregate = """
                 SELECT COALESCE(SUM(status IN (0, 3)), 0) AS backlog,
-                       COALESCE(SUM(status = 4), 0) AS dead,
+                       COALESCE(SUM(status = 4), 0) AS failed,
                        COALESCE(SUM(status IN (0, 3) AND next_attempt_at <= UTC_TIMESTAMP(3)), 0) AS ready,
                        MIN(CASE WHEN status IN (0, 3) AND next_attempt_at <= UTC_TIMESTAMP(3)
                                 THEN first_available_at END) AS ready_oldest,
@@ -758,7 +506,7 @@ class ReliableEventIntegrationTest {
 
         LOG.info("M8.3 snapshot EXPLAIN: type={}, key={}, rows={}, extra={}, indexes={}",
                 plan.get("type"), plan.get("key"), plan.get("rows"), plan.get("Extra"), indexes);
-        assertThat(indexes).contains("idx_publish_scan", "idx_lease_recovery", "idx_dead_list",
+        assertThat(indexes).contains("idx_publish_scan", "idx_lease_recovery",
                 "idx_published_retention");
         assertThat(plan.get("type")).isEqualTo("ALL");
     }
@@ -781,13 +529,13 @@ class ReliableEventIntegrationTest {
     }
 
     @Test
-    void publicationAndDeadMetricsAdvanceOnlyAfterTheOwningTransactionCommits() {
+    void publishedMetricsWaitForCommitAndFallbackRejectsOuterTransactions() {
         AtomicInteger persisted = new AtomicInteger();
-        AtomicInteger dead = new AtomicInteger();
+        AtomicInteger failed = new AtomicInteger();
         PublicationObserver observer = new PublicationObserver() {
             @Override public void stateTransitionCommitted(String status) {
                 if ("PUBLISHED".equals(status)) persisted.incrementAndGet();
-                if ("DEAD".equals(status)) dead.incrementAndGet();
+                if ("FAILED".equals(status)) failed.incrementAndGet();
             }
         };
 
@@ -810,43 +558,21 @@ class ReliableEventIntegrationTest {
         assertThat(persisted).hasValue(1);
         assertThat(statusOf(rolledBackPublish.event().id())).isEqualTo(EventStatus.PUBLISHING.code());
 
-        ClaimedEvent deadEvent = claimedPublishedEvent(2202L);
-        new TransactionTemplate(transactionManager).execute(status -> {
-            assertThat(worker(event -> { throw new TransportException(TransportFailureType.NON_RETRYABLE, "invalid"); }, observer)
-                    .publishClaimedEvent(deadEvent)).isFalse();
-            assertThat(dead).hasValue(0);
-            return null;
-        });
-        assertThat(dead).hasValue(1);
+        ClaimedEvent terminal = claimedPublishedEvent(2202L);
+        assertThatThrownBy(() -> new TransactionTemplate(transactionManager).execute(status ->
+                worker(event -> { throw new TransportException(TransportFailureType.NON_RETRYABLE, "invalid"); }, observer)
+                        .publishClaimedEvent(terminal)))
+                .isInstanceOf(IllegalStateException.class).hasMessageContaining("outside an active transaction");
+        assertThat(statusOf(terminal.event().id())).isEqualTo(EventStatus.PUBLISHING.code());
+        assertThat(failed).hasValue(0);
 
-        ClaimedEvent rolledBackDead = claimedPublishedEvent(2203L);
-        new TransactionTemplate(transactionManager).execute(status -> {
-            assertThat(worker(event -> { throw new TransportException(TransportFailureType.NON_RETRYABLE, "invalid"); }, observer)
-                    .publishClaimedEvent(rolledBackDead)).isFalse();
-            status.setRollbackOnly();
-            return null;
-        });
-        assertThat(dead).hasValue(1);
-        assertThat(statusOf(rolledBackDead.event().id())).isEqualTo(EventStatus.PUBLISHING.code());
-
-        ExpiredLeaseCandidate recoveredDead = expiredDeadCandidate(2204L);
+        ExpiredLeaseCandidate recoveredTerminal = expiredTerminalCandidate(2204L);
         JdbcExpiredLeaseRecovery recovery = new JdbcExpiredLeaseRecovery(jdbcTemplate, transactionManager,
                 100, deterministicBackoff(), observer);
-        new TransactionTemplate(transactionManager).execute(status -> {
-            assertThat(recovery.recoverCandidates(List.of(recoveredDead))).isOne();
-            assertThat(dead).hasValue(1);
-            return null;
-        });
-        assertThat(dead).hasValue(2);
-
-        ExpiredLeaseCandidate rolledBackRecovery = expiredDeadCandidate(2205L);
-        new TransactionTemplate(transactionManager).execute(status -> {
-            assertThat(recovery.recoverCandidates(List.of(rolledBackRecovery))).isOne();
-            status.setRollbackOnly();
-            return null;
-        });
-        assertThat(dead).hasValue(2);
-        assertThat(statusOf(rolledBackRecovery.id())).isEqualTo(EventStatus.PUBLISHING.code());
+        assertThatThrownBy(() -> new TransactionTemplate(transactionManager).execute(status ->
+                recovery.recoverCandidates(List.of(recoveredTerminal))))
+                .isInstanceOf(IllegalStateException.class).hasMessageContaining("outside an active transaction");
+        assertThat(failed).hasValue(0);
     }
 
     @Test
@@ -913,26 +639,7 @@ class ReliableEventIntegrationTest {
         }
     }
 
-    @Test
-    void deadListIndexMigrationUpgradesAnExistingTable() throws Exception {
-        jdbcTemplate.execute("CREATE TABLE reliable_event_outbox_before_m6 LIKE reliable_event_outbox");
-        try {
-            jdbcTemplate.execute("ALTER TABLE reliable_event_outbox_before_m6 DROP INDEX idx_dead_list");
-            String migration = new String(new ClassPathResource(
-                    "schema/reliable-event-outbox-m6-1.sql").getInputStream().readAllBytes(),
-                    StandardCharsets.UTF_8).replace("ALTER TABLE reliable_event_outbox\n",
-                    "ALTER TABLE reliable_event_outbox_before_m6\n");
-            jdbcTemplate.execute(migration);
-
-            assertThat(jdbcTemplate.queryForList(
-                    "SHOW INDEX FROM reliable_event_outbox_before_m6 WHERE Key_name = 'idx_dead_list'"))
-                    .hasSize(2);
-        } finally {
-            jdbcTemplate.execute("DROP TABLE reliable_event_outbox_before_m6");
-        }
-    }
-
-    @Test
+        @Test
     void candidateCanBeClaimedOnlyOnceWithItsOriginalVersion() {
         EventId eventId = inTransaction(() -> publisher.publish(event(105L, NOW)));
         EventCandidate candidate = repository.findDueEventCandidates(NOW, 50).get(0);
@@ -1036,10 +743,9 @@ class ReliableEventIntegrationTest {
             );
             return null;
         })).isInstanceOf(IllegalStateException.class);
-        assertThatThrownBy(() -> inTransaction(() -> {
-            repository.markDead(incorrectOwnerClaim, NOW, "permanent failure");
-            return null;
-        })).isInstanceOf(IllegalStateException.class);
+        assertThatThrownBy(() -> publicationStore(CLOCK, WORKER_ID, PublicationObserver.NOOP).beginFallback(
+                incorrectOwnerClaim, "permanent failure", "NON_RETRYABLE", "NON_RETRYABLE"))
+                .isInstanceOf(IllegalStateException.class);
 
         assertThat(statusOf(eventId)).isEqualTo(EventStatus.PUBLISHING.code());
         assertThat(versionOf(eventId)).isOne();
@@ -1078,10 +784,9 @@ class ReliableEventIntegrationTest {
             );
             return null;
         })).isInstanceOf(IllegalStateException.class);
-        assertThatThrownBy(() -> inTransaction(() -> {
-            repository.markDead(claimedEvent, NOW, "permanent failure");
-            return null;
-        })).isInstanceOf(IllegalStateException.class);
+        assertThatThrownBy(() -> publicationStore(CLOCK, WORKER_ID, PublicationObserver.NOOP).beginFallback(
+                claimedEvent, "permanent failure", "NON_RETRYABLE", "NON_RETRYABLE"))
+                .isInstanceOf(IllegalStateException.class);
 
         assertThat(statusOf(eventId)).isEqualTo(EventStatus.PUBLISHING.code());
         assertThat(versionOf(eventId)).isOne();
@@ -1121,7 +826,7 @@ class ReliableEventIntegrationTest {
     }
 
     @Test
-    void deadUpdateRejectsAStaleClaimVersion() {
+    void fallbackStartRejectsAStaleClaimVersion() {
         EventId eventId = inTransaction(() -> publisher.publish(event(109L, NOW)));
         EventCandidate candidate = repository.findDueEventCandidates(NOW, 50).get(0);
         ClaimedEvent claimedEvent = inTransaction(
@@ -1132,20 +837,44 @@ class ReliableEventIntegrationTest {
                 eventId.value()
         );
 
-        assertThatThrownBy(() -> inTransaction(() -> {
-            repository.markDead(
-                    claimedEvent,
-                    NOW,
-                    TransportException.class.getName() + ": missing destination"
-            );
-            return null;
-        }))
+        assertThatThrownBy(() -> publicationStore(CLOCK, WORKER_ID, PublicationObserver.NOOP).beginFallback(
+                    claimedEvent, TransportException.class.getName() + ": missing destination",
+                    "NON_RETRYABLE", "NON_RETRYABLE"))
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessageContaining("claim is no longer current");
 
         assertThat(statusOf(eventId)).isEqualTo(EventStatus.PUBLISHING.code());
         assertThat(versionOf(eventId)).isEqualTo(2L);
         assertThat(lastErrorOf(eventId)).isNull();
+    }
+
+    @Test
+    void expiredFallbackLeaseIsReclaimedOnlyForFallbackAndRejectsOldCompletion() {
+        EventId eventId = inTransaction(() -> publisher.publish(event(110L, NOW)));
+        EventCandidate candidate = repository.findDueEventCandidates(NOW, 50).stream()
+                .filter(value -> value.id().equals(eventId)).findFirst().orElseThrow();
+        ClaimedEvent original = inTransaction(() -> claim(candidate, WORKER_ID).orElseThrow());
+        ClaimedEvent oldFallbackClaim = publicationStore(CLOCK, WORKER_ID, PublicationObserver.NOOP)
+                .beginFallback(original, "original rejection", "NON_RETRYABLE", "NON_RETRYABLE");
+        expireLease(eventId, 1);
+
+        List<EventFallbackContext> handled = new ArrayList<>();
+        EventFallbackHandler handler = handled::add;
+        JdbcExpiredLeaseRecovery recovery = new JdbcExpiredLeaseRecovery(jdbcTemplate, transactionManager,
+                20, deterministicBackoff(), PublicationObserver.NOOP, LEASE_DURATION, handler);
+        assertThat(recovery.recoverExpiredLeases()).isOne();
+        assertThat(statusOf(eventId)).isEqualTo(EventStatus.FALLBACK_COMPLETED.code());
+        assertThat(handled).singleElement().satisfies(context -> {
+            assertThat(context.stopReason()).isEqualTo(EventFallbackContext.StopReason.NON_RETRYABLE);
+            assertThat(context.failureClassification())
+                    .isEqualTo(EventFallbackContext.FailureClassification.NON_RETRYABLE);
+        });
+        assertThatThrownBy(() -> publicationStore(CLOCK, WORKER_ID, PublicationObserver.NOOP)
+                .finishFallback(oldFallbackClaim, true, null))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("claim is no longer current");
+        assertThat(statusOf(eventId)).isEqualTo(EventStatus.FALLBACK_COMPLETED.code());
+        assertThat(publishedAtOf(eventId)).isNull();
     }
 
     @Test
@@ -1320,7 +1049,7 @@ class ReliableEventIntegrationTest {
     }
 
     @Test
-    void retryableFailureBecomesDeadAfterLastAllowedAttempt() {
+    void retryableFailureFallsBackAfterLastAllowedAttempt() {
         ReliableEventPublisher twoAttemptPublisher = publisherWithMaxAttempts(2);
         EventId eventId = inTransaction(
                 () -> twoAttemptPublisher.publish(event(207L, NOW.minusSeconds(1)))
@@ -1338,24 +1067,23 @@ class ReliableEventIntegrationTest {
         assertThat(publishPending(worker(sender, atRetry, backoff), atRetry)).isZero();
 
         assertThat(sender.sendCount()).isEqualTo(2);
-        assertThat(statusOf(eventId)).isEqualTo(EventStatus.DEAD.code());
+        assertThat(statusOf(eventId)).isEqualTo(EventStatus.FAILED.code());
         assertThat(attemptCountOf(eventId)).isEqualTo(2);
-        assertThat(versionOf(eventId)).isEqualTo(4L);
+        assertThat(versionOf(eventId)).isEqualTo(5L);
         assertThat(nextAttemptAtOf(eventId)).isEqualTo(NOW.plusSeconds(1));
-        assertThat(lastErrorOf(eventId))
-                .isEqualTo("dev.reliableevent.spi.TransportException: temporary failure 2");
+        assertThat(lastErrorOf(eventId)).contains("No EventFallbackHandler", "temporary failure 2");
         assertThat(publishedAtOf(eventId)).isNull();
 
         Clock longAfterRetry = Clock.fixed(NOW.plusSeconds(3_600), ZoneOffset.UTC);
         assertThat(publishPending(worker(sender, longAfterRetry, backoff), longAfterRetry)).isZero();
         assertThat(sender.sendCount()).isEqualTo(2);
-        assertThat(statusOf(eventId)).isEqualTo(EventStatus.DEAD.code());
+        assertThat(statusOf(eventId)).isEqualTo(EventStatus.FAILED.code());
         assertThat(attemptCountOf(eventId)).isEqualTo(2);
-        assertThat(versionOf(eventId)).isEqualTo(4L);
+        assertThat(versionOf(eventId)).isEqualTo(5L);
     }
 
     @Test
-    void unknownSendResultRetriesAndBecomesDeadAfterLastAllowedAttempt() {
+    void unknownSendResultRetriesAndFallsBackAfterLastAllowedAttempt() {
         ReliableEventPublisher twoAttemptPublisher = publisherWithMaxAttempts(2);
         EventId eventId = inTransaction(
                 () -> twoAttemptPublisher.publish(event(218L, NOW.minusSeconds(1)))
@@ -1372,15 +1100,14 @@ class ReliableEventIntegrationTest {
         assertThat(publishPending(worker(sender, atRetry, backoff), atRetry)).isZero();
 
         assertThat(sender.sendCount()).isEqualTo(2);
-        assertThat(statusOf(eventId)).isEqualTo(EventStatus.DEAD.code());
+        assertThat(statusOf(eventId)).isEqualTo(EventStatus.FAILED.code());
         assertThat(attemptCountOf(eventId)).isEqualTo(2);
-        assertThat(versionOf(eventId)).isEqualTo(4L);
-        assertThat(lastErrorOf(eventId))
-                .isEqualTo(TransportException.class.getName() + ": RocketMQ response lost");
+        assertThat(versionOf(eventId)).isEqualTo(5L);
+        assertThat(lastErrorOf(eventId)).contains("No EventFallbackHandler", "RocketMQ response lost");
     }
 
     @Test
-    void nonRetryableFailureBecomesDeadWithoutComputingBackoff() {
+    void nonRetryableFailureFallsBackWithoutComputingBackoff() {
         EventId eventId = inTransaction(
                 () -> publisher.publish(event(208L, NOW.minusSeconds(1)))
         );
@@ -1392,11 +1119,10 @@ class ReliableEventIntegrationTest {
 
         assertThat(sender.sendCount()).isOne();
         org.mockito.Mockito.verifyNoInteractions(backoff);
-        assertThat(statusOf(eventId)).isEqualTo(EventStatus.DEAD.code());
+        assertThat(statusOf(eventId)).isEqualTo(EventStatus.FAILED.code());
         assertThat(attemptCountOf(eventId)).isOne();
-        assertThat(versionOf(eventId)).isEqualTo(2L);
-        assertThat(lastErrorOf(eventId))
-                .isEqualTo(TransportException.class.getName() + ": missing destination");
+        assertThat(versionOf(eventId)).isEqualTo(3L);
+        assertThat(lastErrorOf(eventId)).contains("No EventFallbackHandler", "missing destination");
         assertThat(publishedAtOf(eventId)).isNull();
         assertThat(leaseOwnerOf(eventId)).isNull();
         assertThat(leaseUntilOf(eventId)).isNull();
@@ -1473,8 +1199,7 @@ class ReliableEventIntegrationTest {
         assertThat(versionOf(eventId)).isEqualTo(2L);
         assertThat(leaseOwnerOf(eventId)).isNull();
         assertThat(leaseUntilOf(eventId)).isNull();
-        assertThat(lastErrorOf(eventId))
-                .isEqualTo(JdbcExpiredLeaseRecovery.LEASE_EXPIRED_ERROR);
+        assertThat(lastErrorOf(eventId)).isEqualTo(JdbcExpiredLeaseRecovery.LEASE_EXPIRED_ERROR);
         assertThat(publishedAtOf(eventId)).isNull();
 
         Instant nextAttemptAt = nextAttemptAtOf(eventId);
@@ -1505,7 +1230,7 @@ class ReliableEventIntegrationTest {
     }
 
     @Test
-    void expiredLeaseBecomesDeadWhenAttemptsAreExhausted() {
+    void expiredLeaseFallsBackWhenAttemptsAreExhausted() {
         ReliableEventPublisher oneAttemptPublisher = publisherWithMaxAttempts(1);
         EventId eventId = inTransaction(
                 () -> oneAttemptPublisher.publish(event(303L, NOW.minusSeconds(1)))
@@ -1520,18 +1245,80 @@ class ReliableEventIntegrationTest {
 
         assertThat(recoveredCount).isOne();
         org.mockito.Mockito.verifyNoInteractions(backoff);
-        assertThat(statusOf(eventId)).isEqualTo(EventStatus.DEAD.code());
+        assertThat(statusOf(eventId)).isEqualTo(EventStatus.FAILED.code());
         assertThat(attemptCountOf(eventId)).isOne();
-        assertThat(versionOf(eventId)).isEqualTo(2L);
+        assertThat(versionOf(eventId)).isEqualTo(3L);
         assertThat(leaseOwnerOf(eventId)).isNull();
         assertThat(leaseUntilOf(eventId)).isNull();
-        assertThat(lastErrorOf(eventId))
-                .isEqualTo(JdbcExpiredLeaseRecovery.LEASE_EXPIRED_ERROR);
+        assertThat(lastErrorOf(eventId)).contains("No EventFallbackHandler",
+                JdbcExpiredLeaseRecovery.LEASE_EXPIRED_ERROR);
         assertThat(publishedAtOf(eventId)).isNull();
         assertThat(repository.findDueEventCandidates(
                 databaseNow().plusSeconds(3_600),
                 50
         )).isEmpty();
+    }
+
+    @Test
+    void expiredPublishingLeaseFallbackReportsUnknownBrokerResult() {
+        ReliableEventPublisher oneAttemptPublisher = publisherWithMaxAttempts(1);
+        EventId eventId = inTransaction(() -> oneAttemptPublisher.publish(event(304L, NOW.minusSeconds(1))));
+        EventCandidate candidate = repository.findDueEventCandidates(NOW, 50).stream()
+                .filter(value -> value.id().equals(eventId)).findFirst().orElseThrow();
+        inTransaction(() -> claim(candidate, WORKER_ID).orElseThrow());
+        expireLease(eventId, 1);
+        List<EventFallbackContext> handled = new ArrayList<>();
+        JdbcExpiredLeaseRecovery recovery = new JdbcExpiredLeaseRecovery(jdbcTemplate, transactionManager,
+                20, deterministicBackoff(), PublicationObserver.NOOP, LEASE_DURATION, handled::add);
+
+        assertThat(recovery.recoverExpiredLeases()).isOne();
+        assertThat(statusOf(eventId)).isEqualTo(EventStatus.FALLBACK_COMPLETED.code());
+        assertThat(handled).singleElement().satisfies(context -> {
+            assertThat(context.stopReason()).isEqualTo(EventFallbackContext.StopReason.LEASE_EXPIRED);
+            assertThat(context.failureClassification())
+                    .isEqualTo(EventFallbackContext.FailureClassification.RESULT_UNKNOWN);
+        });
+        assertThat(publishedAtOf(eventId)).isNull();
+    }
+
+    @Test
+    void leaseRecoveryObserverReportsCommittedTargetAndPreservesLegacyCallbacks() {
+        List<Boolean> legacyResults = new ArrayList<>();
+        PublicationObserver legacyObserver = new PublicationObserver() {
+            @Override public void leaseRecovered(ExpiredLeaseCandidate candidate, boolean failed) {
+                legacyResults.add(failed);
+            }
+        };
+        ExpiredLeaseCandidate retryable = expiredLeaseCandidate(305L);
+        JdbcExpiredLeaseRecovery retryRecovery = new JdbcExpiredLeaseRecovery(jdbcTemplate, transactionManager,
+                20, deterministicBackoff(), legacyObserver, LEASE_DURATION, null);
+
+        new TransactionTemplate(transactionManager).execute(status -> {
+            assertThat(retryRecovery.recoverCandidates(List.of(retryable))).isOne();
+            assertThat(legacyResults).isEmpty();
+            return null;
+        });
+        assertThat(legacyResults).containsExactly(false);
+        assertThat(retryRecovery.recoverCandidates(List.of(retryable))).isZero();
+        assertThat(legacyResults).containsExactly(false);
+
+        ExpiredLeaseCandidate terminal = expiredTerminalCandidate(306L);
+        JdbcExpiredLeaseRecovery failedRecovery = new JdbcExpiredLeaseRecovery(jdbcTemplate, transactionManager,
+                20, deterministicBackoff(), legacyObserver, LEASE_DURATION, null);
+        assertThat(failedRecovery.recoverCandidates(List.of(terminal))).isOne();
+        assertThat(legacyResults).containsExactly(false, true);
+
+        ExpiredLeaseCandidate completed = expiredTerminalCandidate(307L);
+        List<String> targetStates = new ArrayList<>();
+        PublicationObserver statusObserver = new PublicationObserver() {
+            @Override public void leaseRecovered(ExpiredLeaseCandidate candidate, String targetStatus) {
+                targetStates.add(targetStatus);
+            }
+        };
+        JdbcExpiredLeaseRecovery completedRecovery = new JdbcExpiredLeaseRecovery(jdbcTemplate, transactionManager,
+                20, deterministicBackoff(), statusObserver, LEASE_DURATION, context -> { });
+        assertThat(completedRecovery.recoverCandidates(List.of(completed))).isOne();
+        assertThat(targetStates).containsExactly("FALLBACK_COMPLETED");
     }
 
     @Test
@@ -1705,7 +1492,7 @@ class ReliableEventIntegrationTest {
     }
 
     @Test
-    void twoRecoverersCompetingForTheSameExhaustedSnapshotDeadLetterOnlyOnce()
+    void twoRecoverersCompetingForTheSameExhaustedSnapshotFailOnlyOnce()
             throws Exception {
         ReliableEventPublisher oneAttemptPublisher = publisherWithMaxAttempts(1);
         EventId eventId = inTransaction(
@@ -1750,9 +1537,9 @@ class ReliableEventIntegrationTest {
         assertThat(List.of(firstRecovered, secondRecovered))
                 .containsExactlyInAnyOrder(0, 1);
         org.mockito.Mockito.verifyNoInteractions(backoff);
-        assertThat(statusOf(eventId)).isEqualTo(EventStatus.DEAD.code());
+        assertThat(statusOf(eventId)).isEqualTo(EventStatus.FAILED.code());
         assertThat(attemptCountOf(eventId)).isOne();
-        assertThat(versionOf(eventId)).isEqualTo(2L);
+        assertThat(versionOf(eventId)).isEqualTo(3L);
         assertThat(leaseOwnerOf(eventId)).isNull();
         assertThat(leaseUntilOf(eventId)).isNull();
     }
@@ -1892,8 +1679,8 @@ class ReliableEventIntegrationTest {
     }
 
     @Test
-    void deadEventDoesNotStopLaterCandidatesInTheSameBatch() {
-        EventId deadEvent = inTransaction(
+    void nonRetryableFailureDoesNotStopLaterCandidatesInTheSameBatch() {
+        EventId failedEvent = inTransaction(
                 () -> publisher.publish(event(209L, NOW.minusSeconds(1)))
         );
         EventId publishedEvent = inTransaction(
@@ -1906,11 +1693,11 @@ class ReliableEventIntegrationTest {
 
         assertThat(publishedCount).isOne();
         assertThat(sender.attemptedEventKeys()).containsExactly("209", "210");
-        assertThat(statusOf(deadEvent)).isEqualTo(EventStatus.DEAD.code());
+        assertThat(statusOf(failedEvent)).isEqualTo(EventStatus.FAILED.code());
         assertThat(statusOf(publishedEvent)).isEqualTo(EventStatus.PUBLISHED.code());
-        assertThat(attemptCountOf(deadEvent)).isOne();
+        assertThat(attemptCountOf(failedEvent)).isOne();
         assertThat(attemptCountOf(publishedEvent)).isOne();
-        assertThat(versionOf(deadEvent)).isEqualTo(2L);
+        assertThat(versionOf(failedEvent)).isEqualTo(3L);
         assertThat(versionOf(publishedEvent)).isEqualTo(2L);
     }
 
@@ -1999,7 +1786,7 @@ class ReliableEventIntegrationTest {
         return inTransaction(() -> claim(candidate, WORKER_ID).orElseThrow());
     }
 
-    private ExpiredLeaseCandidate expiredDeadCandidate(long taskId) {
+    private ExpiredLeaseCandidate expiredTerminalCandidate(long taskId) {
         EventId eventId = inTransaction(() -> publisher.publish(event(taskId, NOW)));
         jdbcTemplate.update("UPDATE reliable_event_outbox SET max_attempts=1 WHERE id=?", eventId.value());
         EventCandidate candidate = repository.findDueEventCandidates(NOW, 100).stream()
@@ -2110,11 +1897,6 @@ class ReliableEventIntegrationTest {
     private long outboxRowCount() {
         return requiredLong("SELECT COUNT(*) FROM reliable_event_outbox");
     }
-
-    private long replayAuditCount() {
-        return requiredLong("SELECT COUNT(*) FROM reliable_event_replay_audit");
-    }
-
     private int statusOf(EventId eventId) {
         Integer status = jdbcTemplate.queryForObject(
                 "SELECT status FROM reliable_event_outbox WHERE id = ?",

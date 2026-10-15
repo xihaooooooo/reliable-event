@@ -35,7 +35,7 @@ tests:
           - labels: '{__name__="ALERTS",alertname="ReliableEventUnfinishedOverdue",alertstate="firing",outbox_store="db",severity="critical"}'
             value: 1
 
-  - name: dead-transition-follows-overdue-and-rolling-dead-window-recovers
+  - name: failed-transition-follows-overdue-and-rolling-failed-window-recovers
     interval: 15s
     input_series:
       - series: 'up{job="reliable-event-example",instance="a",outbox_store="db",expected_snapshot="true",snapshot_mode="automatic"}'
@@ -46,14 +46,14 @@ tests:
         values: '1+0x23 0+0x44'
       - series: 'reliable_event_unfinished_overdue_oldest_age{job="reliable-event-example",instance="a",outbox_store="db"}'
         values: '120+0x23 0+0x44'
-      - series: 'reliable_event_dead_entered_total{job="reliable-event-example",instance="a",outbox_store="db"}'
+      - series: 'reliable_event_failed_entered_total{job="reliable-event-example",instance="a",outbox_store="db"}'
         values: '0+0x23 1+0x44'
     alert_rule_test:
       - eval_time: 6m
         alertname: ReliableEventUnfinishedOverdue
         exp_alerts: []
       - eval_time: 17m
-        alertname: ReliableEventNewDeadLetter
+        alertname: ReliableEventNewFailedEvent
         exp_alerts: []
     promql_expr_test:
       - expr: ALERTS{alertname="ReliableEventUnfinishedOverdue",alertstate="firing"}
@@ -61,10 +61,10 @@ tests:
         exp_samples:
           - labels: '{__name__="ALERTS",alertname="ReliableEventUnfinishedOverdue",alertstate="firing",outbox_store="db",severity="critical"}'
             value: 1
-      - expr: ALERTS{alertname="ReliableEventNewDeadLetter",alertstate="firing"}
+      - expr: ALERTS{alertname="ReliableEventNewFailedEvent",alertstate="firing"}
         eval_time: 6m
         exp_samples:
-          - labels: '{__name__="ALERTS",alertname="ReliableEventNewDeadLetter",alertstate="firing",outbox_store="db",severity="warning"}'
+          - labels: '{__name__="ALERTS",alertname="ReliableEventNewFailedEvent",alertstate="firing",outbox_store="db",severity="warning"}'
             value: 1
 
   - name: future-planned-event-is-not-an-overdue-unfinished-event

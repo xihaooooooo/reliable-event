@@ -48,7 +48,7 @@ final class JdbcOutboxSql {
     static final String READ_METRICS_SNAPSHOT = """
             SELECT
               COALESCE(SUM(status IN (0, 3)), 0) AS backlog,
-              COALESCE(SUM(status = 4), 0) AS dead,
+              COALESCE(SUM(status = 4), 0) AS failed,
               COALESCE(SUM(status IN (0, 3) AND next_attempt_at <= UTC_TIMESTAMP(3)), 0) AS ready,
               CASE
                 WHEN SUM(status IN (0, 3) AND next_attempt_at <= UTC_TIMESTAMP(3)) = 0 THEN 0
@@ -56,15 +56,15 @@ final class JdbcOutboxSql {
                   MIN(CASE WHEN status IN (0, 3) AND next_attempt_at <= UTC_TIMESTAMP(3)
                            THEN first_available_at END), UTC_TIMESTAMP(3)) / 1000000.0
               END AS ready_oldest_age,
-              COALESCE(SUM(status IN (0, 1, 3) AND first_available_at <= UTC_TIMESTAMP(3)), 0)
+              COALESCE(SUM(status IN (0, 1, 3, 6) AND first_available_at <= UTC_TIMESTAMP(3)), 0)
                 AS unfinished_overdue,
               CASE
-                WHEN SUM(status IN (0, 1, 3) AND first_available_at <= UTC_TIMESTAMP(3)) = 0 THEN 0
+                WHEN SUM(status IN (0, 1, 3, 6) AND first_available_at <= UTC_TIMESTAMP(3)) = 0 THEN 0
                 ELSE TIMESTAMPDIFF(MICROSECOND,
-                  MIN(CASE WHEN status IN (0, 1, 3) AND first_available_at <= UTC_TIMESTAMP(3)
+                  MIN(CASE WHEN status IN (0, 1, 3, 6) AND first_available_at <= UTC_TIMESTAMP(3)
                            THEN first_available_at END), UTC_TIMESTAMP(3)) / 1000000.0
               END AS unfinished_oldest_age,
-              COALESCE(SUM(status IN (0, 1, 3) AND first_available_at IS NULL), 0)
+              COALESCE(SUM(status IN (0, 1, 3, 6) AND first_available_at IS NULL), 0)
                 AS unfinished_timestamp_missing
             FROM reliable_event_outbox
             """;
@@ -74,12 +74,18 @@ final class JdbcOutboxSql {
                    version,
                    event_type,
                    event_key,
+                   payload,
+                   headers,
+                   status,
+                   last_error,
+                   fallback_stop_reason,
+                   fallback_failure_classification,
                    lease_owner,
                    lease_until,
                    attempt_count,
                    max_attempts
             FROM reliable_event_outbox
-            WHERE status = ?
+            WHERE status IN (?, ?)
               AND lease_owner IS NOT NULL
               AND TRIM(lease_owner) <> ''
               AND lease_until <= UTC_TIMESTAMP(3)
@@ -149,41 +155,47 @@ final class JdbcOutboxSql {
               AND lease_until > UTC_TIMESTAMP(3)
             """;
 
-    static final String MARK_DEAD = """
+    static final String BEGIN_FALLBACK = """
             UPDATE reliable_event_outbox
-            SET status = ?,
-                last_error = ?,
-                lease_owner = NULL,
-                lease_until = NULL,
-                updated_at = ?,
-                version = version + 1
-            WHERE id = ?
-              AND status = ?
-              AND version = ?
-              AND lease_owner = ?
+            SET status = 6, last_error = ?, fallback_stop_reason = ?,
+                fallback_failure_classification = ?, lease_owner = ?,
+                lease_until = TIMESTAMPADD(MICROSECOND, ?, UTC_TIMESTAMP(3)),
+                updated_at = UTC_TIMESTAMP(3), version = version + 1
+            WHERE id = ? AND status = 1 AND version = ? AND lease_owner = ?
               AND lease_until > UTC_TIMESTAMP(3)
+            """;
+
+    static final String FINISH_FALLBACK = """
+            UPDATE reliable_event_outbox
+            SET status = ?, last_error = COALESCE(?, last_error),
+                lease_owner = NULL, lease_until = NULL,
+                updated_at = UTC_TIMESTAMP(3), version = version + 1
+            WHERE id = ? AND status = 6 AND version = ? AND lease_owner = ?
+              AND lease_until > UTC_TIMESTAMP(3)
+            """;
+
+    static final String CLAIM_EXPIRED_FALLBACK = """
+            UPDATE reliable_event_outbox
+            SET lease_owner = ?, lease_until = TIMESTAMPADD(MICROSECOND, ?, UTC_TIMESTAMP(3)),
+                updated_at = UTC_TIMESTAMP(3), version = version + 1
+            WHERE id = ? AND status = 6 AND version = ? AND lease_owner = ?
+              AND lease_until = ? AND lease_until <= UTC_TIMESTAMP(3)
+            """;
+
+    static final String RECOVER_EXPIRED_LEASE_TO_FALLBACK = """
+            UPDATE reliable_event_outbox
+            SET status = 6, last_error = ?, fallback_stop_reason = ?,
+                fallback_failure_classification = ?, lease_owner = ?,
+                lease_until = TIMESTAMPADD(MICROSECOND, ?, UTC_TIMESTAMP(3)),
+                updated_at = UTC_TIMESTAMP(3), version = version + 1
+            WHERE id = ? AND status = 1 AND version = ? AND lease_owner = ?
+              AND lease_until = ? AND lease_until <= UTC_TIMESTAMP(3)
             """;
 
     static final String RECOVER_EXPIRED_LEASE_TO_RETRY_WAIT = """
             UPDATE reliable_event_outbox
             SET status = ?,
                 next_attempt_at = TIMESTAMPADD(MICROSECOND, ?, UTC_TIMESTAMP(3)),
-                last_error = ?,
-                lease_owner = NULL,
-                lease_until = NULL,
-                updated_at = UTC_TIMESTAMP(3),
-                version = version + 1
-            WHERE id = ?
-              AND status = ?
-              AND version = ?
-              AND lease_owner = ?
-              AND lease_until = ?
-              AND lease_until <= UTC_TIMESTAMP(3)
-            """;
-
-    static final String RECOVER_EXPIRED_LEASE_TO_DEAD = """
-            UPDATE reliable_event_outbox
-            SET status = ?,
                 last_error = ?,
                 lease_owner = NULL,
                 lease_until = NULL,

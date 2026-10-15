@@ -1,3 +1,3 @@
 package dev.reliableevent.jdbc.internal.model;
 
-public record OutboxCounts(long backlog, long dead) { }
+public record OutboxCounts(long backlog, long failed) { }

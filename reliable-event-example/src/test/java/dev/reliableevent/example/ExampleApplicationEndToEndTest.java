@@ -9,11 +9,6 @@ import dev.reliableevent.ReliableEvent;
 import dev.reliableevent.ReliableEventPublisher;
 import dev.reliableevent.spi.TransportException;
 import dev.reliableevent.spi.EventTransport;
-import dev.reliableevent.jdbc.DeadEventDetails;
-import dev.reliableevent.jdbc.DeadEventLookup;
-import dev.reliableevent.jdbc.DeadEventOperations;
-import dev.reliableevent.jdbc.DeadEventReplayRequest;
-import dev.reliableevent.jdbc.DeadEventReplayResult;
 import dev.reliableevent.jdbc.internal.publication.JdbcEventPublicationWorker;
 import dev.reliableevent.jdbc.internal.persistence.JdbcPublicationStore;
 import dev.reliableevent.jdbc.internal.recovery.JdbcExpiredLeaseRecovery;
@@ -183,7 +178,6 @@ class ExampleApplicationEndToEndTest {
                 mysqlJdbcUrlUtc(), MYSQL.getUsername(), MYSQL.getPassword());
         new ResourceDatabasePopulator(
                 new ClassPathResource("schema/reliable-event-outbox.sql"),
-                new ClassPathResource("schema/reliable-event-replay-audit-m6-2.sql"),
                 new ClassPathResource("schema/example-tables.sql")
         ).execute(dataSource);
         jdbc = new JdbcTemplate(dataSource);
@@ -269,7 +263,7 @@ class ExampleApplicationEndToEndTest {
 
     @Test
     void consumerSeparatesBusinessFailureDuplicateSkipAndAckFailure() throws Exception {
-        startApplication(false, false, 8, "--example.consumer.enabled=false");
+        startApplication(false, 8, "--example.consumer.enabled=false");
         MemorySpanExporter.reset();
         Created created = postOrder("consumer-results", 2);
         ObjectMapper appMapper = context.getBean(ObjectMapper.class);
@@ -525,7 +519,7 @@ class ExampleApplicationEndToEndTest {
 
     @Test
     void userSuppliedNativeRocketMqProducerRemainsUsableAfterApplicationContextCloses() throws Exception {
-        startApplication(false, false, 8, "--test.rocketmq.user-producer=true");
+        startApplication(false, 8, "--test.rocketmq.user-producer=true");
         Producer userProducer = context.getBean(Producer.class);
         SimpleConsumer probe = null;
         try {
@@ -565,7 +559,7 @@ class ExampleApplicationEndToEndTest {
     @Test
     void normalContextStopWaitsForARealBrokerConfirmationBeforeClosingRocketMqClients() throws Exception {
         Set<String> clientThreadsBeforeContext = liveRocketMqThreadNames();
-        startApplication(true, false, 8, "--test.rocketmq.shutdown-barrier=true",
+        startApplication(true, 8, "--test.rocketmq.shutdown-barrier=true",
                 "--reliable-event.shutdown-timeout=8s");
         CountDownLatch confirmed = new CountDownLatch(1);
         CountDownLatch release = new CountDownLatch(1);
@@ -618,7 +612,7 @@ class ExampleApplicationEndToEndTest {
     void shutdownTimeoutReleasesQueuedCandidatesAndRecoversAnUncommittedRealConfirmationLease()
             throws Exception {
         Set<String> clientThreadsBeforeContext = liveRocketMqThreadNames();
-        startApplication(true, false, 8, "--test.rocketmq.shutdown-barrier=true",
+        startApplication(true, 8, "--test.rocketmq.shutdown-barrier=true",
                 "--reliable-event.shutdown-timeout=500ms", "--reliable-event.worker-threads=1",
                 "--reliable-event.worker-queue-capacity=2", "--reliable-event.claim-batch-size=3");
         CountDownLatch confirmed = new CountDownLatch(1);
@@ -724,137 +718,9 @@ class ExampleApplicationEndToEndTest {
                 .sorted().toList().toString();
     }
 
-    @Test
-    void twoOperatorsCompeteToReplayADeadEventAfterRepairingItsDestination() throws Exception {
-        startApplication(false, true, 1);
-        Created created = postOrder("eraser", 3);
-        EventId eventId = new EventId(created.eventId());
-        EventTransport missingDestination = new RocketMqEventTransport(PROVIDER, context.getBean(Producer.class), new MapEventDestinationResolver(Map.of()));
-        Clock publishClock = Clock.systemUTC();
-        assertThat(publishPending(worker(missingDestination, publishClock), publishClock)).isZero();
-        assertThat(status(created.eventId())).isEqualTo(4);
-
-        DeadEventOperations operations = context.getBean(DeadEventOperations.class);
-        assertThat(operations.firstPage(50).events()).anySatisfy(
-                summary -> assertThat(summary.id()).isEqualTo(eventId));
-        DeadEventDetails inspected = deadDetails(operations, eventId);
-        assertThat(inspected.lastError()).contains("No RocketMQ destination");
-        long deadVersion = inspected.version();
-
-        CountDownLatch ready = new CountDownLatch(2);
-        CountDownLatch start = new CountDownLatch(1);
-        var operators = Executors.newFixedThreadPool(2);
-        try {
-            Future<DeadEventReplayResult> first = operators.submit(() -> replayAfterSignal(
-                    operations, inspected, "operator-a", ready, start));
-            Future<DeadEventReplayResult> second = operators.submit(() -> replayAfterSignal(
-                    operations, inspected, "operator-b", ready, start));
-            assertThat(ready.await(5, TimeUnit.SECONDS)).isTrue();
-            start.countDown();
-            List<DeadEventReplayResult> results = List.of(first.get(), second.get());
-            assertThat(results.stream().filter(DeadEventReplayResult.Replayed.class::isInstance).count())
-                    .isOne();
-            assertThat(results.stream().filter(DeadEventReplayResult.NotDead.class::isInstance).count())
-                    .isOne();
-            DeadEventReplayResult.Replayed replayed = results.stream()
-                    .filter(DeadEventReplayResult.Replayed.class::isInstance)
-                    .map(DeadEventReplayResult.Replayed.class::cast).findFirst().orElseThrow();
-            assertThat(replayed.previousVersion()).isEqualTo(deadVersion);
-            assertThat(replayed.newVersion()).isEqualTo(deadVersion + 1);
-            assertThat(status(created.eventId())).isZero();
-            assertThat(attemptCount(created.eventId())).isZero();
-            assertThat(auditCount(created.eventId())).isOne();
-            assertThat(jdbc.queryForObject(
-                    "SELECT operator_id FROM reliable_event_replay_audit WHERE id = ?",
-                    String.class, replayed.auditId())).isIn("operator-a", "operator-b");
-
-            // Restart with the repaired mapping and normal Starter scheduling.
-            context.close();
-            context = null;
-            startApplication(true, true, 1);
-            await().atMost(Duration.ofSeconds(30)).pollInterval(Duration.ofMillis(100))
-                    .untilAsserted(() -> {
-                        assertThat(status(created.eventId())).isEqualTo(2);
-                        assertThat(effectCount(created.orderId())).isOne();
-                    });
-            assertThat(status(created.eventId())).isEqualTo(2);
-            assertThat(consumedCount(created.orderId())).isOne();
-            assertThat(jdbc.queryForObject("""
-                    SELECT a.new_version FROM reliable_event_replay_audit a
-                    WHERE a.id = ? AND a.event_id = ? AND a.result = 'REQUEUED'
-                    """, Long.class, replayed.auditId(), created.eventId()))
-                    .isEqualTo(deadVersion + 1);
-        } finally {
-            operators.shutdownNow();
-        }
-    }
-
-    @Test
-    void replayAfterUnknownResultKeepsIdentityAndConsumerEffectIdempotent() throws Exception {
-        startApplication(false, true, 1);
-        ClientConfiguration configuration = ClientConfiguration.newBuilder()
-                .setEndpoints("localhost:" + PROXY_GRPC_PORT)
-                .setRequestTimeout(Duration.ofSeconds(10))
-                .enableSsl(false)
-                .build();
-        try (SimpleConsumer probe = PROVIDER.newSimpleConsumerBuilder()
-                .setClientConfiguration(configuration)
-                .setConsumerGroup(PROBE_GROUP)
-                .setAwaitDuration(Duration.ofSeconds(3))
-                .setSubscriptionExpressions(Map.of(TOPIC, FilterExpression.SUB_ALL))
-                .build()) {
-            Created created = postOrder("ruler", 5);
-            EventTransport realSender = context.getBean(EventTransport.class);
-            EventTransport receiptLost = event -> {
-                realSender.send(event);
-                throw new TransportException(TransportFailureType.RESULT_UNKNOWN, "Test discarded a successful Broker receipt");
-            };
-            Clock publishClock = Clock.systemUTC();
-            assertThat(publishPending(worker(receiptLost, publishClock), publishClock)).isZero();
-            assertThat(status(created.eventId())).isEqualTo(4);
-            List<MessageView> firstDelivery = receiveFor(probe,
-                    Long.toString(created.orderId()), 1);
-            await().atMost(Duration.ofSeconds(30)).pollInterval(Duration.ofMillis(100))
-                    .untilAsserted(() -> assertThat(effectCount(created.orderId())).isOne());
-
-            DeadEventOperations operations = context.getBean(DeadEventOperations.class);
-            DeadEventDetails inspected = deadDetails(operations, new EventId(created.eventId()));
-            assertThat(inspected.lastError()).contains("Test discarded a successful Broker receipt");
-            var result = operations.replay(new DeadEventReplayRequest(
-                    inspected.id(), inspected.version(), "operator-after-check",
-                    "Verified Broker delivery and consumer effect before controlled replay"));
-            assertThat(result).isInstanceOf(DeadEventReplayResult.Replayed.class);
-            DeadEventReplayResult.Replayed replayed = (DeadEventReplayResult.Replayed) result;
-            assertThat(auditCount(created.eventId())).isOne();
-            assertThat(attemptCount(created.eventId())).isZero();
-
-            assertThat(publishPending(worker(realSender, publishClock), publishClock)).isOne();
-            List<MessageView> secondDelivery = receiveFor(probe,
-                    Long.toString(created.orderId()), 1);
-            MessageView first = firstDelivery.get(0);
-            MessageView second = secondDelivery.get(0);
-            assertThat(first.getMessageId().toString()).isNotEqualTo(second.getMessageId().toString());
-            for (MessageView message : List.of(first, second)) {
-                assertThat(message.getKeys()).contains(Long.toString(created.orderId()));
-                assertThat(message.getProperties())
-                        .containsEntry("reliable_event_id", Long.toString(created.eventId()))
-                        .containsEntry("reliable_event_type", OrderService.EVENT_TYPE)
-                        .containsEntry("reliable_event_key", Long.toString(created.orderId()));
-            }
-            await().atMost(Duration.ofSeconds(30)).pollInterval(Duration.ofMillis(100))
-                    .untilAsserted(() -> assertThat(effectCount(created.orderId())).isOne());
-            assertThat(consumedCount(created.orderId())).isOne();
-            assertThat(status(created.eventId())).isEqualTo(2);
-            assertThat(attemptCount(created.eventId())).isOne();
-            assertThat(jdbc.queryForObject(
-                    "SELECT previous_attempt_count FROM reliable_event_replay_audit WHERE id = ?",
-                    Integer.class, replayed.auditId())).isOne();
-        }
-    }
-
-    @Test
+            @Test
     void publishedRetentionKeepsIdentityAndDoesNotSendAgain() throws Exception {
-        startApplication(true, false, 8,
+        startApplication(true, 8,
                 "--reliable-event.published-retention-enabled=true",
                 "--reliable-event.published-retention=1s",
                 "--reliable-event.cleanup-interval=100ms",
@@ -911,35 +777,11 @@ class ExampleApplicationEndToEndTest {
             }
         }
     }
-
-    private DeadEventReplayResult replayAfterSignal(DeadEventOperations operations,
-                                                     DeadEventDetails inspected, String operator,
-                                                     CountDownLatch ready, CountDownLatch start)
-            throws InterruptedException {
-        ready.countDown();
-        if (!start.await(5, TimeUnit.SECONDS)) {
-            throw new IllegalStateException("Timed out waiting for operator start");
-        }
-        return operations.replay(new DeadEventReplayRequest(
-                inspected.id(), inspected.version(), operator, "Repaired the event destination"));
-    }
-
-    private DeadEventDetails deadDetails(DeadEventOperations operations, EventId id) {
-        DeadEventLookup lookup = operations.lookup(id);
-        assertThat(lookup).isInstanceOf(DeadEventLookup.Dead.class);
-        return ((DeadEventLookup.Dead) lookup).event();
-    }
-
     private void startApplication(boolean scheduling) {
-        startApplication(scheduling, false, 8);
+        startApplication(scheduling, 8);
     }
 
-    private void startApplication(boolean scheduling, boolean deadOperations, int maxAttempts) {
-        startApplication(scheduling, deadOperations, maxAttempts, new String[0]);
-    }
-
-    private void startApplication(boolean scheduling, boolean deadOperations, int maxAttempts,
-                                  String... extraProperties) {
+    private void startApplication(boolean scheduling, int maxAttempts, String... extraProperties) {
         String[] properties = new String[] {
                         "--server.port=0",
                         "--spring.datasource.url=" + mysqlJdbcUrlUtc(),
@@ -948,7 +790,6 @@ class ExampleApplicationEndToEndTest {
                         "--example.rocketmq.topic=" + TOPIC,
                         "--example.rocketmq.consumer-group=" + GROUP,
                         "--reliable-event.scheduling-enabled=" + scheduling,
-                        "--reliable-event.dead-operations-enabled=" + deadOperations,
                         "--reliable-event.max-attempts=" + maxAttempts,
                         "--reliable-event.poll-interval=100ms",
                         "--reliable-event.initial-retry-delay=100ms",
@@ -1136,13 +977,6 @@ class ExampleApplicationEndToEndTest {
                 "SELECT attempt_count FROM reliable_event_outbox WHERE id = ?",
                 Integer.class, eventId);
     }
-
-    private long auditCount(long eventId) {
-        return jdbc.queryForObject(
-                "SELECT COUNT(*) FROM reliable_event_replay_audit WHERE event_id = ?",
-                Long.class, eventId);
-    }
-
     private int effectCount(long orderId) {
         Integer count = jdbc.queryForObject(
                 "SELECT COALESCE(SUM(handled_count), 0) FROM example_order_effect WHERE order_id = ?",

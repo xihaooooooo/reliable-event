@@ -45,6 +45,8 @@ class MicrometerPublicationObserverTest {
                 availableAt, 1, 2), false);
         observer.leaseRecovered(new ExpiredLeaseCandidate(new EventId(2), 1, "worker-1",
                 availableAt, 2, 2), true);
+        observer.leaseRecovered(new ExpiredLeaseCandidate(new EventId(3), 1, "worker-1",
+                availableAt, 1, 1), "FALLBACK_COMPLETED");
         observer.refreshSnapshot();
         observer.cleanupCompleted(new PublishedRetentionResult(3, 2, 60), 1_000_000);
         observer.cleanupFailed();
@@ -59,10 +61,12 @@ class MicrometerPublicationObserverTest {
                 .isEqualTo(4);
         assertThat(registry.get("reliable_event.lease.expired").tag("result", "retry_wait")
                 .counter().count()).isEqualTo(1);
-        assertThat(registry.get("reliable_event.lease.expired").tag("result", "dead")
+        assertThat(registry.get("reliable_event.lease.expired").tag("result", "failed")
+                .counter().count()).isEqualTo(1);
+        assertThat(registry.get("reliable_event.lease.expired").tag("result", "fallback_completed")
                 .counter().count()).isEqualTo(1);
         assertThat(registry.get("reliable_event.backlog").gauge().value()).isEqualTo(3);
-        assertThat(registry.get("reliable_event.dead").gauge().value()).isEqualTo(2);
+        assertThat(registry.get("reliable_event.failed").gauge().value()).isEqualTo(2);
         assertThat(registry.get("reliable_event.ready").gauge().value()).isEqualTo(4);
         assertThat(registry.get("reliable_event.ready.oldest_age").gauge().value()).isNaN();
         assertThat(registry.get("reliable_event.unfinished.overdue").gauge().value()).isEqualTo(6);
@@ -134,7 +138,8 @@ class MicrometerPublicationObserverTest {
         MicrometerPublicationObserver observer = new MicrometerPublicationObserver(registry, repository);
         observer.refreshSnapshot();
         observer.stateTransitionCommitted("PUBLISHED");
-        observer.stateTransitionCommitted("DEAD");
+        observer.stateTransitionCommitted("FAILED");
+        observer.stateTransitionCommitted("FALLBACK_COMPLETED");
         observer.stateUpdateFailed("PUBLISHED", true);
         observer.schedulerCycleFailed(true, "candidate_scan");
 
@@ -146,7 +151,8 @@ class MicrometerPublicationObserverTest {
                 "reliable_event_unfinished_timestamp_missing ",
                 "reliable_event_snapshot_last_success_timestamp ",
                 "reliable_event_publication_persisted_total 1.0",
-                "reliable_event_dead_entered_total 1.0",
+                "reliable_event_failed_entered_total 1.0",
+                "reliable_event_fallback_completed_total 1.0",
                 "reliable_event_publication_state_update_failure_total 1.0",
                 "reliable_event_scheduler_failure_total{mode=\"auto\",stage=\"candidate_scan\"} 1.0");
         assertThat(scrape).doesNotContain("eventId", "event_id", "messageId", "message_id", "eventKey");

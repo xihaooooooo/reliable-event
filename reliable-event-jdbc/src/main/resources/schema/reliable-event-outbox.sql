@@ -13,6 +13,8 @@ CREATE TABLE IF NOT EXISTS reliable_event_outbox (
     lease_until       DATETIME(3) NULL,
     version           BIGINT NOT NULL DEFAULT 0,
     last_error        VARCHAR(1024) NULL,
+    fallback_stop_reason VARCHAR(32) NULL,
+    fallback_failure_classification VARCHAR(32) NULL,
     created_at        DATETIME(3) NOT NULL,
     updated_at        DATETIME(3) NOT NULL,
     published_at      DATETIME(3) NULL,
@@ -20,7 +22,6 @@ CREATE TABLE IF NOT EXISTS reliable_event_outbox (
     UNIQUE KEY uk_event_identity (event_type, event_key),
     KEY idx_publish_scan (status, next_attempt_at, id),
     KEY idx_lease_recovery (status, lease_until, id),
-    KEY idx_dead_list (status, id),
     KEY idx_published_retention (status, published_at, id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 

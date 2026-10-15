@@ -35,17 +35,19 @@ ReliableEvent 是一个面向 Spring Boot 的事务 Outbox 发布库。业务服
 
 后台扫描 `PENDING` 与到期的 `RETRY_WAIT`，按 `next_attempt_at, id` 取一批候选。候选带 `version`；真正发送前在短事务中用条件更新抢占为 `PUBLISHING`、递增 `attempt_count` 和 `version`、写入 worker owner 与过期时间，再读取事件。队列中的候选尚未持有数据库租约。发送调用在数据库事务之外进行；成功后短事务更新为 `PUBLISHED` 并记录时间。状态写入同时核对状态、版本、owner 和尚未过期的租约，旧 Worker 不能覆盖新的领取者。
 
-传输必须同步等待实际 Broker 确认。`RETRYABLE` 表示确认失败且可重试；`NON_RETRYABLE` 表示确定的永久拒绝并进入 `DEAD`；`RESULT_UNKNOWN` 表示消息是否被接受不确定，会重试。未分类的 RuntimeException 按 `RESULT_UNKNOWN` 处理。发送成功但状态更新失败时，消息可能已被 Broker 接收；当前协议无法消除这一不确定窗口。租约过期则由恢复器以带版本、owner、旧租约时间条件的更新转成 `RETRY_WAIT` 或 `DEAD`。这些语义是至少一次投递，要求消费端去重。
+传输必须同步等待实际 Broker 确认。`RETRYABLE` 表示确认失败且可重试；`NON_RETRYABLE` 表示确定的永久拒绝并停止普通发送；`RESULT_UNKNOWN` 表示消息是否被接受不确定，会重试。未分类的 RuntimeException 按 `RESULT_UNKNOWN` 处理。永久拒绝、尝试耗尽及耗尽时租约恢复都会进入 `FALLBACK_PROCESSING`，在无数据库事务和行锁时调用应用可选的 `EventFallbackHandler`。发布和恢复流程必须在外部事务之外运行兜底；检测到外部事务时会拒绝处理，之后由租约恢复接手。正常返回写为 `FALLBACK_COMPLETED`；缺少 handler 或 handler 抛异常则写为 `FAILED`。handler 必须幂等：进程崩溃、租约过期或最终状态写入失败都可能导致再次调用。兜底完成不代表 Broker 发布成功，也不会更新 identity 的成功时间。发送成功但状态更新失败时，消息可能已被 Broker 接收；至少一次投递要求消费端去重。
 
 状态码在 SQL 和 Java 中一致：
 
-- `0 PENDING`：刚登记或人工重放，等待发送。
+- `0 PENDING`：刚登记，等待发送。
 - `1 PUBLISHING`：已被某个 Worker 抢占并持有租约。
 - `2 PUBLISHED`：收到 Broker 确认且成功保存发布状态。
 - `3 RETRY_WAIT`：可重试失败或租约超时，等待 `next_attempt_at`。
-- `4 DEAD`：永久拒绝、超过最大尝试次数或最终租约恢复失败。
+- `4 FAILED`：普通发送停止且兜底未成功完成；旧版 `DEAD` 行保留数值并对应此状态，无需重写状态码。
+- `5 FALLBACK_COMPLETED`：应用兜底正常返回，不代表 Broker 已确认。
+- `6 FALLBACK_PROCESSING`：应用兜底处理中；租约过期后恢复器抢占并只再次调用兜底。
 
-尝试次数在每次抢占时递增，而不是每次 sender 调用一定只增一次；`attempt_count` 代表领取尝试。默认最多 8 次。退避初始时间、基础时间上限和抖动比例必须显式配置。基础时间每次指数翻倍，达到配置上限后停止增长，再按配置比例增加随机抖动；最终等待时间可以超过基础时间上限。到达最大次数后，下一次发送失败或租约恢复会将事件置为 `DEAD`。最后错误只保存最多 1024 个 Unicode 字符的异常类型和消息；应用应避免让异常消息携带凭证、payload 或个人数据。
+`attempt_count` 在普通发送领取时递增，表示普通发送领取次数；兜底租约重抢不会增加它。默认最多 8 次。退避初始时间、基础时间上限和抖动比例必须显式配置。基础时间每次指数翻倍，达到配置上限后停止增长，再按配置比例增加随机抖动；最终等待时间可以超过基础时间上限。达到最大次数后，发送失败或租约恢复会调用兜底。最后错误最多保存 1024 个 Unicode 字符；兜底失败时会合并兜底异常摘要和原发送错误摘要。应用应避免异常消息携带凭证、payload 或个人数据。
 
 ## 消费端与 Broker 行为
 
@@ -154,7 +156,6 @@ reliable-event:
 
 - `enabled=true`：关闭时不启用 ReliableEvent 自动配置。
 - `transport`：可选的 `rocketmq`、`kafka` 或 `custom`，默认未设置并按上述规则选择。
-- `dead-operations-enabled=false`：默认不创建死信查询/重放 Bean。
 - `published-retention-enabled=false`、`published-retention`：默认不清理；开启时必须提供正的保留时长。
 - `identity-retention-enabled=false`、`identity-retention`：默认永久保留已发布身份；开启要求同时启用发布行清理并提供正的 identity 保留期。
 - `cleanup-batch-size=100`、`cleanup-interval=1h`：每次最多清理 1–1000 行；周期必须为正。
@@ -190,24 +191,23 @@ Kafka 属性（`reliable-event.kafka`，未知属性会报错）：
 
 当前 DDL 使用 MySQL 8 的 `JSON`、InnoDB、`UTC_TIMESTAMP(3)`、`TIMESTAMPADD` 和 `DATETIME(3)`。连接与数据库会话应使用 UTC；两个示例 JDBC URL 均指定 `connectionTimeZone=UTC`。本库没有自动迁移器，不会在应用启动时建表或执行 SQL。
 
-新库执行 [`reliable-event-outbox.sql`](../reliable-event-jdbc/src/main/resources/schema/reliable-event-outbox.sql)，会创建 `reliable_event_outbox` 和 `reliable_event_identity`，含发布扫描、租约恢复、死信分页和发布保留相关索引。Outbox 保存 payload/headers JSON、状态、可用/下次尝试时间、尝试次数/上限、租约、版本、最后错误和发布/创建/更新时间。identity 表保存自增 EventId、唯一业务事件键、登记时间及成功发布时间。
+新库执行 [`reliable-event-outbox.sql`](../reliable-event-jdbc/src/main/resources/schema/reliable-event-outbox.sql)，会创建 `reliable_event_outbox` 和 `reliable_event_identity`，含发布扫描、租约恢复和发布保留相关索引。Outbox 保存 payload/headers JSON、状态、可用/下次尝试时间、尝试次数/上限、租约、版本、兜底恢复信息、最后错误和发布/创建/更新时间。identity 表保存自增 EventId、唯一业务事件键、登记时间及成功发布时间。
 
 已有数据库应先检查实际表结构，只应用适用的增量 SQL：
 
 - `reliable-event-outbox-m4-5.sql`：为旧 Outbox 加 `first_available_at`；历史事件首次可用时间无法还原，需由运维决定补数。
-- `reliable-event-outbox-m6-1.sql`：为旧表增加死信分页索引。
-- `reliable-event-replay-audit-m6-2.sql`：使用受控重放前创建审计表。
 - `reliable-event-outbox-m7-2.sql`：发布保留清理索引。
+- `reliable-event-outbox-m8-1.sql`：为兜底租约恢复保存停止原因和失败分类。旧状态 `4` 保留数值并解释为 `FAILED`；已有 `reliable_event_replay_audit` 表归应用管理，库不会自动删除。
 - `reliable-event-identity-m7-1.sql` 与 `...-check.sql`：旧库启用 identity 表时，在暂停登记的维护窗口创建/回填并检查 ID、键和 AUTO_INCREMENT 连续性。
 - `reliable-event-identity-retention.sql` 与 `...-backfill.sql`：启用 identity 到期清理前增加 `published_at` 与索引，并在暂停登记和清理时回填。迁移脚本说明了已被旧版 Outbox 清理删除的孤立身份如何开始其新保留窗口。
 
 迁移由部署方排期和执行；按目标版本检查脚本注释、`SHOW CREATE TABLE` 与校验 SQL，并在写入恢复前验证一致性。清理 identity 会释放该 `(event_type,event_key)` 的唯一键，之后同一业务键可能被重新登记为新事件；保留期应覆盖业务去重窗口。
 
-## 死信操作与清理
+## 失败处理与清理
 
-启用 `reliable-event.dead-operations-enabled=true` 后可注入 `DeadEventOperations`。分页每页最多 100 条，列表不包含业务键或错误；`lookup` 可返回受限详情。重放要求 ID、读取时的 `expectedVersion`、操作者和原因。只有当前状态仍为 `DEAD` 且版本匹配时，操作才会在一个事务内将事件清回 `PENDING`、重置 attempt、清掉错误/租约/发布时刻，并写一条 `reliable_event_replay_audit`。返回 `NotFound`、`NotDead`、`VersionMismatch` 时不会改变事件或新增审计记录。库不提供身份认证或授权，调用方需做访问控制，并在操作前核对 Broker 与消费者事实；结果未知时重放可能造成重复投递。
+原 `DeadEventOperations` 查询、详情、分页、重放 API，以及 JDBC 实现和审计表建表脚本已移除。相关配置属性也已删除。应用负责失败事件的查询、重投、补偿和删除，并自行管理旧审计表；本库不会自动删除已有审计表。应用可提供唯一的 `EventFallbackHandler` Bean；上下文含原始 JSON payload/headers、失败次数、停止原因、失败分类和错误摘要，不暴露内部存储类型。状态写入失败后兜底可能再次触发，应用应按业务键或事件 ID 保证幂等。
 
-发布行清理默认关闭。显式打开 `published-retention-enabled` 并设置 `published-retention` 后，独立调度器按批次删除超过期限的 `PUBLISHED` Outbox 行；若同时启用 identity 保留，先将 Outbox 成功时间复制到 identity，再在同一事务中清理到期且没有 Outbox 对应行的身份。`PENDING`、`PUBLISHING`、`RETRY_WAIT` 和 `DEAD` 不由此任务清理。清理按调度周期分批运行，不替代备份或审计保留策略。
+发布行清理默认关闭。显式打开 `published-retention-enabled` 并设置 `published-retention` 后，独立调度器按批次删除超过期限的 `PUBLISHED` Outbox 行；若同时启用 identity 保留，先将 Outbox 成功时间复制到 identity，再在同一事务中清理到期且没有 Outbox 对应行的身份。只有 `PUBLISHED` 行会由此任务清理；其他状态包括 `FAILED` 与 `FALLBACK_COMPLETED` 均保留给应用处理。清理按调度周期分批运行，不替代备份或审计保留策略。
 
 ## 运行示例
 
@@ -245,7 +245,7 @@ mvn -pl reliable-event-kafka-example spring-boot:run
 
 ## 可观测性、日志和部署
 
-有 Micrometer `MeterRegistry` 时会注册发送成功/失败计数、按失败类型分开的发送耗时、确认延迟、租约恢复、状态提交、清理、快照失败、调度失败、Worker 数量和 Outbox 快照指标。快照包括 backlog、dead、ready、ready 最老年龄、未完成超期数量/年龄及缺失首次可用时间数量。快照在独立线程和有超时的单条数据库查询中刷新；首次成功快照之前相关 Gauge 为空值。核心指标名以 `reliable_event.` 开头，例如 `publish.success`、`publish.failure`、`publish.duration`、`backlog`、`dead`、`ready`、`unfinished.overdue`、`snapshot.last_success_timestamp`、`scheduler.running`。Micrometer 会按注册表规则映射为 Prometheus 名称。指标不使用事件 ID、业务键、Trace ID 或错误内容作为标签。
+有 Micrometer `MeterRegistry` 时会注册发送成功/失败计数、按失败类型分开的发送耗时、确认延迟、租约恢复、状态提交、清理、快照失败、调度失败、Worker 数量和 Outbox 快照指标。快照包括 backlog、failed、ready、ready 最老年龄、未完成超期数量/年龄及缺失首次可用时间数量。快照在独立线程和有超时的单条数据库查询中刷新；首次成功快照之前相关 Gauge 为空值。核心指标名以 `reliable_event.` 开头，例如 `publish.success`、`publish.failure`、`publish.duration`、`backlog`、`failed`、`ready`、`unfinished.overdue`、`snapshot.last_success_timestamp`、`scheduler.running`。Micrometer 会按注册表规则映射为 Prometheus 名称。指标不使用事件 ID、业务键、Trace ID 或错误内容作为标签。
 
 例如 Micrometer counter `reliable_event.publish.success` 在 Prometheus registry 中导出为 `reliable_event_publish_success_total`；`reliable_event.publish.duration` 是按 `outcome` 标记的 Timer，导出为 `reliable_event_publish_duration_seconds_*` 系列。可选仪表盘和告警按 Prometheus 暴露名查询。
 

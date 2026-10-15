@@ -265,7 +265,7 @@ class KafkaPublicationCrashIntegrationTest {
         assertBusinessDeduplication(created.orderId());
     }
 
-    @Test void nativeBrokerOutageConsumesConfiguredAttemptsAndMovesEventToDead() throws Exception {
+    @Test void nativeBrokerOutageConsumesConfiguredAttemptsAndEntersFallback() throws Exception {
         evidenceDirectory = evidenceDirectory("native-retry-exhaustion");
         OrderService.CreatedOrder created = context.getBean(OrderService.class).create("broker-outage", 1);
         var producer = context.getBean(org.apache.kafka.clients.producer.Producer.class);
@@ -288,7 +288,7 @@ class KafkaPublicationCrashIntegrationTest {
             await(() -> jdbc.queryForObject("SELECT next_attempt_at <= ? FROM reliable_event_outbox WHERE id=?",
                     Boolean.class, Timestamp.from(Clock.systemUTC().instant()), created.eventId()), Duration.ofSeconds(10));
             assertThat(publishPending(worker(context.getBean(EventTransport.class)))).isZero();
-            assertThat(status(created.eventId())).isEqualTo(EventStatus.DEAD.code());
+            assertThat(status(created.eventId())).isEqualTo(EventStatus.FAILED.code());
             assertThat(attemptCount(created.eventId())).isEqualTo(2);
             timeline("native_retry_exhausted event_id=" + created.eventId() + " status="
                     + status(created.eventId()) + " attempt_count=" + attemptCount(created.eventId())
@@ -312,7 +312,7 @@ class KafkaPublicationCrashIntegrationTest {
             assertBusinessDeduplication(created.orderId());
         }
         Thread.sleep(500);
-        assertThat(status(created.eventId())).isEqualTo(EventStatus.DEAD.code());
+        assertThat(status(created.eventId())).isEqualTo(EventStatus.FAILED.code());
         String resourceAfter = nativeProducerSample("after-broker-recovery", producer, clientId);
         timeline(resourceBefore);
         timeline(resourceAfter);

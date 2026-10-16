@@ -161,6 +161,33 @@ class MicrometerPublicationObserverTest {
     }
 
     @Test
+    void recoveryHealthIsIndependentFromSuccessfulScansAndRetainsLastSuccessOnFailure() {
+        SimpleMeterRegistry registry = new SimpleMeterRegistry();
+        MicrometerPublicationObserver observer = new MicrometerPublicationObserver(
+                registry, mock(JdbcOutboxRepository.class));
+        try {
+            observer.recoveryStarted(100);
+            observer.schedulerCycleCompleted(true, 101);
+            assertThat(registry.get("reliable_event.recovery.running").gauge().value()).isEqualTo(1);
+            assertThat(registry.get("reliable_event.recovery.started_timestamp").gauge().value()).isEqualTo(100);
+            assertThat(registry.get("reliable_event.recovery.last_success_timestamp").gauge().value()).isZero();
+            assertThat(registry.get("reliable_event.scheduler.last_success_timestamp").gauge().value()).isEqualTo(101);
+
+            observer.recoveryFinished(true, 102);
+            observer.recoveryStarted(103);
+            observer.schedulerCycleFailed(true, "lease_recovery");
+            observer.recoveryFinished(false, 104);
+            assertThat(registry.get("reliable_event.recovery.running").gauge().value()).isZero();
+            assertThat(registry.get("reliable_event.recovery.last_success_timestamp").gauge().value()).isEqualTo(102);
+            assertThat(registry.get("reliable_event.scheduler.failure").tags("mode", "auto", "stage", "lease_recovery")
+                    .counter().count()).isEqualTo(1);
+        } finally {
+            observer.close();
+            registry.close();
+        }
+    }
+
+    @Test
     void unavailableLegacyTimestampDoesNotProduceFalseLag() {
         SimpleMeterRegistry registry = new SimpleMeterRegistry();
         MicrometerPublicationObserver observer = new MicrometerPublicationObserver(

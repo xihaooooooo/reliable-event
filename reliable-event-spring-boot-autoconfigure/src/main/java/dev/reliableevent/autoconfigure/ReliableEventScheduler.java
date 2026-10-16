@@ -50,6 +50,7 @@ public final class ReliableEventScheduler implements SmartLifecycle {
     private final Semaphore slots;
     private final Set<Long> outstandingIds = ConcurrentHashMap.newKeySet();
     private final ScheduledExecutorService scanner;
+    private final ScheduledExecutorService recoveryScheduler;
     private final ThreadPoolExecutor executor;
     private final AtomicBoolean stopped = new AtomicBoolean();
     private final AtomicInteger admittedTasks = new AtomicInteger();
@@ -141,6 +142,7 @@ public final class ReliableEventScheduler implements SmartLifecycle {
         this.claimBatchSize = claimBatchSize;
         this.slots = new Semaphore(capacity);
         this.scanner = Executors.newSingleThreadScheduledExecutor(namedDaemonThreads("reliable-event-scan"));
+        this.recoveryScheduler = Executors.newSingleThreadScheduledExecutor(namedDaemonThreads("reliable-event-recover"));
         BlockingQueue<Runnable> queue = workerQueueCapacity == 0
                 ? new SynchronousQueue<>()
                 : new ArrayBlockingQueue<>(workerQueueCapacity);
@@ -151,7 +153,7 @@ public final class ReliableEventScheduler implements SmartLifecycle {
         observe(() -> observer.schedulerState(true, false));
     }
 
-    /** Executes one recovery and dispatch pass without waiting for submitted sends. */
+    /** Scans and dispatches without waiting for sends. Lease recovery runs independently. */
     AsyncPublicationCycleResult dispatchOnce() {
         return dispatchOnce(false);
     }
@@ -180,16 +182,9 @@ public final class ReliableEventScheduler implements SmartLifecycle {
     }
 
     private AsyncPublicationCycleResult dispatchAndRefresh(boolean automatic) {
-        int recoveredCount;
-        try {
-            recoveredCount = recovery.recoverExpiredLeases();
-        } catch (RuntimeException failure) {
-            observe(() -> observer.schedulerCycleFailed(automatic, "lease_recovery"));
-            throw failure;
-        }
         int dispatchLimit = Math.min(claimBatchSize, slots.availablePermits());
         if (dispatchLimit == 0 || stopped.get()) {
-            return new AsyncPublicationCycleResult(recoveredCount, 0);
+            return new AsyncPublicationCycleResult(0, 0);
         }
 
         int queryLimit = (int) Math.min(Integer.MAX_VALUE,
@@ -237,7 +232,26 @@ public final class ReliableEventScheduler implements SmartLifecycle {
                 throw exception;
             }
         }
-        return new AsyncPublicationCycleResult(recoveredCount, submittedCount);
+        return new AsyncPublicationCycleResult(0, submittedCount);
+    }
+
+    private void recoverSafely() {
+        synchronized (lifecycleMonitor) {
+            if (stopped.get()) return;
+            observe(() -> observer.recoveryStarted(Instant.now().getEpochSecond()));
+        }
+        boolean succeeded = false;
+        try {
+            recovery.recoverExpiredLeases();
+            succeeded = true;
+        } catch (RuntimeException exception) {
+            observe(() -> observer.schedulerCycleFailed(true, "lease_recovery"));
+            LOG.error("event=reliable_event.scheduler.recovery_failed exceptionType={}",
+                    exception.getClass().getName());
+        } finally {
+            boolean completedSuccessfully = succeeded;
+            observe(() -> observer.recoveryFinished(completedSuccessfully, Instant.now().getEpochSecond()));
+        }
     }
 
     int outstandingCount() {
@@ -282,6 +296,8 @@ public final class ReliableEventScheduler implements SmartLifecycle {
             if (stopped.get()) {
                 throw new IllegalStateException("Reliable event scheduler cannot restart after stop");
             }
+            // A single fixed-delay task never queues additional recovery rounds while a handler is blocked.
+            recoveryScheduler.scheduleWithFixedDelay(this::recoverSafely, 0, pollIntervalMillis, TimeUnit.MILLISECONDS);
             if (adaptivePollingEnabled) {
                 scanner.schedule(this::runSafely, 0, TimeUnit.MILLISECONDS);
             } else {
@@ -339,13 +355,16 @@ public final class ReliableEventScheduler implements SmartLifecycle {
     private void finishStop(long startedAt, CompletableFuture<Void> completion) {
         try {
             scanner.shutdownNow();
+            recoveryScheduler.shutdownNow();
             executor.shutdown();
             releaseQueuedTasks();
             boolean scannerTerminated = scanner.awaitTermination(
                     remainingNanos(startedAt), TimeUnit.NANOSECONDS);
             boolean workersTerminated = executor.awaitTermination(
                     remainingNanos(startedAt), TimeUnit.NANOSECONDS);
-            if (!scannerTerminated || !workersTerminated) {
+            boolean recoveryTerminated = recoveryScheduler.awaitTermination(
+                    remainingNanos(startedAt), TimeUnit.NANOSECONDS);
+            if (!scannerTerminated || !workersTerminated || !recoveryTerminated) {
                 forceStop();
             }
         } catch (InterruptedException exception) {
@@ -377,6 +396,7 @@ public final class ReliableEventScheduler implements SmartLifecycle {
         LOG.warn("event=reliable_event.shutdown.timed_out admittedTasks={} outstandingCandidates={}",
                 admittedTasks.get(), outstandingIds.size());
         scanner.shutdownNow();
+        recoveryScheduler.shutdownNow();
         for (Runnable task : executor.shutdownNow()) {
             ((CandidateTask) task).release();
         }

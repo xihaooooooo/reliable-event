@@ -40,6 +40,12 @@ public interface PublicationObserver {
 
     default void schedulerCycleFailed(boolean automatic, String stage) { }
 
+    /** Independent automatic lease recovery has begun; it may call application fallback code. */
+    default void recoveryStarted(long startedAtEpochSeconds) { }
+
+    /** Called only when recovery actually exits, including when it exits after scheduler shutdown. */
+    default void recoveryFinished(boolean succeeded, long completedAtEpochSeconds) { }
+
     default void workerCapacity(int inflight, int queued) { }
 
     default void workerStarted() { }

@@ -207,6 +207,8 @@ Kafka 属性（`reliable-event.kafka`，未知属性会报错）：
 
 原 `DeadEventOperations` 查询、详情、分页、重放 API，以及 JDBC 实现和审计表建表脚本已移除。相关配置属性也已删除。应用负责失败事件的查询、重投、补偿和删除，并自行管理旧审计表；本库不会自动删除已有审计表。应用可提供唯一的 `EventFallbackHandler` Bean；上下文含原始 JSON payload/headers、失败次数、停止原因、失败分类和错误摘要，不暴露内部存储类型。状态写入失败后兜底可能再次触发，应用应按业务键或事件 ID 保证幂等。
 
+过期租约恢复由每实例独立的单线程按 `poll-interval` 固定延迟运行，上一轮返回后才开始计时，不积压恢复轮次，也不随自适应扫描加速。普通事件扫描不等待恢复；恢复刚转为待重试的事件可能等到下一轮扫描。恢复中的兜底卡住会暂停该实例后续租约恢复，但普通扫描和发送仍可继续；正常发送失败后的兜底仍占用发送 Worker。停机时扫描、发送和恢复共用 `shutdown-timeout` 总等待期限，超时只请求中断，不能保证外部调用已经停止或未产生副作用。租约到期后的跨实例恢复语义保持不变，兜底仍需幂等。
+
 发布行清理默认关闭。显式打开 `published-retention-enabled` 并设置 `published-retention` 后，独立调度器按批次删除超过期限的 `PUBLISHED` Outbox 行；若同时启用 identity 保留，先将 Outbox 成功时间复制到 identity，再在同一事务中清理到期且没有 Outbox 对应行的身份。只有 `PUBLISHED` 行会由此任务清理；其他状态包括 `FAILED` 与 `FALLBACK_COMPLETED` 均保留给应用处理。清理按调度周期分批运行，不替代备份或审计保留策略。
 
 ## 运行示例
@@ -248,6 +250,8 @@ mvn -pl reliable-event-kafka-example spring-boot:run
 有 Micrometer `MeterRegistry` 时会注册发送成功/失败计数、按失败类型分开的发送耗时、确认延迟、租约恢复、状态提交、清理、快照失败、调度失败、Worker 数量和 Outbox 快照指标。快照包括 backlog、failed、ready、ready 最老年龄、未完成超期数量/年龄及缺失首次可用时间数量。快照在独立线程和有超时的单条数据库查询中刷新；首次成功快照之前相关 Gauge 为空值。核心指标名以 `reliable_event.` 开头，例如 `publish.success`、`publish.failure`、`publish.duration`、`backlog`、`failed`、`ready`、`unfinished.overdue`、`snapshot.last_success_timestamp`、`scheduler.running`。Micrometer 会按注册表规则映射为 Prometheus 名称。指标不使用事件 ID、业务键、Trace ID 或错误内容作为标签。
 
 例如 Micrometer counter `reliable_event.publish.success` 在 Prometheus registry 中导出为 `reliable_event_publish_success_total`；`reliable_event.publish.duration` 是按 `outcome` 标记的 Timer，导出为 `reliable_event_publish_duration_seconds_*` 系列。可选仪表盘和告警按 Prometheus 暴露名查询。
+
+`scheduler.last_success_timestamp` 表示普通扫描成功，不代表租约恢复完成。独立恢复使用 `reliable_event.recovery.running`、`reliable_event.recovery.started_timestamp`、`reliable_event.recovery.last_success_timestamp` 表示实际执行中、最近开始和最近成功时间（时间戳单位为秒，尚未发生时为 0）；恢复失败复用 `scheduler.failure{mode="auto",stage="lease_recovery"}`。即使停机等待超时，`recovery.running` 也保持为 1，直到该调用实际退出。可结合开始时间判断长时间未返回的恢复，不能据此认定外部操作未发生。
 
 若应用另外启用 Micrometer Tracing，库会在登记和每次发布尝试建立 span，并调用应用提供的 Micrometer `Propagator` 提取/注入上下文；库传入的 carrier getter/setter 只放行 W3C `traceparent` 和 `tracestate`，不传 baggage。发布端只把严格匹配 W3C `00-<trace-id>-<span-id>-<flags>` 且 trace/span ID 非全零的 `traceparent` 当作父上下文；实际解析与生成仍由应用的 `Propagator` 完成。发布尝试每次生成独立发送上下文，不改写数据库中保存的登记头。Tracing 缺失或自身失败不应改变发布结果。Starter 不附带 Tracing SDK、Prometheus registry 或 OTLP exporter；依赖与采样/export 配置由应用决定。
 

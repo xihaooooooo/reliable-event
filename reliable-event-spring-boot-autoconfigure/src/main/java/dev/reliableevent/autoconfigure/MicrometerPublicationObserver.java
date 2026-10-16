@@ -55,6 +55,9 @@ final class MicrometerPublicationObserver implements PublicationObserver, AutoCl
     private final AtomicBoolean schedulerEnabled = new AtomicBoolean();
     private final AtomicBoolean schedulerRunning = new AtomicBoolean();
     private final AtomicLong schedulerLastSuccess = new AtomicLong();
+    private final AtomicBoolean recoveryRunning = new AtomicBoolean();
+    private final AtomicLong recoveryStartedAt = new AtomicLong();
+    private final AtomicLong recoveryLastSuccess = new AtomicLong();
     private final AtomicLong inflight = new AtomicLong();
     private final AtomicLong queued = new AtomicLong();
     private final Map<String, Counter> schedulerFailures = new HashMap<>();
@@ -135,6 +138,12 @@ final class MicrometerPublicationObserver implements PublicationObserver, AutoCl
                 value -> value.get() ? 1 : 0).register(registry));
         own(Gauge.builder("reliable_event.scheduler.last_success_timestamp", schedulerLastSuccess,
                 AtomicLong::doubleValue).register(registry));
+        own(Gauge.builder("reliable_event.recovery.running", recoveryRunning,
+                value -> value.get() ? 1 : 0).register(registry));
+        own(Gauge.builder("reliable_event.recovery.started_timestamp", recoveryStartedAt,
+                AtomicLong::doubleValue).register(registry));
+        own(Gauge.builder("reliable_event.recovery.last_success_timestamp", recoveryLastSuccess,
+                AtomicLong::doubleValue).register(registry));
         own(Gauge.builder("reliable_event.worker.inflight", inflight,
                 AtomicLong::doubleValue).register(registry));
         own(Gauge.builder("reliable_event.worker.queued", queued,
@@ -167,6 +176,18 @@ final class MicrometerPublicationObserver implements PublicationObserver, AutoCl
                     event.event().id().value());
         }
         lag.record(Duration.ofMillis(Math.max(0, lagMillis)));
+    }
+
+    @Override
+    public void recoveryStarted(long startedAtEpochSeconds) {
+        recoveryStartedAt.set(startedAtEpochSeconds);
+        recoveryRunning.set(true);
+    }
+
+    @Override
+    public void recoveryFinished(boolean succeeded, long completedAtEpochSeconds) {
+        if (succeeded) recoveryLastSuccess.set(completedAtEpochSeconds);
+        recoveryRunning.set(false);
     }
 
     @Override
